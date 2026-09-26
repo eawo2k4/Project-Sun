@@ -25,6 +25,16 @@ struct ApiFunction {
 std::vector<ApiFunction> KernelApi();
 std::vector<ApiFunction> UserApi();
 std::vector<ApiFunction> GdiApi();
+std::vector<ApiFunction> MmsystemApi();
+// Parts of the USER and GDI tables, by source file.
+std::vector<ApiFunction> UserWindowApi();  // UserWindow.cpp
+std::vector<ApiFunction> MenuApi();        // Menus.cpp
+std::vector<ApiFunction> UserDrawApi();    // GdiDraw.cpp: DrawText, FrameRect, ...
+std::vector<ApiFunction> UserSoundApi();   // Sound.cpp: MessageBeep
+std::vector<ApiFunction> GdiDrawApi();     // GdiDraw.cpp
+
+// Stops sndPlaySound's sound (before its buffer goes away).
+void StopHostSound();
 
 // A 16:16 far pointer argument.
 struct FarPtr {

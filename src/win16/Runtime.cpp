@@ -67,8 +67,12 @@ std::vector<ApiFunction> Win87emApi() { return {{1, "__FPMATH", FpMath}}; }
 // Built-in modules that are only set up when a program imports them.
 std::vector<ApiFunction> OptionalModuleApi(const std::string& name) {
     if (name == "WIN87EM") return Win87emApi();
+    if (name == "MMSYSTEM") return MmsystemApi();
     return {};
 }
+
+// Modules whose calls all do nothing and return 0.
+bool IsSilentModule(const std::string& name) { return name == "SOUND"; }
 
 constexpr uint16_t kScratchBytes = 0x1000;
 
@@ -140,7 +144,9 @@ Runtime::Runtime()
     scratchSel_ = memory_.Allocate(kScratchBytes, SegmentKind::Data);
 }
 
-Runtime::~Runtime() = default;
+Runtime::~Runtime() {
+    if (!playingSound_.empty()) StopHostSound();
+}
 
 void Runtime::Print(const std::string& line) const {
     if (output_) output_(line);
@@ -180,6 +186,7 @@ size_t Runtime::AddModule(const std::string& name, std::vector<ApiFunction> func
     m.name = name;
     m.functions = std::move(functions);
     m.catalog = FindCatalogModule(name);
+    m.silent = IsSilentModule(name);
     m.selector = memory_.Allocate(0x10000, SegmentKind::Host);
     builtins_.push_back(std::move(m));
     const size_t index = builtins_.size() - 1;
@@ -430,7 +437,25 @@ void Runtime::CallApi(size_t moduleIndex, uint16_t ip) {
     }
 
     if (impl) {
+        const uint16_t sp = cpu_.Regs().r[SP];
         impl->impl(*this, cpu_);
+        // Consistency check: a Pascal function removes exactly its arguments
+        // (plus the return address). A mismatch is an engine bug.
+        if (c && c->kind == CatalogKind::Pascal && c->params && !exited_ && cpu_.Regs().s[CS] == retCs &&
+            cpu_.Regs().ip == retIp) {
+            const uint16_t removed = uint16_t(cpu_.Regs().r[SP] - sp - 4);
+            if (removed != ParamBytes(c->params))
+                Note("stackcheck:" + name, "internal error: " + name + " removed " + std::to_string(removed) +
+                                              " bytes of arguments, the catalog says " +
+                                              std::to_string(ParamBytes(c->params)));
+        }
+        if (trace_) frame.Finish(TraceResult(c));
+        return;
+    }
+    if (module.silent && c && c->kind == CatalogKind::Pascal && c->params) {
+        Note("silent:" + module.name, module.name + " calls (PC-speaker music) are ignored");
+        SetResult(cpu_, 0);
+        cpu_.ReturnFar(ParamBytes(c->params));
         if (trace_) frame.Finish(TraceResult(c));
         return;
     }

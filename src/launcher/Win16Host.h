@@ -22,6 +22,8 @@ struct Win16Options {
     bool stubMissing = false;
     // Timers fire at the requested interval, below Windows 3.x's 55 ms too.
     bool exactTimers = false;
+    // No sound output.
+    bool mute = false;
 };
 
 // Runs a 16-bit NE program in-process on the Win16 engine, with its top-level

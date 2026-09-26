@@ -14,6 +14,7 @@
 #include "win16/ApiCatalog.h"
 #include "win16/Files.h"
 #include "win16/LocalHeap.h"
+#include "win16/Menus.h"
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
 #include "win16/Runtime.h"
@@ -250,9 +251,19 @@ void TestUnbuiltModulesLoadAsStubs() {
 
 // --- Windowing, messages, callbacks, global heap ----------------------------------------------
 
+// Output of the last RunWithHost.
+std::vector<std::string> g_output;
+
 TaskExit RunWithHost(const NeProgram& program, HeadlessHost& host, Runtime& rt) {
     rt.SetWindowHost(&host);
-    rt.SetOutput([](const std::string& line) { std::printf("  [win16] %s\n", line.c_str()); });
+    rt.SetMute(true);
+    g_output.clear();
+    rt.SetOutput([](const std::string& line) {
+        std::printf("  [win16] %s\n", line.c_str());
+        g_output.push_back(line);
+        // Every API removes exactly the arguments the catalog lists.
+        CHECK(line.find("internal error") == std::string::npos);
+    });
     std::string error;
     if (!rt.Load(BuildNe(program), "", error)) {
         std::printf("  load failed: %s\n", error.c_str());
@@ -677,6 +688,10 @@ void TestCatalog() {
     CHECK(ahincr && ahincr->kind == CatalogKind::Equate && std::string(ahincr->name) == "__AHINCR");
     const CatalogEntry* initTask = kernel ? FindCatalogEntry(*kernel, 91) : nullptr;
     CHECK(initTask && initTask->kind == CatalogKind::Register);
+    // "Polygon (word ptr word)": Wine sometimes spaces the parameter list.
+    const CatalogModule* gdi = FindCatalogModule("GDI");
+    const CatalogEntry* polygon = gdi ? FindCatalogEntry(*gdi, 36) : nullptr;
+    CHECK(polygon && polygon->params && std::string(polygon->params) == "wpw");
 
     // Every implemented function's ordinal names the same function in the catalog.
     for (const auto& [module, api] : {std::pair{"KERNEL", KernelApi()}, std::pair{"USER", UserApi()},
@@ -864,6 +879,141 @@ void TestExactTimers() {
     CHECK(u.MinTimerMs() == 55);
 }
 
+// --- USER breadth, GDI, sound -------------------------------------------------------------
+
+void TestUiProgram() {
+    HeadlessHost host;
+    Runtime rt;
+    rt.SetFrameCap(0);
+    const TaskExit e = RunWithHost(UiProgram(), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);  // else the failed check
+    // MoveWindow to 640x480 made the host window fullscreen; SetWindowText retitled it.
+    CHECK(host.windows.size() == 1);
+    if (host.windows.empty()) return;
+    const HeadlessHost::Record& w = host.windows[0];
+    CHECK(w.info.fullscreen && w.info.width == 640 && w.info.height == 480 && w.info.title == "Renamed");
+    CHECK(host.cursorShape == 32514 && host.captured == 0);  // IDC_WAIT; capture released
+    CHECK(rt.SoundsPlayed() >= 1);                              // MessageBeep (muted)
+    auto has = [](const std::string& text) {
+        return std::any_of(g_output.begin(), g_output.end(),
+                           [&](const std::string& l) { return l.find(text) != std::string::npos; });
+    };
+    CHECK(has("menu bar isn't drawn yet") && has("DialogBox(\"ABOUT\") answers IDCANCEL"));
+    CHECK(has("SOUND calls (PC-speaker music) are ignored"));
+    CHECK(rt.Windows().TimerCount() == 0);  // the multimedia timer killed itself
+}
+
+void TestMenuModel() {
+    Menus m;
+    const uint16_t bar = m.FromTemplate(GameMenuTemplate());
+    CHECK(bar != 0);
+    const std::vector<Menus::Item>* top = m.Items(bar);
+    CHECK(top && top->size() == 2);
+    if (!top || top->size() != 2) return;
+    CHECK((*top)[0].text == "&Game" && (*top)[0].popup && (*top)[1].id == 200 && (*top)[1].text == "&Help");
+    const std::vector<Menus::Item>* game = m.Items((*top)[0].popup);
+    CHECK(game && game->size() == 2 && (*game)[0].id == 100 && (*game)[0].text == "&New\tF2");
+    // By command (found inside the popup) or by position.
+    CHECK(m.Find(bar, 101, mf::ByCommand) && m.Find(bar, 101, mf::ByCommand)->text == "E&xit");
+    CHECK(m.Find(bar, 1, mf::ByPosition)->id == 200 && !m.Find(bar, 5, mf::ByPosition));
+    CHECK(m.Check(bar, 101, mf::Checked) == 0 && m.Check(bar, 101, 0) == mf::Checked);
+    CHECK(m.EnableItem(bar, 100, mf::Grayed) == 0 && m.State(bar, 100, 0) == mf::Grayed);
+    CHECK(m.State(bar, 0, mf::ByPosition) == ((2 << 8) | mf::Popup));  // a popup: its item count
+    CHECK(m.Check(bar, 999, mf::Checked) == -1);
+    // Built by hand: append, insert before, remove.
+    const uint16_t popup = m.Create(true);
+    CHECK(m.Append(popup, 0, 1, "One") && m.Append(popup, 0, 3, "Three") && m.Insert(popup, 1, 0, 2, "Two"));
+    CHECK(m.Items(popup)->size() == 3 && (*m.Items(popup))[1].text == "Two");
+    CHECK(m.Remove(popup, 2, mf::ByCommand, false) && m.Items(popup)->size() == 2);
+    const size_t before = m.Count();
+    CHECK(m.Destroy(bar) && m.Count() == before - 2);  // with its popup
+    // Truncated or wrong templates are refused.
+    std::vector<uint8_t> t = GameMenuTemplate();
+    t.resize(t.size() - 3);
+    CHECK(m.FromTemplate(t) == 0 && m.FromTemplate({1, 0, 0, 0}) == 0);
+    // Accelerators: 5-byte entries up to the one flagged 80h.
+    const uint16_t acc = m.LoadAccelerators({0x01, 0x71, 0, 100, 0, 0x8D, 'N', 0, 101, 0, 0x01, 1, 0, 1, 0});
+    CHECK(acc && m.Accelerators(acc)->size() == 2 && (*m.Accelerators(acc))[1].flags == 0x8D);
+    CHECK(m.LoadAccelerators({}) == 0);
+}
+
+void TestInputState() {
+    HeadlessHost host;
+    Runtime rt;
+    rt.SetFrameCap(0);
+    std::string error;
+    rt.SetWindowHost(&host);
+    CHECK(rt.Load(BuildNe(WindowProgram(true)), "", error));
+    rt.Run(1'000'000);  // blocks in GetMessage with its window (320x200) alive
+    User& u = rt.Windows();
+    const uint16_t hwnd = u.HwndForHost(1);
+    CHECK(hwnd && u.Active() == hwnd && u.Focus() == hwnd);
+    host.events.push_back({1, wm::KeyDown, 0x10, 0});                 // shift down
+    host.events.push_back({1, wm::LButtonDown, 0x0001, 0x00060005});  // (5, 6), MK_LBUTTON
+    Msg16 m;
+    CHECK(u.Next(m, 0, 0, 0, true, true) == User::Fetch::Message);
+    CHECK(u.KeyState(0x10) < 0 && (u.KeyState(0x10) & 1) && u.KeyState(0x11) == 0);
+    CHECK(u.KeyState(1) < 0);  // VK_LBUTTON
+    const Rect16 r = u.WindowRect(hwnd);
+    CHECK(u.MouseX() == r.left + 5 && u.MouseY() == r.top + 6);
+    host.events.push_back({1, wm::KeyUp, 0x10, 0});
+    host.events.push_back({1, wm::LButtonUp, 0, 0x00060005});
+    while (u.Next(m, 0, 0, 0, true, false) == User::Fetch::Message) {}
+    u.Next(m, 0, 0, 0, true, true);
+    CHECK(u.KeyState(0x10) >= 0 && (u.KeyState(0x10) & 1) && u.KeyState(1) >= 0);  // up; still toggled
+
+    // Capture: the host is told; mouse input goes to the capturing window.
+    CHECK(u.SetCaptureTo(hwnd) == 0 && host.captured == 1 && u.Captured() == hwnd);
+    CHECK(u.SetCaptureTo(0) == hwnd && host.captured == 0);
+    // Cursor: hidden while ShowCursor's count is negative, SetCursor(NULL) hides it.
+    CHECK(u.ShowCursorCount(false) == -1 && host.cursorShape == 0);
+    CHECK(u.ShowCursorCount(true) == 0 && host.cursorShape == kArrowCursor);
+    const uint16_t cross = u.CursorHandle(32515);
+    CHECK(cross && u.CursorHandle(32515) == cross);
+    u.SetCursorHandle(cross);
+    CHECK(host.cursorShape == 32515);
+    u.SetCursorHandle(0);
+    CHECK(host.cursorShape == 0);
+    // Message boxes without a real host: the default button of the set.
+    CHECK(u.ShowMessageBox(hwnd, "c", "t", 0x0000) == 1);          // MB_OK
+    CHECK(u.ShowMessageBox(hwnd, "c", "t", 0x0101) == 2);          // MB_OKCANCEL, DEFBUTTON2
+    CHECK(u.ShowMessageBox(hwnd, "c", "t", 0x0203) == 2);          // MB_YESNOCANCEL, DEFBUTTON3
+    CHECK(u.ShowMessageBox(hwnd, "c", "t", 0x0002) == 3);          // MB_ABORTRETRYIGNORE
+    CHECK(u.ShowMessageBox(hwnd, "c", "t", 0x0005) == 4);          // MB_RETRYCANCEL
+    // Repositioning into fullscreen and back.
+    CHECK(u.Reposition(hwnd, 0, 0, 640, 480, swp::NoZOrder) && host.windows[0].info.fullscreen);
+    CHECK(u.Reposition(hwnd, 5, 5, 100, 80, swp::NoZOrder) && !host.windows[0].info.fullscreen);
+    int w = 0, h = 0;
+    CHECK(rt.Graphics().SurfacePixels(hwnd, w, h) && w == 100 && h == 80);
+    CHECK(u.WindowRect(kDesktopHwnd).right == 640 && u.ClientRect(kDesktopHwnd).bottom == 480);
+}
+
+void TestGdiDefaults() {
+    Runtime rt;
+    Gdi& g = rt.Graphics();
+    // Every DC starts with the engine's 96-DPI SYSTEM_FONT, a stock object.
+    const uint16_t dc = g.CreateCompatibleDc(0);
+    const uint16_t system = g.StockObject(13), ansiVar = g.StockObject(12);
+    CHECK(system && ansiVar && system != ansiVar && g.StockObject(13) == system);
+    CHECK(g.Select(dc, ansiVar) == system);
+    CHECK(g.Delete(system) && g.StockObject(13) == system);  // stock: deleting is a no-op
+    CHECK(g.DeleteDc(dc));
+    // COLOR_xxx + 1 brushes use the Windows 3.1 colours.
+    CHECK(ClassicSysColor(15) == 0xC0C0C0 && ClassicSysColor(2) == 0x800000 && ClassicSysColor(99) == 0);
+    CHECK(g.CreateSurface(0x2100, 4, 4));
+    const uint16_t wdc = g.GetWindowDc(0x2100);
+    CHECK(g.Fill(wdc, {0, 0, 4, 4}, 16));  // COLOR_BTNFACE + 1
+    g.ReleaseWindowDc(wdc);
+    int w = 0, h = 0;
+    const uint32_t* px = g.SurfacePixels(0x2100, w, h);
+    CHECK(px && (px[0] & 0xFFFFFF) == 0xC0C0C0);
+    // Resizing keeps the picture at the top left.
+    CHECK(g.ResizeSurface(0x2100, 8, 2));
+    px = g.SurfacePixels(0x2100, w, h);
+    CHECK(px && w == 8 && h == 2 && (px[0] & 0xFFFFFF) == 0xC0C0C0 && (px[7] & 0xFFFFFF) == 0);
+    g.DestroySurface(0x2100);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -914,6 +1064,10 @@ int main() {
         {"CrtProgram", TestCrtProgram},
         {"IteratedSegment", TestIteratedSegment},
         {"ExactTimers", TestExactTimers},
+        {"UiProgram", TestUiProgram},
+        {"MenuModel", TestMenuModel},
+        {"InputState", TestInputState},
+        {"GdiDefaults", TestGdiDefaults},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

@@ -5,7 +5,9 @@
 
 #include "win16/Gdi.h"
 
+#include <algorithm>
 #include <cstring>
+#include <cwchar>
 
 #include "retro/FramePacing.h"
 #include "win16/Api.h"
@@ -38,6 +40,7 @@ Gdi::Gdi(Runtime& rt)
 
 Gdi::~Gdi() {
     for (auto& [hwnd, s] : surfaces_) FreeSurface(s);
+    for (auto& [index, brush] : sysBrushes_) DeleteObject(static_cast<HGDIOBJ>(brush));
     // DCs first, so no owned object is still selected when it's deleted.
     for (const auto& [h, o] : objects_) {
         if (o.owned && o.kind == Kind::Dc) DeleteDC(static_cast<HDC>(o.host));
@@ -79,8 +82,63 @@ void* Gdi::HostObject(uint16_t handle, Kind kind) const {
 }
 
 void* Gdi::HostBrush(uint16_t brush) const {
-    if (brush >= 1 && brush <= 31) return GetSysColorBrush(brush - 1);  // COLOR_xxx + 1
+    if (brush >= 1 && brush <= 31) {  // COLOR_xxx + 1
+        const int index = brush - 1;
+        if (index > 20) return GetSysColorBrush(index);  // newer than Windows 3.1
+        auto& cached = sysBrushes_[index];
+        if (!cached) cached = ::CreateSolidBrush(ClassicSysColor(index));
+        return cached;
+    }
     return HostObject(brush, Kind::Brush);
+}
+
+bool Gdi::KindOf(uint16_t handle, Kind& kind) const {
+    const Object* o = Find(handle);
+    if (!o) return false;
+    kind = o->kind;
+    return true;
+}
+
+// --- Fonts ------------------------------------------------------------------------------------
+
+void* Gdi::StockFont(int index) {
+    // Windows 3.1 at VGA resolution: face, height, width, weight.
+    struct Spec {
+        int index;
+        const wchar_t* face;
+        int height, width, weight;
+        BYTE pitch, charset;
+    };
+    static const Spec kFonts[] = {
+        {OEM_FIXED_FONT, L"Terminal", 12, 8, FW_NORMAL, FIXED_PITCH | FF_MODERN, OEM_CHARSET},
+        {ANSI_FIXED_FONT, L"Courier", 13, 0, FW_NORMAL, FIXED_PITCH | FF_MODERN, ANSI_CHARSET},
+        {ANSI_VAR_FONT, L"MS Sans Serif", 13, 0, FW_NORMAL, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET},
+        {SYSTEM_FONT, L"System", 16, 0, FW_BOLD, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET},
+        {DEVICE_DEFAULT_FONT, L"System", 16, 0, FW_BOLD, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET},
+        {SYSTEM_FIXED_FONT, L"Fixedsys", 15, 8, FW_NORMAL, FIXED_PITCH | FF_MODERN, ANSI_CHARSET},
+    };
+    for (const Spec& s : kFonts) {
+        if (s.index != index) continue;
+        void*& font = stockFonts_[index];
+        if (!font) {
+            LOGFONTW lf{};
+            lf.lfHeight = s.height;  // cell height in pixels
+            lf.lfWidth = s.width;
+            lf.lfWeight = s.weight;
+            lf.lfCharSet = s.charset;
+            lf.lfQuality = NONANTIALIASED_QUALITY;
+            lf.lfPitchAndFamily = s.pitch;
+            wcscpy_s(lf.lfFaceName, s.face);
+            font = CreateFontIndirectW(&lf);
+            if (font) Wrap(font, Kind::Font, true, true);
+        }
+        return font;
+    }
+    return nullptr;
+}
+
+void Gdi::SelectDefaultFont(void* dc) {
+    if (void* font = StockFont(SYSTEM_FONT)) SelectObject(static_cast<HDC>(dc), static_cast<HFONT>(font));
 }
 
 uint16_t Gdi::HandleForHost(void* host) const {
@@ -112,6 +170,39 @@ bool Gdi::MakeSurface(Surface& s, int width, int height) {
     s.width = width;
     s.height = height;
     std::memset(bits, 0, size_t(width) * height * 4);  // black until painted
+    SelectDefaultFont(dc);
+    return true;
+}
+
+bool Gdi::ResizeSurface(uint16_t hwnd, int width, int height) {
+    const auto it = surfaces_.find(hwnd);
+    if (it == surfaces_.end() || width <= 0 || height <= 0) return false;
+    Surface& s = it->second;
+    if (s.saved > 0) return false;
+    if (s.width == width && s.height == height) return true;
+    BITMAPINFO bmi{};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = width;
+    bmi.bmiHeader.biHeight = -height;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    void* bits = nullptr;
+    HBITMAP dib = CreateDIBSection(static_cast<HDC>(s.dc), &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (!dib) return false;
+    std::memset(bits, 0, size_t(width) * height * 4);
+    GdiFlush();
+    // The old picture, top left.
+    uint32_t* dst = static_cast<uint32_t*>(bits);
+    for (int y = 0; y < std::min(height, s.height); ++y)
+        std::memcpy(dst + size_t(y) * width, s.bits + size_t(y) * s.width, size_t(std::min(width, s.width)) * 4);
+    HGDIOBJ old = SelectObject(static_cast<HDC>(s.dc), dib);
+    DeleteObject(old);
+    s.dib = dib;
+    s.bits = dst;
+    s.width = width;
+    s.height = height;
+    s.dirty = hwnd != kDesktop;
     return true;
 }
 
@@ -187,7 +278,9 @@ bool Gdi::ReleaseWindowDc(uint16_t hdc) {
 uint16_t Gdi::CreateCompatibleDc(uint16_t hdc) {
     HDC base = hdc ? static_cast<HDC>(HostDc(hdc)) : nullptr;
     if (hdc && !base) return 0;
-    return Wrap(CreateCompatibleDC(base), Kind::Dc, true, false);
+    HDC dc = CreateCompatibleDC(base);
+    if (dc) SelectDefaultFont(dc);
+    return Wrap(dc, Kind::Dc, true, false);
 }
 
 bool Gdi::DeleteDc(uint16_t hdc) {
@@ -205,6 +298,7 @@ void Gdi::ClipTo(uint16_t hdc, const Rect16& r) {
 // --- Objects -----------------------------------------------------------------------------------
 
 uint16_t Gdi::StockObject(int index) {
+    if (void* font = StockFont(index)) return HandleForHost(font);
     HGDIOBJ obj = GetStockObject(index);
     return obj ? Wrap(obj, KindOfHost(obj), false, true) : 0;
 }
@@ -536,7 +630,8 @@ void Api_GetStockObject(Runtime& rt, Cpu& cpu) {  // (int)
 }  // namespace
 
 std::vector<ApiFunction> GdiApi() {
-    return {
+    std::vector<ApiFunction> api = GdiDrawApi();
+    api.insert(api.end(), {
         {1, "SETBKCOLOR", Api_SetBkColor},
         {2, "SETBKMODE", Api_SetBkMode},
         {9, "SETTEXTCOLOR", Api_SetTextColor},
@@ -557,7 +652,8 @@ std::vector<ApiFunction> GdiApi() {
         {83, "GETPIXEL", Api_GetPixel},
         {87, "GETSTOCKOBJECT", Api_GetStockObject},
         {90, "GETTEXTCOLOR", Api_GetTextColor},
-    };
+    });
+    return api;
 }
 
 }  // namespace retro::win16
