@@ -52,7 +52,7 @@ public:
     // Returns its selector, or 0 if the arena or the LDT is full.
     uint16_t Allocate(uint32_t size, SegmentKind kind);
 
-    // Marks the selector not present (its memory is not reused yet).
+    // Marks the selector not present and returns its memory for reuse.
     void Free(uint16_t selector);
 
     // Descriptor for a selector, or nullptr if the selector is null, not an
@@ -81,9 +81,15 @@ public:
     uint32_t ArenaUsed() const { return next_; }
 
 private:
+    struct Range {
+        uint32_t base;
+        uint32_t size;
+    };
+
     std::vector<uint8_t> arena_;
     std::vector<Descriptor> ldt_;
-    uint32_t next_ = 16;  // keep linear 0 unused
+    std::vector<Range> free_;  // freed arena ranges, reused first-fit
+    uint32_t next_ = 16;       // keep linear 0 unused
     uint16_t nextIndex_ = kFirstIndex;
 };
 

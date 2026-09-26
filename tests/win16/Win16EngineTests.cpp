@@ -311,6 +311,24 @@ void TestGlobalHeap() {
     CHECK(heap.Count() == 1);
 }
 
+void TestFreedMemoryIsReused() {
+    // A 1 MB arena holds ~15 64 KB blocks at once; allocating and freeing 500
+    // of them only works if freed memory is reused.
+    Memory mem(1 << 20);
+    GlobalHeap heap(mem);
+    for (int i = 0; i < 500; ++i) {
+        const uint16_t h = heap.Alloc(gmem::Moveable, 0x10000);
+        CHECK(h != 0);
+        if (!h) return;
+        const uint16_t sel = uint16_t(heap.Lock(h) >> 16);
+        CHECK(mem.Read8(sel, 0xFFFF) == 0);  // reused memory is zero-filled again
+        mem.Write8(sel, 0xFFFF, 0xAA);
+        heap.Unlock(h);
+        CHECK(heap.Free(h) == 0);
+    }
+    CHECK(mem.ArenaUsed() < 0x30000);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -343,6 +361,7 @@ int main() {
         {"FullscreenWindowIsFlagged", TestFullscreenWindowIsFlagged},
         {"FaultInsideCallbackIsReported", TestFaultInsideCallbackIsReported},
         {"GlobalHeap", TestGlobalHeap},
+        {"FreedMemoryIsReused", TestFreedMemoryIsReused},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

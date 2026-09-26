@@ -31,12 +31,26 @@ uint16_t Memory::Allocate(uint32_t size, SegmentKind kind) {
     }
     if (index == 0) return 0;
 
-    uint32_t base = next_;
+    uint32_t base = 0;
     if (kind != SegmentKind::Host) {
-        base = (next_ + 15u) & ~15u;  // paragraph aligned, like the real thing
-        if (base + size > arena_.size()) return 0;
+        const uint32_t span = (size + 15u) & ~15u;  // paragraph granular, like the real thing
+        bool reused = false;
+        for (auto it = free_.begin(); it != free_.end(); ++it) {
+            if (it->size >= span) {  // first fit
+                base = it->base;
+                it->base += span;
+                it->size -= span;
+                if (it->size == 0) free_.erase(it);
+                reused = true;
+                break;
+            }
+        }
+        if (!reused) {
+            base = (next_ + 15u) & ~15u;
+            if (base + span > arena_.size()) return 0;
+            next_ = base + span;
+        }
         std::memset(&arena_[base], 0, size);
-        next_ = base + size;
     }
 
     ldt_[index] = Descriptor{base, size - 1, kind, true};
@@ -46,7 +60,10 @@ uint16_t Memory::Allocate(uint32_t size, SegmentKind kind) {
 
 void Memory::Free(uint16_t selector) {
     const uint16_t index = selector >> 3;
-    if ((selector & 4) && index >= kFirstIndex && index < kLdtEntries) ldt_[index].present = false;
+    if (!(selector & 4) || index < kFirstIndex || index >= kLdtEntries || !ldt_[index].present) return;
+    Descriptor& d = ldt_[index];
+    d.present = false;
+    if (d.kind != SegmentKind::Host) free_.push_back({d.base, (d.limit + 1 + 15u) & ~15u});
 }
 
 const Descriptor* Memory::Lookup(uint16_t selector) const {
