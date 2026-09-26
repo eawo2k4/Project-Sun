@@ -6,12 +6,14 @@
 #include <cstdio>
 #include <cwchar>
 #include <filesystem>
+#include <iterator>
 #include <string>
 
 #include "ProcessLauncher.h"
 #include "retro/ClampPolicy.h"
 #include "retro/ExeFormat.h"
 #include "retro/PathUtil.h"
+#include "retro/ShellIntegration.h"
 #include "Win16Host.h"
 
 namespace fs = std::filesystem;
@@ -25,6 +27,8 @@ enum ExitCode : int {
     Exit_BadImage = 3,
     Exit_Unsupported = 4,
     Exit_LaunchFailed = 5,
+    // 6: a Win16 task stopped (kWin16Stopped)
+    Exit_ShellFailed = 7,  // --register-shell / --unregister-shell failed
 };
 
 struct Options {
@@ -81,7 +85,14 @@ void PrintUsage() {
         "                    with --d3d9on12 they end up on Direct3D 12\n"
         "  --no-display-sandbox  Let the game change the real display mode (no window\n"
         "                    sandbox or GDI scaling; frame pacing still applies)\n"
-        "  --                End of options\n",
+        "  --                End of options\n"
+        "\n"
+        "Explorer integration (\"Run with RetroLaunch\" on .exe files, which runs\n"
+        "RetroLaunch --windowed <file>):\n"
+        "  RetroLaunch --register-shell [--all-users]\n"
+        "  RetroLaunch --unregister-shell [--all-users]\n"
+        "  Without --all-users only the current user gets it (no admin rights needed);\n"
+        "  --all-users needs an elevated prompt.\n",
         stderr);
 }
 
@@ -216,8 +227,58 @@ bool ValidateShim(const fs::path& shim, std::string& error) {
 
 }  // namespace
 
+// --register-shell / --unregister-shell [--all-users]
+int ShellMain(int argc, wchar_t** argv) {
+    const bool registering = std::wcscmp(argv[1], L"--register-shell") == 0;
+    retro::ShellScope scope = retro::ShellScope::CurrentUser;
+    for (int i = 2; i < argc; ++i) {
+        if (std::wcscmp(argv[i], L"--all-users") == 0) {
+            scope = retro::ShellScope::AllUsers;
+        } else {
+            std::fprintf(stderr, "Unknown option for %s: %s\n", ToUtf8(argv[1]).c_str(), ToUtf8(argv[i]).c_str());
+            return Exit_Usage;
+        }
+    }
+    const char* who = scope == retro::ShellScope::AllUsers ? "all users" : "the current user";
+    std::wstring error;
+    if (registering) {
+        wchar_t self[MAX_PATH * 4] = {};
+        const DWORD n = GetModuleFileNameW(nullptr, self, DWORD(std::size(self)));
+        if (n == 0 || n >= std::size(self)) {
+            std::fprintf(stderr, "error: cannot determine RetroLaunch's own path\n");
+            return Exit_ShellFailed;
+        }
+        if (!retro::RegisterShellVerb(scope, self, error)) {
+            std::fprintf(stderr, "error: could not add the Explorer entry: %s\n", ToUtf8(error).c_str());
+            return Exit_ShellFailed;
+        }
+        std::printf("Added \"Run with RetroLaunch\" to the context menu of .exe files for %s.\n"
+                    "  Command : %s\n"
+                    "  Key     : %s\\%s\n"
+                    "On Windows 11 it is under \"Show more options\" (or Shift+right-click).\n"
+                    "If you move RetroLaunch.exe, run --register-shell again.\n",
+                    who, ToUtf8(retro::ShellCommandFor(self)).c_str(),
+                    scope == retro::ShellScope::AllUsers ? "HKEY_LOCAL_MACHINE" : "HKEY_CURRENT_USER",
+                    ToUtf8(retro::kShellVerbKey).c_str());
+        return 0;
+    }
+    bool existed = false;
+    if (!retro::UnregisterShellVerb(scope, existed, error)) {
+        std::fprintf(stderr, "error: could not remove the Explorer entry: %s\n", ToUtf8(error).c_str());
+        return Exit_ShellFailed;
+    }
+    std::printf(existed ? "Removed \"Run with RetroLaunch\" for %s.\n"
+                        : "\"Run with RetroLaunch\" was not registered for %s: nothing to remove.\n",
+                who);
+    return 0;
+}
+
 int wmain(int argc, wchar_t** argv) {
     SetConsoleOutputCP(CP_UTF8);
+
+    if (argc >= 2 && (std::wcscmp(argv[1], L"--register-shell") == 0 ||
+                      std::wcscmp(argv[1], L"--unregister-shell") == 0))
+        return ShellMain(argc, argv);
 
     Options opt;
     if (!ParseArgs(argc, argv, opt)) {

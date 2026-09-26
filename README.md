@@ -450,6 +450,7 @@ side by side, with shim logs in `logs/`.
 
 ```
 RetroLaunch [options] <program.exe> [program arguments...]
+RetroLaunch --register-shell | --unregister-shell [--all-users]
   --inspect        Print executable header info and exit
   --wait           Wait for exit and return the program's exit code
   --hidden         16-bit programs: create their windows but never show them
@@ -490,5 +491,38 @@ RetroLaunch [options] <program.exe> [program arguments...]
   against the same files.
 
 Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure,
-6 Win16 task stopped (fault, unimplemented API, or blocked waiting for input). With `--wait`, and always for
-16-bit programs, the launcher returns the program's own exit code.
+6 Win16 task stopped (fault, unimplemented API, or blocked waiting for input),
+7 Explorer integration failed. With `--wait`, and always for 16-bit programs, the
+launcher returns the program's own exit code.
+
+### Explorer integration
+
+`RetroLaunch --register-shell` adds **Run with RetroLaunch** to the right-click menu
+of `.exe` files. The entry runs `"<path to RetroLaunch.exe>" --windowed "%1"` and uses
+RetroLaunch's own icon (`RetroLaunch.exe,0`). Both paths are quoted, so spaces in
+either are fine.
+
+```
+RetroLaunch --register-shell                 # for you: no admin rights needed
+RetroLaunch --register-shell --all-users     # for everyone: elevated prompt
+RetroLaunch --unregister-shell [--all-users] # remove it again
+```
+
+- **Where it's stored:** for the current user,
+  `HKEY_CURRENT_USER\Software\Classes\exefile\shell\RetroLaunch`; with `--all-users`,
+  under `HKEY_LOCAL_MACHINE`. Both appear as
+  `HKEY_CLASSES_ROOT\exefile\shell\RetroLaunch`, with its `command` subkey.
+- **Removing it:** `--unregister-shell` deletes exactly that key and nothing around it.
+- **Windows 11:** classic entries like this one appear under **Show more options**
+  (or Shift+right-click).
+- **Moving RetroLaunch:** the entry records RetroLaunch's current location, so after
+  moving `RetroLaunch.exe` run `--register-shell` again.
+
+Removing the entry by hand, if RetroLaunch is gone:
+
+```
+reg delete "HKCU\Software\Classes\exefile\shell\RetroLaunch" /f
+reg delete "HKLM\Software\Classes\exefile\shell\RetroLaunch" /f
+```
+
+The second command needs an elevated prompt, and is only needed after `--all-users`.

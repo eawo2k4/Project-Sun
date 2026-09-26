@@ -20,6 +20,15 @@ add_executable(PixelConvertTests PixelConvertTests.cpp Check.h)
 target_link_libraries(PixelConvertTests PRIVATE RetroCore)
 add_test(NAME PixelConvert COMMAND PixelConvertTests)
 
+# Explorer integration against a redirected HKEY_CURRENT_USER (the real context
+# menu isn't touched).
+add_executable(ShellIntegrationTests ShellIntegrationTests.cpp Check.h)
+target_link_libraries(ShellIntegrationTests PRIVATE RetroCore)
+add_test(NAME ShellIntegration COMMAND ShellIntegrationTests)
+# A bad option is refused before anything is written.
+add_test(NAME ShellRegisterRejectsBadOption COMMAND $<TARGET_FILE:RetroLaunch> --register-shell --bogus)
+set_tests_properties(ShellRegisterRejectsBadOption PROPERTIES WILL_FAIL TRUE)
+
 # --- End-to-end tests: RetroLaunch -> RetroShim -> ShimProbe ----------------------
 
 # ddraw is linked (loaded at startup); d3d9 is loaded with LoadLibrary at run

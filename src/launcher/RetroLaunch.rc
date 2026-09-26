@@ -1,0 +1,5 @@
+// RetroLaunch.exe resources. The first icon is "RetroLaunch.exe,0": the
+// program's icon, and the icon of Explorer's "Run with RetroLaunch" entry.
+// (RetroLaunch.ico comes from tools/make_icon.py.)
+
+1 ICON "RetroLaunch.ico"

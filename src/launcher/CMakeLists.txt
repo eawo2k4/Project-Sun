@@ -1,5 +1,6 @@
 add_executable(RetroLaunch
     main.cpp
+    RetroLaunch.rc
     ProcessLauncher.cpp
     ProcessLauncher.h
     Win16Host.cpp
