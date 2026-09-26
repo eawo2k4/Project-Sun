@@ -5,9 +5,13 @@
 # (Gdi.cpp) draws with the host's Win32 GDI, and real windows come from a
 # WindowHost the embedding application provides.
 add_library(RetroWin16 STATIC
+    ApiCatalog.cpp
+    CatalogLookup.cpp
     Cpu.cpp
+    Files.cpp
     Gdi.cpp
     Kernel.cpp
+    LocalHeap.cpp
     Memory.cpp
     NeImage.cpp
     NeLoader.cpp
@@ -15,9 +19,12 @@ add_library(RetroWin16 STATIC
     Runtime.cpp
     User.cpp
     include/win16/Api.h
+    include/win16/ApiCatalog.h
     include/win16/Cpu.h
+    include/win16/Files.h
     include/win16/Gdi.h
     include/win16/Kernel.h
+    include/win16/LocalHeap.h
     include/win16/Memory.h
     include/win16/NeImage.h
     include/win16/NeLoader.h

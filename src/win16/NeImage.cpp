@@ -261,9 +261,22 @@ bool ParseNe(const std::vector<uint8_t>& file, NeImage& out, std::string& error)
             error = Fmt("segment %u data outside the file", i + 1u);
             return false;
         }
-        if (s.flags & NeSegment::kIterated) {
-            error = Fmt("segment %u uses iterated data (not supported yet)", i + 1u);
-            return false;
+        if ((s.flags & NeSegment::kIterated) && s.fileLength) {
+            // Records of { WORD count, WORD length, BYTE data[length] }: data repeated count times.
+            uint32_t at = s.fileOffset;
+            const uint32_t end = s.fileOffset + s.fileLength;
+            while (at + 4 <= end) {
+                const uint16_t count = rd.U16(at), bytes = rd.U16(at + 2);
+                at += 4;
+                if (at + bytes > end || s.expanded.size() + uint64_t(count) * bytes > 0x10000) {
+                    error = Fmt("segment %u: bad iterated data record", i + 1u);
+                    return false;
+                }
+                for (uint16_t n = 0; n < count; ++n)
+                    s.expanded.insert(s.expanded.end(), rd.Data() + at, rd.Data() + at + bytes);
+                at += bytes;
+            }
+            if (s.minAlloc < s.expanded.size()) s.minAlloc = uint32_t(s.expanded.size());
         }
         if ((s.flags & NeSegment::kRelocInfo) && s.fileLength &&
             !ParseRelocations(rd, s.fileOffset + s.fileLength, impNames, s, error)) {

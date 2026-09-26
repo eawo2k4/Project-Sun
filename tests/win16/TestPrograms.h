@@ -1072,16 +1072,285 @@ inline NeProgram DivideByZeroProgram() {
     return p;
 }
 
-// Imports from a DLL that isn't built in.
-inline NeProgram MissingModuleProgram() {
+// Calls module.ordinal (a DLL the engine doesn't implement) with four words
+// of arguments, then exits with 51 if the call returned.
+inline NeProgram MissingModuleProgram(const std::string& module = "SHELL", uint16_t ordinal = 22) {
     NeProgram p = BaseProgram();
-    p.modules = {"KERNEL", "SHELL"};
+    p.modules = {"KERNEL", module};
     NeSeg code;
     Asm16 a;
-    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 1));
+    a.db({0x6A, 0x00, 0x1E, 0x6A, 0x00, 0x1E, 0x6A, 0x00, 0x6A, 0x00});  // push 0 / ds:0 / ds:0 / 0
+    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, ordinal));
+    a.db({0xB8, 51, 0x4C, 0xCD, 0x21});  // exit(51)
     code.bytes = a.Finish();
     p.segments = {code, DataSegment({}, 0x100)};
     return p;
+}
+
+// What a C runtime's startup and a typical game's initialization do with
+// KERNEL, run against a program directory holding CRT.INI ([Game] Level=7,
+// Name=Sunny) and CRTDATA.BIN ("RETRO16!"). Exit 0, or the failed check:
+//   1 InitTask            2 WIN87EM __fpMath init     3 __AHINCR / __WINFLAGS
+//   4-6 local heap: moveable blocks (handle -> pointer), growth past the
+//       initial heap, fixed blocks          7 GlobalReAlloc to 40000 bytes
+//   8 lstrcpy/lstrcat/lstrlen   9-10 private profile reads, a write read back
+//   11 _lopen/_lread/_llseek   12 files outside the directory / for writing
+//   13 INT 21h open/read/close  14 GetModuleHandle/GetProcAddress
+//   15 GetModuleFileName, GetDOSEnvironment   16 LoadLibrary
+// It imports SHELL.ShellAbout but never calls it.
+inline NeProgram CrtProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "WIN87EM", "SHELL"};
+    constexpr uint8_t kHinst = 0x00, kH = 0x02, kP = 0x04, kG = 0x06, kFile = 0x08, kUser = 0x0A,
+                      kIni = 0x10, kGame = 0x18, kLevel = 0x20, kName = 0x28, kMissing = 0x30,
+                      kScore = 0x38, k99 = 0x40, kX = 0x44, kData = 0x48, kSecret = 0x58, kUserName = 0x68,
+                      kGetMessage = 0x70, kDialogBox = 0x7C, kMmsystem = 0x88, kNoSuch = 0x98, kAbc = 0xA4,
+                      kDef = 0xA8, kBuf = 0xB0;
+    std::vector<uint8_t> data(0x100, 0);
+    auto put = [&](uint8_t at, const std::string& s) { std::copy(s.begin(), s.end(), data.begin() + at); };
+    put(kIni, "CRT.INI");
+    put(kGame, "Game");
+    put(kLevel, "Level");
+    put(kName, "Name");
+    put(kMissing, "Missing");
+    put(kScore, "Score");
+    put(k99, "99");
+    put(kX, "x");
+    put(kData, "CRTDATA.BIN");
+    put(kSecret, "..\\SECRET.TXT");
+    put(kUserName, "USER");
+    put(kGetMessage, "GETMESSAGE");
+    put(kDialogBox, "DIALOGBOX");
+    put(kMmsystem, "MMSYSTEM.DLL");
+    put(kNoSuch, "NOSUCH.DLL");
+    put(kAbc, "abc");
+    put(kDef, "def");
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    constexpr uint16_t WIN87EM = 3, SHELL = 4;
+    auto cmpAx = [&](uint16_t v) { a.db({0x3D}).dw(v); };
+    auto dxZero = [&](int fail) { a.db({0x85, 0xD2}); FailUnless(a, JZ, fail); };
+
+    // 1. InitTask
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 1);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    // 2. __fpMath(BX = 0): initialize the emulator
+    a.db({0x31, 0xDB});  // xor bx, bx
+    e.Call(WIN87EM, 1);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 2);
+    // 3. Imported constants: mov ax, __AHINCR (8); mov ax, __WINFLAGS; GetWinFlags()
+    a.db({0xB8});
+    code.relocs.push_back({5, 1, a.Here(), 1, 114});  // offset fixup to KERNEL.114
+    a.db({0xFF, 0xFF});
+    cmpAx(8);
+    FailUnless(a, JZ, 3);
+    a.db({0xB8});
+    code.relocs.push_back({5, 1, a.Here(), 1, 178});  // KERNEL.178 __WINFLAGS
+    a.db({0xFF, 0xFF});
+    cmpAx(0x0013);
+    FailUnless(a, JZ, 3);
+    e.Call(Emit::KERNEL, 132);  // GetWinFlags
+    cmpAx(0x0013);
+    FailUnless(a, JZ, 3);
+
+    // 4. LocalAlloc(LMEM_MOVEABLE, 100); LocalLock; *handle == pointer
+    e.Imm(0x0002); e.Imm(100);
+    e.Call(Emit::KERNEL, 5);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 4);
+    e.StoreAx(kH);
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 8);  // LocalLock
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 4);
+    e.StoreAx(kP);
+    a.db({0x8B, 0x1E, kH, 0x00, 0x8B, 0x07});  // mov bx, [h] / mov ax, [bx]
+    a.db({0x3B, 0x06, kP, 0x00});              // cmp ax, [p]
+    FailUnless(a, JZ, 4);
+    a.db({0x8B, 0x1E, kP, 0x00, 0xC6, 0x07, 0x5A});  // mov bx, [p] / mov byte [bx], 5Ah
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 9);  // LocalUnlock
+    // 5. LocalReAlloc(h, 3000, LMEM_MOVEABLE): past the initial 256-byte heap
+    e.Mem(kH); e.Imm(3000); e.Imm(0x0002);
+    e.Call(Emit::KERNEL, 6);
+    a.db({0x3B, 0x06, kH, 0x00});  // same handle
+    FailUnless(a, JZ, 5);
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 8);  // LocalLock
+    a.db({0x89, 0xC3, 0x80, 0x3F, 0x5A});  // mov bx, ax / cmp byte [bx], 5Ah (kept)
+    FailUnless(a, JZ, 5);
+    a.db({0xC6, 0x87}).dw(2999).db({0x77});  // mov byte [bx+2999], 77h (inside DGROUP now)
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 10);  // LocalSize
+    cmpAx(3000);
+    FailUnless(a, JZ, 5);
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 9);  // LocalUnlock
+    e.Mem(kH);
+    e.Call(Emit::KERNEL, 7);  // LocalFree
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 5);
+    // 6. LocalAlloc(LMEM_FIXED, 16): the handle is the pointer
+    e.Imm(0); e.Imm(16);
+    e.Call(Emit::KERNEL, 5);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 6);
+    e.StoreAx(kP);
+    e.Mem(kP);
+    e.Call(Emit::KERNEL, 11);  // LocalHandle
+    a.db({0x3B, 0x06, kP, 0x00});
+    FailUnless(a, JZ, 6);
+    e.Mem(kP);
+    e.Call(Emit::KERNEL, 7);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 6);
+
+    // 7. GlobalAlloc(GMEM_MOVEABLE, 16) -> GlobalReAlloc(40000) keeps the handle
+    e.Imm(0x0002); e.Long(16);
+    e.Call(Emit::KERNEL, 15);
+    e.StoreAx(kG);
+    e.Mem(kG); e.Long(40000); e.Imm(0x0002);
+    e.Call(Emit::KERNEL, 16);
+    a.db({0x3B, 0x06, kG, 0x00});
+    FailUnless(a, JZ, 7);
+    e.Mem(kG);
+    e.Call(Emit::KERNEL, 20);  // GlobalSize
+    cmpAx(40000);
+    FailUnless(a, JZ, 7);
+    dxZero(7);
+
+    // 8. lstrcpy(buf, "abc"); lstrcat(buf, "def"); lstrlen(buf) = 6
+    e.Far(kBuf); e.Far(kAbc);
+    e.Call(Emit::KERNEL, 88);
+    e.Far(kBuf); e.Far(kDef);
+    e.Call(Emit::KERNEL, 89);
+    e.Far(kBuf);
+    e.Call(Emit::KERNEL, 90);
+    cmpAx(6);
+    FailUnless(a, JZ, 8);
+
+    // 9. GetPrivateProfileInt("Game", "Level", 1, "CRT.INI") = 7; "Missing" -> 42
+    e.Far(kGame); e.Far(kLevel); e.Imm(1); e.Far(kIni);
+    e.Call(Emit::KERNEL, 127);
+    cmpAx(7);
+    FailUnless(a, JZ, 9);
+    e.Far(kGame); e.Far(kMissing); e.Imm(42); e.Far(kIni);
+    e.Call(Emit::KERNEL, 127);
+    cmpAx(42);
+    FailUnless(a, JZ, 9);
+    //    GetPrivateProfileString("Game", "Name", "x", buf, 32, "CRT.INI") = 5 ("Sunny")
+    e.Far(kGame); e.Far(kName); e.Far(kX); e.Far(kBuf); e.Imm(32); e.Far(kIni);
+    e.Call(Emit::KERNEL, 128);
+    cmpAx(5);
+    FailUnless(a, JZ, 9);
+    a.db({0x80, 0x3E, kBuf, 0x00, 'S'});
+    FailUnless(a, JZ, 9);
+    // 10. WritePrivateProfileString("Game", "Score", "99"), read back as 99
+    e.Far(kGame); e.Far(kScore); e.Far(k99); e.Far(kIni);
+    e.Call(Emit::KERNEL, 129);
+    e.Far(kGame); e.Far(kScore); e.Imm(0); e.Far(kIni);
+    e.Call(Emit::KERNEL, 127);
+    cmpAx(99);
+    FailUnless(a, JZ, 10);
+
+    // 11. _lopen("CRTDATA.BIN", OF_READ); _lread 16 -> 8 bytes; _llseek(2); _lread 1 -> 'T'
+    e.Far(kData); e.Imm(0);
+    e.Call(Emit::KERNEL, 85);
+    cmpAx(0xFFFF);
+    FailUnless(a, JNZ, 11);
+    e.StoreAx(kFile);
+    e.Mem(kFile); e.Far(kBuf); e.Imm(16);
+    e.Call(Emit::KERNEL, 82);
+    cmpAx(8);
+    FailUnless(a, JZ, 11);
+    a.db({0x80, 0x3E, kBuf, 0x00, 'R'});
+    FailUnless(a, JZ, 11);
+    e.Mem(kFile); e.Long(2); e.Imm(0);
+    e.Call(Emit::KERNEL, 84);
+    cmpAx(2);
+    FailUnless(a, JZ, 11);
+    e.Mem(kFile); e.Far(kBuf); e.Imm(1);
+    e.Call(Emit::KERNEL, 82);
+    a.db({0x80, 0x3E, kBuf, 0x00, 'T'});
+    FailUnless(a, JZ, 11);
+    e.Mem(kFile);
+    e.Call(Emit::KERNEL, 81);  // _lclose
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 11);
+    // 12. "..\SECRET.TXT" is outside; opening for writing is refused
+    e.Far(kSecret); e.Imm(0);
+    e.Call(Emit::KERNEL, 85);
+    cmpAx(0xFFFF);
+    FailUnless(a, JZ, 12);
+    e.Far(kData); e.Imm(2);  // OF_READWRITE
+    e.Call(Emit::KERNEL, 85);
+    cmpAx(0xFFFF);
+    FailUnless(a, JZ, 12);
+
+    // 13. INT 21h: open (3Dh), read 4 bytes (3Fh), close (3Eh)
+    a.db({0xBA, kData, 0x00, 0xB8, 0x00, 0x3D, 0xCD, 0x21});  // mov dx, data / mov ax, 3D00h / int 21h
+    FailUnless(a, 0x73 /* JNC */, 13);
+    a.db({0x89, 0xC3, 0xB4, 0x3F, 0xB9, 0x04, 0x00, 0xBA, kBuf, 0x00, 0xCD, 0x21});  // read 4 to buf
+    FailUnless(a, 0x73, 13);
+    cmpAx(4);
+    FailUnless(a, JZ, 13);
+    a.db({0xB4, 0x3E, 0xCD, 0x21});  // close BX
+    FailUnless(a, 0x73, 13);
+
+    // 14. GetModuleHandle("USER"); GetProcAddress: GETMESSAGE yes, DIALOGBOX (not implemented) no
+    e.Far(kUserName);
+    e.Call(Emit::KERNEL, 47);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 14);
+    e.StoreAx(kUser);
+    e.Mem(kUser); e.Far(kGetMessage);
+    e.Call(Emit::KERNEL, 50);
+    a.db({0x09, 0xD0});  // or ax, dx
+    FailUnless(a, JNZ, 14);
+    e.Mem(kUser); e.Far(kDialogBox);
+    e.Call(Emit::KERNEL, 50);
+    a.db({0x09, 0xD0});
+    FailUnless(a, JZ, 14);
+
+    // 15. GetModuleFileName(hInst, buf, 64) > 0; GetDOSEnvironment starts with "PATH="
+    e.Mem(kHinst); e.Far(kBuf); e.Imm(64);
+    e.Call(Emit::KERNEL, 49);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 15);
+    e.Call(Emit::KERNEL, 131);
+    a.db({0x8E, 0xC2, 0x89, 0xC3});             // mov es, dx / mov bx, ax
+    a.db({0x26, 0x80, 0x3F, 'P'});              // cmp byte es:[bx], 'P'
+    FailUnless(a, JZ, 15);
+
+    // 16. LoadLibrary: MMSYSTEM.DLL (a stub module) >= 32, NOSUCH.DLL < 32
+    e.Far(kMmsystem);
+    e.Call(Emit::KERNEL, 95);
+    cmpAx(32);
+    FailUnless(a, 0x73 /* JAE */, 16);
+    e.Far(kNoSuch);
+    e.Call(Emit::KERNEL, 95);
+    cmpAx(32);
+    FailUnless(a, JC /* JB */, 16);
+
+    e.Exit0();
+    // Never reached: ShellAbout(hwnd, app, other, icon), importing SHELL.
+    e.Imm(0); e.Far(kX); e.Far(kX); e.Imm(0);
+    e.Call(SHELL, 22);
+    e.FailStubs(16);
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x100)};
+    return p;
+}
+
+// CrtProgram's files: CRT.INI and CRTDATA.BIN, for the program's directory.
+inline std::vector<std::pair<std::string, std::string>> CrtProgramFiles() {
+    return {{"CRT.INI", "; test settings\r\n[Game]\r\nLevel=7\r\nName = Sunny\r\n"}, {"CRTDATA.BIN", "RETRO16!"}};
 }
 
 }  // namespace win16test

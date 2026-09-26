@@ -125,7 +125,7 @@ set_tests_properties(Win16HelloViaLauncher PROPERTIES
 set_tests_properties(Win16FatalExitViaLauncher PROPERTIES
     PASS_REGULAR_EXPRESSION "fatal exit, code 7 - FatalExit\\(7\\)")
 set_tests_properties(Win16UnimplementedViaLauncher PROPERTIES
-    PASS_REGULAR_EXPRESSION "USER\\.7 is not implemented yet")
+    PASS_REGULAR_EXPRESSION "USER\\.7 \\(ExitWindows\\) is not implemented yet \\(returning to [0-9A-F]+:0005\\)")
 
 # Windowing through the real Win32 host (windows created but never shown).
 add_test(NAME Win16WindowViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_window.exe)
@@ -150,3 +150,20 @@ set_tests_properties(Win16PaintViaLauncher Win16AnimationViaLauncher PROPERTIES
 add_test(NAME Win16ResourcesViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_resources.exe)
 set_tests_properties(Win16ResourcesViaLauncher PROPERTIES FIXTURES_REQUIRED win16_samples
     PASS_REGULAR_EXPRESSION "Win16 task  : TESTAPP, 2 segments, 3 resources.*Win16 exit  : exited, code 0")
+
+# Real-program support: C-runtime style startup (local heap, files, INI,
+# WIN87EM, imported constants), the API trace, and DLLs that aren't built in
+# (SHELL here): a clean stop by name, or --stub-missing carrying on.
+add_test(NAME Win16CrtViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_crt.exe)
+add_test(NAME Win16TraceViaLauncher COMMAND ${LAUNCH} --trace-win16 ${WIN16_SAMPLES}/win16_hello.exe)
+add_test(NAME Win16StubModuleViaLauncher COMMAND ${LAUNCH} ${WIN16_SAMPLES}/win16_shell.exe)
+add_test(NAME Win16StubMissingViaLauncher COMMAND ${LAUNCH} --stub-missing ${WIN16_SAMPLES}/win16_shell.exe)
+set_tests_properties(Win16CrtViaLauncher Win16TraceViaLauncher Win16StubModuleViaLauncher
+    Win16StubMissingViaLauncher PROPERTIES FIXTURES_REQUIRED win16_samples)
+set_tests_properties(Win16CrtViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION "Win16 exit  : exited, code 0")
+set_tests_properties(Win16TraceViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
+    "\\[trace\\] [0-9A-F]+:[0-9A-F]+ KERNEL\\.91 InitTask.*\\[trace\\] [0-9A-F]+:[0-9A-F]+ USER\\.1 MessageBox\\(0000, \"Hello from Win16\", \"Project Sun\", 0000\\) = 0001")
+set_tests_properties(Win16StubModuleViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
+    "SHELL\\.22 \\(ShellAbout\\) is not implemented yet \\(returning to")
+set_tests_properties(Win16StubMissingViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
+    "SHELL\\.22 \\(ShellAbout\\) is not implemented yet: returning 0 \\(--stub-missing\\).*exited, code 51")

@@ -454,7 +454,7 @@ uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_
             id = nextTimerId_++;
         } while (id == 0 || find(0, id) != timers_.end());
     }
-    const uint32_t interval = std::max<uint32_t>(elapseMs, kMinTimerMs);
+    const uint32_t interval = std::max<uint32_t>(elapseMs, minTimerMs_);
     const Timer t{hwnd, id, procSel, procOff, interval, QpcNow() + MsToQpc(interval)};
     if (const auto it = find(hwnd, id); it != timers_.end()) {
         *it = t;

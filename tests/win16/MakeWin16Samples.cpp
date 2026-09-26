@@ -28,6 +28,8 @@ int main(int argc, char** argv) {
         {"win16_paint.exe", win16test::PaintProgram()},
         {"win16_anim.exe", win16test::AnimationProgram(30)},
         {"win16_resources.exe", win16test::ResourceProgram()},
+        {"win16_crt.exe", win16test::CrtProgram()},
+        {"win16_shell.exe", win16test::MissingModuleProgram()},
     };
     for (const auto& s : samples) {
         const std::vector<uint8_t> bytes = win16test::BuildNe(s.program);
@@ -38,6 +40,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("wrote %s (%zu bytes)\n", s.file, bytes.size());
+    }
+    // win16_crt.exe reads these from its directory.
+    for (const auto& [file, content] : win16test::CrtProgramFiles()) {
+        std::ofstream out(dir + "/" + file, std::ios::binary);
+        out << content;
+        if (!out) {
+            std::fprintf(stderr, "cannot write %s\n", file.c_str());
+            return 1;
+        }
     }
     return 0;
 }

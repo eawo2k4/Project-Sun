@@ -33,29 +33,59 @@ uint16_t Memory::Allocate(uint32_t size, SegmentKind kind) {
 
     uint32_t base = 0;
     if (kind != SegmentKind::Host) {
-        const uint32_t span = (size + 15u) & ~15u;  // paragraph granular, like the real thing
-        bool reused = false;
-        for (auto it = free_.begin(); it != free_.end(); ++it) {
-            if (it->size >= span) {  // first fit
-                base = it->base;
-                it->base += span;
-                it->size -= span;
-                if (it->size == 0) free_.erase(it);
-                reused = true;
-                break;
-            }
-        }
-        if (!reused) {
-            base = (next_ + 15u) & ~15u;
-            if (base + span > arena_.size()) return 0;
-            next_ = base + span;
-        }
+        base = AllocRange((size + 15u) & ~15u);  // paragraph granular, like the real thing
+        if (base == UINT32_MAX) return 0;
         std::memset(&arena_[base], 0, size);
     }
 
     ldt_[index] = Descriptor{base, size - 1, kind, true};
     nextIndex_ = static_cast<uint16_t>(index + 1);
     return static_cast<uint16_t>((index << 3) | 7);  // TI = LDT, RPL = 3
+}
+
+uint32_t Memory::AllocRange(uint32_t span) {
+    for (auto it = free_.begin(); it != free_.end(); ++it) {
+        if (it->size >= span) {  // first fit
+            const uint32_t base = it->base;
+            it->base += span;
+            it->size -= span;
+            if (it->size == 0) free_.erase(it);
+            return base;
+        }
+    }
+    const uint32_t base = (next_ + 15u) & ~15u;
+    if (base + span > arena_.size()) return UINT32_MAX;
+    next_ = base + span;
+    return base;
+}
+
+bool Memory::Resize(uint16_t selector, uint32_t size) {
+    const uint16_t index = selector >> 3;
+    if (size == 0 || size > 0x10000 || !Lookup(selector)) return false;
+    Descriptor& d = ldt_[index];
+    if (d.kind == SegmentKind::Host) return false;
+    const uint32_t oldSize = d.limit + 1;
+    const uint32_t oldSpan = (oldSize + 15u) & ~15u, span = (size + 15u) & ~15u;
+    if (span <= oldSpan) {  // fits in place; give back the tail
+        if (span < oldSpan) free_.push_back({d.base + span, oldSpan - span});
+    } else if (d.base + oldSpan == next_ && d.base + span <= arena_.size()) {
+        next_ = d.base + span;  // last in the arena: grow in place
+    } else {
+        const uint32_t base = AllocRange(span);
+        if (base == UINT32_MAX) return false;
+        std::memcpy(&arena_[base], &arena_[d.base], oldSize);
+        free_.push_back({d.base, oldSpan});
+        d.base = base;
+    }
+    if (size > oldSize) std::memset(&arena_[d.base + oldSize], 0, size - oldSize);
+    d.limit = size - 1;
+    return true;
+}
+
+uint32_t Memory::FreeBytes() const {
+    uint32_t bytes = uint32_t(arena_.size()) - next_;
+    for (const Range& r : free_) bytes += r.size;
+    return bytes;
 }
 
 void Memory::Free(uint16_t selector) {

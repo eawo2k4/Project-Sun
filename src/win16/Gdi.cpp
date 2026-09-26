@@ -454,7 +454,7 @@ void Api_TextOut(Runtime& rt, Cpu& cpu) {  // (HDC, x, y, LPCSTR, int count) -> 
     const int count = a.Int(4);
     BOOL ok = FALSE;
     if (dc && count >= 0) {
-        rt.Mem().Translate(str.sel, str.off, uint32_t(count), Access::Read);  // #GP if out of bounds
+        if (count > 0) rt.Mem().Translate(str.sel, str.off, uint32_t(count), Access::Read);  // #GP if out of bounds
         std::string text(size_t(count), '\0');
         for (int i = 0; i < count; ++i) text[size_t(i)] = char(rt.Mem().Read8(str.sel, uint16_t(str.off + i)));
         // Win16 text is ANSI (code page 1252), whatever the host's code page.

@@ -22,8 +22,9 @@ struct NeReloc {
 };
 
 struct NeSeg {
-    std::vector<uint8_t> bytes;
+    std::vector<uint8_t> bytes;  // iterated: the records as stored
     bool data = false;
+    bool iterated = false;
     uint32_t minAlloc = 0;  // 0 = size of bytes
     std::vector<NeReloc> relocs;
 };
@@ -178,7 +179,8 @@ inline std::vector<uint8_t> BuildNe(const NeProgram& p) {
         const size_t e = segTab + i * 8;
         Put16(f, e, s.bytes.empty() ? 0 : uint16_t(at >> kShift));
         Put16(f, e + 2, uint16_t(s.bytes.size()));
-        Put16(f, e + 4, uint16_t((s.data ? 0x0001 : 0) | (s.relocs.empty() ? 0 : 0x0100)));
+        Put16(f, e + 4, uint16_t((s.data ? 0x0001 : 0) | (s.iterated ? 0x0008 : 0) |
+                                 (s.relocs.empty() ? 0 : 0x0100)));
         const uint32_t minAlloc = s.minAlloc ? s.minAlloc : uint32_t(s.bytes.size());
         Put16(f, e + 6, uint16_t(minAlloc == 0x10000 ? 0 : minAlloc));
     }

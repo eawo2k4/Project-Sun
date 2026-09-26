@@ -278,6 +278,10 @@ int RunWin16Program(const std::filesystem::path& exe, const std::string& command
     win16::Runtime runtime;
     runtime.SetWindowHost(&host);
     runtime.SetFrameCap(options.fpsCap);
+    runtime.SetTrace(options.trace);
+    runtime.SetStubMissing(options.stubMissing);
+    runtime.SetExactTimers(options.exactTimers);
+    runtime.SetProgram(exe);
     runtime.SetOutput([](const std::string& line) {
         std::printf("[win16] %s\n", line.c_str());
         std::fflush(stdout);

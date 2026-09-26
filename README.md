@@ -30,11 +30,14 @@ Project Sun/
 │  │  ├─ NeLoader.cpp              selectors per segment, fixup chains, PSP, initial registers
 │  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset
 │  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
-│  │  ├─ Kernel.cpp                KERNEL: task start/exit, version, DOS3Call, global heap, resources
+│  │  ├─ ApiCatalog.cpp            generated: every system DLL export (name, params, constants)
+│  │  ├─ Kernel.cpp                KERNEL: task, heaps, modules, strings, files, INI, resources
+│  │  ├─ LocalHeap.cpp             LocalAlloc & co. inside DGROUP (Win16 handle tables)
+│  │  ├─ Files.cpp                 the task's file view (program directory, read-only), INI files
 │  │  ├─ Resources.cpp             resource lookup/loading, string tables
 │  │  ├─ User.cpp                  USER: classes, windows, message queue, timers, callbacks
 │  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, text, back buffers, presentation
-│  │  └─ Runtime.cpp               Win16 task: builtin DLL dispatch, INT 21h / 31h
+│  │  └─ Runtime.cpp               Win16 task: DLL dispatch, stub modules, trace, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
 │  │  ├─ ProcessLauncher.{h,cpp}   Detours create-suspended + inject + payload + resume
@@ -81,11 +84,13 @@ Project Sun/
 `RetroLaunch program.exe` on a 16-bit NE executable runs it in-process:
 
 - **Loader:** each segment gets an LDT selector (Windows-style values, `0x0107`,
-  `0x010F`, …). Segment data is copied from the file and relocations are applied,
-  including chained fixups, internal/movable targets, and imports by ordinal or name.
-  DGROUP is extended by the heap and stack, and a PSP carries the command line.
-  The task starts with the registers the Windows loader sets (DS = DGROUP, DI =
-  hInstance, BX/CX = stack/heap sizes, ES = PSP).
+  `0x010F`, …). Segment data is copied from the file (iterated segments are expanded)
+  and relocations are applied, including chained fixups, internal/movable targets, and
+  imports by ordinal or name. DGROUP is laid out like Windows does it (static data,
+  then the stack, then the local heap). A PSP carries the command line and the DOS
+  environment, and `hModule` is a copy of the NE header. The task starts with the
+  registers the Windows loader sets (DS = DGROUP, DI = hInstance, BX/CX = stack/heap
+  sizes, ES = PSP).
 - **Memory:** every `selector:offset` access goes through the virtual LDT and is
   checked like on a 286. A null or absent selector, an offset past the limit, a
   write to code or an execute from data raises #GP.
@@ -93,13 +98,47 @@ Project Sun/
   with protected-mode segment loads. Faults stop the task with the exact `CS:IP`
   and cause.
 - **System DLLs:** KERNEL, USER and GDI are built in (`Kernel.cpp`, `User.cpp`,
-  `Gdi.cpp`). Imports are resolved to `module-selector:ordinal` on a *host* segment,
-  so a far call runs the C++ implementation. Calling an API that isn't implemented
-  yet stops the task with e.g. `USER.39 is not implemented yet`, rather than
-  crashing. Implemented so far:
-  - KERNEL: `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `WaitEvent`,
-    `DOS3Call`, `GlobalAlloc`, `GlobalLock`, `GlobalUnlock`, `GlobalFree`, `GlobalSize`,
-    `FindResource`, `LoadResource`, `LockResource`, `FreeResource`, `SizeofResource`.
+  `Gdi.cpp`), plus WIN87EM's `__fpMath` start-up and shut-down calls. Imports are
+  resolved to `module-selector:ordinal` on a *host* segment, so a far call runs the C++
+  implementation.
+  - **API catalog:** every export of the Windows 3.x system DLLs is catalogued, with
+    its name, calling convention, parameters and constants (`ApiCatalog.cpp`,
+    generated from Wine's `.spec` files by `tools/gen_win16_catalog.py`; only these
+    interface facts are used). The catalog covers KERNEL, USER, GDI, KEYBOARD, SOUND,
+    MMSYSTEM, SHELL, COMMDLG, WIN87EM, LZEXPAND, VER, TOOLHELP, SYSTEM, DDEML, WINSOCK,
+    DISPLAY, MOUSE, COMM and WING.
+  - **Other DLLs load as stubs:** a program importing a DLL that isn't built in
+    (SHELL, MMSYSTEM, or the game's own) still loads, and only a call into it stops
+    the task.
+  - **Missing APIs stop cleanly, by name:** calling an API that isn't implemented yet
+    stops the task with e.g.
+    `USER.216 (GetDlgItem) is not implemented yet (returning to 0127:04A2)`, rather
+    than crashing.
+  - **Imported constants:** `__AHINCR`, `__AHSHIFT` and `__WINFLAGS` resolve to their
+    values. The real-mode memory selectors (`__A000H`, `__0040H`, …) resolve to null,
+    with a note.
+  - `GetProcAddress` only finds implemented functions, so a program that probes for an
+    API sees it missing.
+
+  Implemented so far:
+  - KERNEL: `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `GetWinFlags`
+    (286, standard mode, no coprocessor), `WaitEvent`, `Yield`, `DOS3Call`.
+    - Global heap: `GlobalAlloc`, `GlobalReAlloc`, `GlobalLock`, `GlobalUnlock`,
+      `GlobalFree`, `GlobalSize`, `GlobalHandle`, `GlobalFlags`, `GlobalCompact`,
+      `GetFreeSpace`, `LockSegment`/`UnlockSegment`.
+    - Local heap: `LocalInit`, `LocalAlloc`, `LocalReAlloc`, `LocalFree`, `LocalLock`,
+      `LocalUnlock`, `LocalSize`, `LocalHandle`, `LocalFlags`, `LocalCompact`.
+    - Modules: `GetModuleHandle`, `GetModuleFileName`, `GetProcAddress`,
+      `MakeProcInstance`/`FreeProcInstance`, `LoadLibrary` (built-in modules only),
+      `FreeLibrary`, `GetInstanceData`, `GetCurrentTask`, `GetCurrentPDB`,
+      `GetDOSEnvironment`.
+    - Strings: `lstrcpy`, `lstrcpyn`, `lstrcat`, `lstrlen`, `OutputDebugString`.
+    - Files: `OpenFile`, `_lopen`, `_lread`, `_llseek`, `_lclose` (`_lcreat`/`_lwrite`
+      are refused), plus `GetWindowsDirectory`, `GetSystemDirectory` and `SetErrorMode`.
+    - INI files: `GetProfileInt`/`String`, `GetPrivateProfileInt`/`String`,
+      `WriteProfileString`, `WritePrivateProfileString`.
+    - Resources: `FindResource`, `LoadResource`, `LockResource`, `FreeResource`,
+      `SizeofResource`.
   - USER: `RegisterClass`, `CreateWindow`/`CreateWindowEx`, `ShowWindow`,
     `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `GetMessage`, `PeekMessage`,
     `PostMessage`, `SendMessage`, `TranslateMessage`, `DispatchMessage`,
@@ -123,6 +162,22 @@ Project Sun/
   windows scaled by a whole number. Closing, keys and mouse come back as 16-bit
   messages, in the 16-bit window's coordinates. `WM_QUIT` is retrieved only after
   everything else, as in Windows.
+- **Local heaps:** `LocalAlloc` works on the heap in the caller's DS, normally DGROUP's,
+  which starts after the stack. A moveable block's handle is the offset of a real Win16
+  handle-table entry (address, flags, lock count), so code that dereferences a handle
+  finds the pointer. When the heap is full, DGROUP grows, up to 64 KB, keeping its
+  selector (`Memory::Resize`, which `GlobalReAlloc` uses too).
+- **Files:** the program sees its own directory, read-only.
+  - Relative paths, `C:\WINDOWS\…` and `C:\WINDOWS\SYSTEM\…` all map into that
+    directory, and the program's own absolute paths work.
+  - Anything that leads outside it is refused, including `..`, other drives and links
+    or junctions.
+  - Opening for writing, creating, deleting and renaming are refused with "access
+    denied" and a note. Saving belongs in a per-game save directory, which comes later.
+  - The same layer serves KERNEL's file functions and the C runtime's INT 21h calls:
+    open, read, seek, close, device info, attributes, date/time, current directory,
+    free space, and find (always empty).
+  - INI files are read from disk, and writes are kept in memory for the rest of the run.
 - **Resources:** the NE resource table is parsed at load: integer or named types
   (`RT_BITMAP`, `RT_ICON`, `RT_CURSOR`, `RT_MENU`, `RT_STRING`, custom types) and
   names. As in Windows 3.x, an `HRSRC` is the resource's `NAMEINFO` offset in the table,
@@ -180,14 +235,46 @@ the program exits with it), or 6 if the task stopped on a fault, an unimplemente
 while waiting for input that can never arrive. `--hidden` creates a 16-bit program's host
 windows without showing them; the tests use it.
 
+### Running a real 16-bit program
+
+```
+RetroLaunch --windowed C:\Games\SKI\SKIFREE.EXE
+RetroLaunch --trace-win16 C:\Games\SKI\SKIFREE.EXE > trace.txt
+```
+
+- `--inspect` shows the NE header without running anything.
+- `--trace-win16` logs every API call: the return address, `MODULE.ordinal`, the name,
+  the arguments decoded from the catalog (strings quoted, `MAKEINTRESOURCE` ids as
+  `#n`) and the result. Calls made from inside a callback are indented under the call
+  that led to them:
+  ```
+  [trace] 012F:0134 USER.41 CreateWindow("RetroWin", "Win16 Window", 00CF0000, -32768, ...)
+  [trace]   012F:02BF USER.107 DefWindowProc(2004, 0081, 0000, 010F0000) = 0000:0001
+  [trace]   = 2004
+  ```
+- When the program reaches something the engine doesn't have, the last line says what,
+  with its catalog name:
+  `Win16 exit  : stopped at an unimplemented API - SHELL.22 (ShellAbout) is not implemented yet (returning to 0127:04A2)`.
+- `--stub-missing` is for triage: a missing Pascal function with known parameters
+  returns 0 and the program carries on, with one note per function. Functions whose
+  arguments can't be removed safely still stop: register-based ones, and those with
+  unknown parameters. The program may misbehave afterwards, but you see everything it
+  needs in one run instead of one run per gap.
+- `--exact-timers` makes `SetTimer` honour intervals below 55 ms.
+- Writing files isn't supported yet: a game that saves (high scores, settings in its
+  own files) gets "access denied", and the launcher notes it once. INI settings work
+  for the run.
+
 Not yet: fonts (`CreateFont`; text uses the host's default font) and text metrics,
 lines and other shapes, regions, palettes (8-bit games), mapping modes, non-client areas
 (a 16-bit window is all client area), child windows (they get no back buffer), child
 controls and system classes (`BUTTON`, `EDIT`, …), menus, dialogs, icons and cursors
 from resources (they're parsed, but `LoadIcon`/`LoadCursor` return placeholders),
-system bitmaps (`OBM_xxx`), `SetSystemTimer`, other NE DLLs, huge (> 64 KB) global
-blocks, 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`),
-x87 / WIN87EM, and iterated segments.
+system bitmaps (`OBM_xxx`), `SetSystemTimer`, sound (MMSYSTEM, SOUND), writing files,
+loading NE DLLs (a game's own DLLs load as stubs), huge (> 64 KB) global blocks, 386
+instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), floating point
+(WIN87EM's emulation interrupts and x87 instructions stop the task with a clear
+message), and `Catch`/`Throw`.
 
 ## Shim modules
 
@@ -285,6 +372,10 @@ RetroLaunch [options] <program.exe> [program arguments...]
   --inspect        Print executable header info and exit
   --wait           Wait for exit and return the program's exit code
   --hidden         16-bit programs: create their windows but never show them
+  --trace-win16    16-bit programs: log every API call (arguments, result, return address)
+  --stub-missing   16-bit programs: missing APIs with known parameters return 0
+                   instead of stopping the program (logged once each)
+  --exact-timers   16-bit programs: timers honour intervals below Windows 3.x's 55 ms
   --no-shim        Launch without injection (baseline comparison)
   --shim <path>    Shim DLL (default: RetroShim.dll beside RetroLaunch)
   --cwd <dir>      Working directory (default: the program's folder)

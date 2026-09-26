@@ -135,7 +135,11 @@ bool LoadNe(const NeImage& image, const std::vector<uint8_t>& file, Memory& memo
             error = Fmt("out of memory allocating segment %u (%u bytes)", i + 1u, size);
             return false;
         }
-        if (seg.fileLength) std::memcpy(memory.SegmentData(sel), &file[seg.fileOffset], seg.fileLength);
+        if (!seg.expanded.empty()) {
+            std::memcpy(memory.SegmentData(sel), seg.expanded.data(), seg.expanded.size());
+        } else if (seg.fileLength) {
+            std::memcpy(memory.SegmentData(sel), &file[seg.fileOffset], seg.fileLength);
+        }
         out.selectors.push_back(sel);
     }
     if (image.autoDataSegment) out.dgroup = out.selectors[image.autoDataSegment - 1];
@@ -167,8 +171,22 @@ bool LoadNe(const NeImage& image, const std::vector<uint8_t>& file, Memory& memo
         return false;
     }
     r.s[SS] = out.selectors[stackSeg - 1];
-    r.r[SP] = image.initialSp ? image.initialSp
-                              : uint16_t(std::min<uint32_t>(memory.SegmentSize(r.s[SS]), 0xFFFE) & ~1u);
+    const uint32_t ssSize = memory.SegmentSize(r.s[SS]);
+    if (image.initialSp) {
+        r.r[SP] = image.initialSp;
+    } else if (stackSeg == image.autoDataSegment) {
+        // The stack follows the static data; the local heap follows the stack.
+        const uint32_t data = image.segments[stackSeg - 1].minAlloc;
+        r.r[SP] = uint16_t(std::min<uint32_t>(data + image.stackSize, std::min<uint32_t>(ssSize, 0xFFFE)) & ~1u);
+    } else {
+        r.r[SP] = uint16_t(std::min<uint32_t>(ssSize, 0xFFFE) & ~1u);
+    }
+    if (out.dgroup) {
+        const uint32_t dgSize = memory.SegmentSize(out.dgroup);
+        uint32_t heapStart = dgSize - std::min<uint32_t>(dgSize, image.heapSize);
+        if (out.dgroup == r.s[SS] && !image.initialSp) heapStart = r.r[SP];
+        out.heapStart = uint16_t(std::min<uint32_t>(heapStart, 0xFFFF));
+    }
     r.s[DS] = out.dgroup;
     r.s[ES] = out.psp;
     r.r[AX] = 0;

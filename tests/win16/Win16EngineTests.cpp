@@ -2,12 +2,18 @@
 // registers), resources, timers, and running synthetic programs to completion.
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 
 #include "../Check.h"
 #include "retro/FramePacing.h"
 #include "TestPrograms.h"
+#include "win16/ApiCatalog.h"
+#include "win16/Files.h"
+#include "win16/LocalHeap.h"
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
 #include "win16/Runtime.h"
@@ -24,10 +30,21 @@ struct RunOutcome {
     std::vector<std::string> output;
 };
 
-RunOutcome RunProgram(const NeProgram& program, uint64_t budget = 1'000'000) {
+bool StartsWith(const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; }
+
+struct RunSettings {
+    bool trace = false;
+    bool stubMissing = false;
+    std::filesystem::path program;  // the .exe path (its directory is what files see)
+};
+
+RunOutcome RunProgram(const NeProgram& program, uint64_t budget = 1'000'000, const RunSettings& s = {}) {
     RunOutcome o;
     Runtime rt;
     rt.SetOutput([&](const std::string& line) { o.output.push_back(line); });
+    rt.SetTrace(s.trace);
+    rt.SetStubMissing(s.stubMissing);
+    if (!s.program.empty()) rt.SetProgram(s.program);
     o.loaded = rt.Load(BuildNe(program), "arg1 arg2", o.loadError);
     if (o.loaded) o.exit = rt.Run(budget);
     std::printf("  -> %s code %u: %s (%llu instructions)\n", ToString(o.exit.kind), o.exit.code,
@@ -131,7 +148,11 @@ void TestLoaderSetsUpTask() {
     CHECK(r.s[DS] == m.dgroup && m.dgroup == m.selectors[1]);
     CHECK(r.s[SS] == m.dgroup);
     CHECK(rt.Mem().SegmentSize(m.dgroup) == 0x100 + 0x100 + 0x400);  // + heap + stack
-    CHECK(r.r[SP] == 0x600);
+    // Like Windows: static data, then the stack, then the local heap.
+    CHECK(r.r[SP] == 0x500 && m.heapStart == 0x500 && rt.Locals().Has(m.dgroup));
+    // The environment is in the PSP; hModule is a copy of the NE header.
+    CHECK(rt.Environment() && rt.Mem().Read16(m.psp, 0x2C) == rt.Environment());
+    CHECK(rt.Mem().Read16(rt.ModuleHandle(), 0) == 0x454E);  // "NE"
     CHECK(r.s[ES] == m.psp && r.r[DI] == m.dgroup && r.r[BX] == 0x400 && r.r[CX] == 0x100);
 
     // The far call to segment 3 was relocated to segment 3's selector.
@@ -182,13 +203,15 @@ void TestImportsByName() {
 
     o = RunProgram(ByNameProgram(true));
     CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
-    CHECK(o.exit.message == "KERNEL.FROBNICATE is not implemented yet");
+    CHECK(StartsWith(o.exit.message, "KERNEL.FROBNICATE is not implemented yet (returning to "));
 }
 
 void TestUnimplementedApiStopsCleanly() {
     const RunOutcome o = RunProgram(UnimplementedApiProgram());
     CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
-    CHECK(o.exit.message == "USER.7 is not implemented yet");
+    // Named from the catalog, with the return address (after the 5-byte CALL at 0).
+    CHECK(StartsWith(o.exit.message, "USER.7 (ExitWindows) is not implemented yet (returning to "));
+    CHECK(o.exit.message.find(":0005)") != std::string::npos);
 }
 
 void TestFaultsAreReported() {
@@ -202,10 +225,27 @@ void TestFaultsAreReported() {
     CHECK(o.exit.message.find("divide error") != std::string::npos);
 }
 
-void TestMissingModuleFailsToLoad() {
-    const RunOutcome o = RunProgram(MissingModuleProgram());
-    CHECK(!o.loaded);
-    CHECK(o.loadError.find("SHELL") != std::string::npos);
+void TestUnbuiltModulesLoadAsStubs() {
+    // SHELL isn't implemented but is known: the program loads, and the call
+    // stops it by name.
+    RunOutcome o = RunProgram(MissingModuleProgram());
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Unimplemented);
+    CHECK(StartsWith(o.exit.message, "SHELL.22 (ShellAbout) is not implemented yet (returning to "));
+
+    // A DLL nobody knows (the game's own): loads with a note, stops when called.
+    o = RunProgram(MissingModuleProgram("GAMEDLL", 3));
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Unimplemented);
+    CHECK(StartsWith(o.exit.message, "GAMEDLL.3 is not implemented yet"));
+    CHECK(o.exit.message.find("GAMEDLL is not built in") != std::string::npos);
+    CHECK(!o.output.empty() && o.output[0].find("module GAMEDLL is not built in") != std::string::npos);
+
+    // --stub-missing: known Pascal functions return 0 and the program goes on.
+    o = RunProgram(MissingModuleProgram(), 1'000'000, {false, true, {}});
+    CHECK(o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 51);
+    CHECK(o.output.size() == 1 && StartsWith(o.output[0], "SHELL.22 (ShellAbout) is not implemented yet: returning 0"));
+    //   ...but not unknown ones: their arguments can't be removed.
+    o = RunProgram(MissingModuleProgram("GAMEDLL", 3), 1'000'000, {false, true, {}});
+    CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
 }
 
 // --- Windowing, messages, callbacks, global heap ----------------------------------------------
@@ -619,6 +659,211 @@ void TestResourceProgramRendersOnTimer() {
     CHECK(yellow > 20 && blue > yellow);
 }
 
+// --- Real-program support: catalog, trace, KERNEL services -----------------------------------
+
+void TestCatalog() {
+    const CatalogModule* user = FindCatalogModule("user");
+    CHECK(user && FindCatalogModule("SHELL") && FindCatalogModule("MMSYSTEM") && !FindCatalogModule("NOPE"));
+    if (!user) return;
+    const CatalogEntry* cw = FindCatalogEntry(*user, 41);
+    CHECK(cw && std::string(cw->name) == "CreateWindow" && cw->kind == CatalogKind::Pascal);
+    CHECK(cw && ParamBytes(cw->params) == 30);  // matches the implementation's RETF 30
+    const CatalogEntry* byName = FindCatalogEntry(*user, "getmessage");
+    CHECK(byName && byName->ordinal == 108);
+    const CatalogEntry* wsprintf = FindCatalogEntry(*user, 420);
+    CHECK(wsprintf && wsprintf->kind == CatalogKind::Varargs);
+    const CatalogModule* kernel = FindCatalogModule("KERNEL");
+    const CatalogEntry* ahincr = kernel ? FindCatalogEntry(*kernel, 114) : nullptr;
+    CHECK(ahincr && ahincr->kind == CatalogKind::Equate && std::string(ahincr->name) == "__AHINCR");
+    const CatalogEntry* initTask = kernel ? FindCatalogEntry(*kernel, 91) : nullptr;
+    CHECK(initTask && initTask->kind == CatalogKind::Register);
+
+    // Every implemented function's ordinal names the same function in the catalog.
+    for (const auto& [module, api] : {std::pair{"KERNEL", KernelApi()}, std::pair{"USER", UserApi()},
+                                      std::pair{"GDI", GdiApi()}}) {
+        const CatalogModule* m = FindCatalogModule(module);
+        for (const ApiFunction& f : api) {
+            const CatalogEntry* c = m ? FindCatalogEntry(*m, f.ordinal) : nullptr;
+            std::string upper = c ? c->name : "";
+            for (char& ch : upper) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+            if (upper != f.name) std::printf("  mismatch: %s.%u %s vs %s\n", module, f.ordinal, f.name, upper.c_str());
+            CHECK(upper == f.name);
+        }
+    }
+}
+
+void TestTrace() {
+    const RunOutcome o = RunProgram(HelloProgram(), 1'000'000, {true, false, {}});
+    CHECK(o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 0);
+    for (const std::string& line : o.output) std::printf("  | %s\n", line.c_str());
+    auto has = [&](const std::string& text) {
+        return std::any_of(o.output.begin(), o.output.end(),
+                           [&](const std::string& l) { return l.find(text) != std::string::npos; });
+    };
+    CHECK(has("[trace] ") && has(" KERNEL.91 InitTask(AX="));
+    CHECK(has(" USER.1 MessageBox(0000, \"Hello from Win16\", \"Project Sun\", 0000) = 0001"));
+
+    // Nested: DispatchMessage -> WndProc -> DefWindowProc -> DestroyWindow ...
+    const RunOutcome w = RunProgram(WindowProgram(false), 1'000'000, {true, false, {}});
+    CHECK(w.exit.kind == TaskExit::Kind::Exited && w.exit.code == 0);
+    size_t dispatch = w.output.size(), nested = 0;
+    for (size_t i = 0; i < w.output.size(); ++i) {
+        if (dispatch == w.output.size() && w.output[i].find("USER.114 DispatchMessage(") != std::string::npos &&
+            w.output[i].find(" = ") == std::string::npos)
+            dispatch = i;  // printed before its callbacks' calls
+        if (i > dispatch && StartsWith(w.output[i], "[trace]   ")) ++nested;  // indented: inside a callback
+    }
+    CHECK(dispatch < w.output.size() && nested > 0);
+}
+
+void TestMemoryResize() {
+    Memory mem;
+    const uint16_t a = mem.Allocate(32, SegmentKind::Data);
+    const uint16_t b = mem.Allocate(32, SegmentKind::Data);  // a is no longer last
+    mem.Write8(a, 31, 0xAB);
+    const uint32_t before = mem.FreeBytes();
+    CHECK(mem.Resize(a, 5000));  // moves
+    CHECK(mem.SegmentSize(a) == 5000 && mem.Read8(a, 31) == 0xAB && mem.Read8(a, 4999) == 0);
+    CHECK(mem.Resize(b, 64) && mem.SegmentSize(b) == 64);
+    CHECK(mem.Resize(a, 16) && mem.SegmentSize(a) == 16);  // shrinks in place
+    bool faulted = false;
+    try {
+        mem.Read8(a, 16);
+    } catch (const ProtectionFault&) {
+        faulted = true;
+    }
+    CHECK(faulted);
+    CHECK(!mem.Resize(a, 0x10001) && !mem.Resize(0x1234, 16));
+    CHECK(mem.FreeBytes() <= before);
+}
+
+void TestLocalHeap() {
+    Memory mem;
+    LocalHeaps heaps(mem);
+    const uint16_t ds = mem.Allocate(0x200, SegmentKind::Data);
+    CHECK(heaps.Init(ds, 0x100, 0x1FF));
+    const uint16_t fixed = heaps.Alloc(ds, lmem::Fixed, 10);
+    CHECK(fixed >= 0x100 && heaps.Lock(ds, fixed) == fixed && heaps.HandleFor(ds, fixed) == fixed);
+    const uint16_t h = heaps.Alloc(ds, lmem::Moveable, 20);
+    CHECK(h && h != fixed);
+    const uint16_t p = heaps.Lock(ds, h);
+    CHECK(p && mem.Read16(ds, h) == p);                  // *handle == pointer
+    CHECK(heaps.Flags(ds, h) == 1 && mem.Read8(ds, uint16_t(h + 3)) == 1);  // lock count
+    CHECK(heaps.HandleFor(ds, p) == h && heaps.Size(ds, h) == 20);
+    CHECK(!heaps.Unlock(ds, h) && heaps.Flags(ds, h) == 0);
+    mem.Write8(ds, p, 0x42);
+    // Grow past the end: the segment grows (the heap ends where it does).
+    const uint16_t grown = heaps.ReAlloc(ds, h, 2000, lmem::Moveable);
+    CHECK(grown == h && heaps.Size(ds, h) == 2000 && mem.SegmentSize(ds) > 0x200);
+    const uint16_t moved = heaps.Lock(ds, h);
+    CHECK(mem.Read8(ds, moved) == 0x42 && mem.Read16(ds, h) == moved);
+    // A fixed block can't move unless asked to.
+    const uint16_t f2 = heaps.Alloc(ds, lmem::Fixed, 8);
+    CHECK(heaps.ReAlloc(ds, fixed, 400, lmem::Fixed) == 0);
+    CHECK(heaps.ReAlloc(ds, fixed, 4, lmem::Fixed) == fixed);  // shrinking stays put
+    CHECK(heaps.Free(ds, fixed) == 0 && heaps.Free(ds, fixed) == fixed && heaps.Free(ds, f2) == 0);
+    CHECK(heaps.Free(ds, h) == 0 && heaps.Count(ds) == 0);
+    CHECK(heaps.Compact(ds) > 2000);
+    CHECK(heaps.Alloc(0x1234, 0, 4) == 0);  // no heap there
+}
+
+std::filesystem::path MakeProgramDir(const std::string& name) {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("retro_win16_" + name);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir / "DATA");
+    for (const auto& [file, content] : CrtProgramFiles()) std::ofstream(dir / file, std::ios::binary) << content;
+    std::ofstream(dir / "DATA" / "LEVEL1.DAT", std::ios::binary) << "L1";
+    std::ofstream(dir.parent_path() / ("retro_win16_" + name + "_secret.txt")) << "secret";
+    return dir;
+}
+
+void TestFileSystem() {
+    const std::filesystem::path dir = MakeProgramDir("fs");
+    FileSystem fs;
+    fs.SetProgram(dir / "GAME.EXE");
+    std::filesystem::path out;
+    std::string why;
+    CHECK(fs.Resolve("CRT.INI", out, why) && out == dir / "CRT.INI");
+    CHECK(fs.Resolve("data\\level1.dat", out, why) && fs.Exists("DATA\\LEVEL1.DAT"));
+    CHECK(fs.Resolve("C:\\WINDOWS\\CRT.INI", out, why) && out == dir / "CRT.INI");
+    CHECK(fs.Resolve("c:\\windows\\system\\CRT.INI", out, why) && out == dir / "CRT.INI");
+    CHECK(fs.Resolve((dir / "CRT.INI").string(), out, why));  // its own absolute path
+    CHECK(!fs.Resolve("..\\retro_win16_fs_secret.txt", out, why));
+    CHECK(!fs.Resolve("DATA\\..\\..\\retro_win16_fs_secret.txt", out, why));
+    CHECK(!fs.Resolve("C:\\AUTOEXEC.BAT", out, why) && !fs.Resolve("\\\\server\\share\\x", out, why));
+    CHECK(!fs.Exists("NOPE.TXT") && !fs.Exists("CON"));
+
+    uint16_t error = 0;
+    const int h = fs.Open("CRTDATA.BIN", 0, error);
+    CHECK(h >= 5);
+    uint8_t buf[16] = {};
+    CHECK(fs.Read(h, buf, sizeof(buf)) == 8 && buf[0] == 'R' && buf[7] == '!');
+    CHECK(fs.Read(h, buf, sizeof(buf)) == 0);  // end of file
+    CHECK(fs.Seek(h, -2, 2) == 6 && fs.Read(h, buf, 1) == 1 && buf[0] == '6');
+    CHECK(fs.Seek(h, -100, 1) == -1);
+    CHECK(fs.Close(h) && !fs.Close(h) && fs.Read(h, buf, 1) == -1);
+    CHECK(fs.Open("CRTDATA.BIN", 1, error) == -1 && error == dos::AccessDenied);  // writing
+    CHECK(fs.Open("NOPE.BIN", 0, error) == -1 && error == dos::FileNotFound);
+
+    Profiles ini(fs);
+    std::string v;
+    CHECK(ini.Get("CRT.INI", "game", "LEVEL", v) && v == "7");
+    CHECK(ini.Get("CRT.INI", "Game", "Name", v) && v == "Sunny");
+    CHECK(!ini.Get("CRT.INI", "Game", "Nope", v) && !ini.Get("", "windows", "load", v));
+    CHECK(ini.Get("CRT.INI", "Game", "", v) && v == std::string("Level\0Name\0", 11));
+    const std::string key = "Score", value = "99";
+    ini.Write("crt.ini", "Game", &key, &value);
+    CHECK(ini.Get("CRT.INI", "Game", "score", v) && v == "99");
+    ini.Write("CRT.INI", "Game", &key, nullptr);  // delete the key
+    CHECK(!ini.Get("CRT.INI", "Game", "Score", v));
+    ini.Write("CRT.INI", "Game", nullptr, nullptr);  // delete the section
+    CHECK(!ini.Get("CRT.INI", "Game", "Level", v));
+    std::ifstream check(dir / "CRT.INI");
+    std::string first;
+    std::getline(check, first);
+    CHECK(first.rfind("; test settings", 0) == 0);  // the file itself is untouched
+}
+
+void TestCrtProgram() {
+    const std::filesystem::path dir = MakeProgramDir("crt");
+    const RunOutcome o = RunProgram(CrtProgram(), 1'000'000, {false, false, dir / "CRT.EXE"});
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 0);  // else the failed check
+    for (const std::string& line : o.output) std::printf("  | %s\n", line.c_str());
+}
+
+void TestIteratedSegment() {
+    NeProgram p = SelfTestProgram();
+    // DGROUP as iterated records: 4 x "AB", then 1 x "xyz".
+    NeSeg& d = p.segments[1];
+    d.iterated = true;
+    d.bytes = {4, 0, 2, 0, 'A', 'B', 1, 0, 3, 0, 'x', 'y', 'z'};
+    NeImage img;
+    std::string error;
+    CHECK(ParseNe(BuildNe(p), img, error));
+    CHECK(std::string(img.segments[1].expanded.begin(), img.segments[1].expanded.end()) == "ABABABABxyz");
+    Runtime rt;
+    CHECK(rt.Load(BuildNe(p), "", error));
+    CHECK(std::string(reinterpret_cast<const char*>(rt.Mem().SegmentData(rt.Module().dgroup)), 11) == "ABABABABxyz");
+    d.bytes = {4, 0, 9, 0, 'A'};  // record longer than the data
+    CHECK(!ParseNe(BuildNe(p), img, error) && error.find("iterated") != std::string::npos);
+}
+
+void TestExactTimers() {
+    Runtime rt;
+    User& u = rt.Windows();
+    rt.SetExactTimers(true);
+    CHECK(u.MinTimerMs() == 1);
+    const uint16_t id = u.StartTimer(0, 0, 5, 0, 0);
+    const int64_t start = retro::QpcNow();
+    Msg16 m;
+    for (int i = 0; i < 4; ++i) CHECK(u.Next(m, 0, 0, 0, true, true) == User::Fetch::Message && m.wParam == id);
+    const double ms = double(retro::QpcNow() - start) * 1000.0 / double(retro::QpcFrequency());
+    std::printf("  4 ticks of an exact 5 ms timer: %.1f ms\n", ms);
+    CHECK(ms >= 4 * 5 * 0.9 && ms < 55);
+    rt.SetExactTimers(false);
+    CHECK(u.MinTimerMs() == 55);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -644,7 +889,7 @@ int main() {
         {"ImportsByName", TestImportsByName},
         {"UnimplementedApiStopsCleanly", TestUnimplementedApiStopsCleanly},
         {"FaultsAreReported", TestFaultsAreReported},
-        {"MissingModuleFailsToLoad", TestMissingModuleFailsToLoad},
+        {"UnbuiltModulesLoadAsStubs", TestUnbuiltModulesLoadAsStubs},
         {"WindowProgramRunsToQuit", TestWindowProgramRunsToQuit},
         {"HostCloseReachesWndProc", TestHostCloseReachesWndProc},
         {"HandleMappingWhileRunning", TestHandleMappingWhileRunning},
@@ -661,6 +906,14 @@ int main() {
         {"BitmapsFromDibs", TestBitmapsFromDibs},
         {"TimerCadence", TestTimerCadence},
         {"ResourceProgramRendersOnTimer", TestResourceProgramRendersOnTimer},
+        {"Catalog", TestCatalog},
+        {"Trace", TestTrace},
+        {"MemoryResize", TestMemoryResize},
+        {"LocalHeap", TestLocalHeap},
+        {"FileSystem", TestFileSystem},
+        {"CrtProgram", TestCrtProgram},
+        {"IteratedSegment", TestIteratedSegment},
+        {"ExactTimers", TestExactTimers},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

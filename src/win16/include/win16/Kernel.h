@@ -18,6 +18,7 @@ namespace gmem {
 constexpr uint16_t Fixed = 0x0000;
 constexpr uint16_t Moveable = 0x0002;
 constexpr uint16_t ZeroInit = 0x0040;
+constexpr uint16_t Modify = 0x0080;
 }  // namespace gmem
 
 class GlobalHeap {
@@ -34,6 +35,11 @@ public:
     // True while still locked.
     bool Unlock(uint16_t handle);
     uint32_t Size(uint16_t handle) const;
+    // GlobalReAlloc: the same handle (blocks keep their selector), or 0.
+    // GMEM_MODIFY changes only the flags (fixed <-> moveable changes the handle).
+    uint16_t ReAlloc(uint16_t handle, uint32_t bytes, uint16_t flags);
+    // GlobalHandle: the handle of a block's selector, or 0.
+    uint16_t HandleOf(uint16_t selector) const;
 
     size_t Count() const { return blocks_.size(); }
     uint16_t LockCount(uint16_t handle) const;
