@@ -113,17 +113,21 @@ void TestRealTimePacing() {
     const double freq = static_cast<double>(QpcFrequency());
     const double total = (stamps.back() - stamps.front()) / freq;
     const double expected = (frames - 1) / 60.0;
+    // "Early" is measured against each frame's slot on the cadence, not the
+    // previous frame: after a late (preempted) frame the next one is meant to
+    // follow sooner to keep the cadence, but no frame may beat its slot.
+    const int64_t period = QpcFrequency() / 60;
     double worstEarly = 0;
     for (size_t i = 1; i < stamps.size(); ++i) {
-        const double dt = (stamps[i] - stamps[i - 1]) / freq;
-        worstEarly = std::max(worstEarly, (1.0 / 60.0) - dt);
+        const int64_t slot = stamps.front() + static_cast<int64_t>(i) * period;
+        worstEarly = std::max(worstEarly, (slot - stamps[i]) / freq);
     }
     std::printf("  %d frames in %.1f ms (ideal %.1f ms), %s timer, worst early %.3f ms\n", frames,
                 total * 1000, expected * 1000, waiter.HighResolution() ? "high-res" : "legacy",
                 worstEarly * 1000);
     CHECK(total >= expected * 0.99);  // never faster than the cap
     CHECK(total <= expected * 1.25);  // and not wildly slower
-    CHECK(worstEarly < 0.0005);       // no frame more than 0.5 ms early
+    CHECK(worstEarly < 0.0002);       // no frame ahead of its slot (0.2 ms clock slack)
 }
 
 }  // namespace

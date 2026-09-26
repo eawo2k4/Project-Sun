@@ -4,8 +4,9 @@ Project Sun is a software/layer that will let you run Windows 3.x–XP games.
 
 RetroRunner is an in-process compatibility runner for vintage Windows games (Win 3.x → XP) on
 Windows 11 x64. It runs games natively: no VM, no whole-PC emulator, no Wine.
-32-bit games run under WOW64 with an injected shim DLL. 16-bit NE programs
-will go through an embedded Win16 engine (planned).
+32-bit games run under WOW64 with an injected shim DLL. 16-bit NE programs run
+in-process on the built-in Win16 engine: an NE loader, a virtual LDT and a
+286-class interpreter. The engine is at an early stage; see [Win16 engine](#win16-engine).
 
 ## Layout
 
@@ -24,9 +25,16 @@ Project Sun/
 │  │  ├─ include/retro/PathUtil.h      ANSI/UTF-8 path helpers
 │  │  ├─ include/retro/ShimProtocol.h  launcher → shim config payload (GUID + struct)
 │  │  └─ *.cpp
+│  ├─ win16/               RetroWin16.lib: 16-bit Windows engine (no Windows headers)
+│  │  ├─ NeImage.cpp               NE parser: segments, relocations, imports, entry table
+│  │  ├─ NeLoader.cpp              selectors per segment, fixup chains, PSP, initial registers
+│  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset
+│  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
+│  │  └─ Runtime.cpp               Win16 task: built-in KERNEL/USER/GDI, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
-│  │  └─ ProcessLauncher.{h,cpp}   Detours create-suspended + inject + payload + resume
+│  │  ├─ ProcessLauncher.{h,cpp}   Detours create-suspended + inject + payload + resume
+│  │  └─ Win16Host.{h,cpp}         runs NE programs on the Win16 engine
 │  └─ shim/                RetroShim.dll (injected)
 │     ├─ dllmain.cpp               attach/detach, config load, per-module transactions
 │     ├─ ShimState.h               config + module handle for hook modules
@@ -58,11 +66,43 @@ Project Sun/
    ├─ DisplayMathTests.cpp viewports, aspect, mapping round-trips, window classification
    ├─ FramePacingTests.cpp scheduler with a fake clock + one real-time measurement
    ├─ PixelConvertTests.cpp format conversion, channel expansion, CRC
+   ├─ win16/               Win16 engine: CPU instruction tests, NE/loader/runtime tests,
+   │                       Asm16 + NeBuilder (synthetic NE executables), sample generator
    └─ ShimProbe.cpp, ProbeDisplay.cpp, ProbeGraphics.cpp, ProbeD3D8.cpp
                            x86 target driven by the end-to-end tests (see tests/CMakeLists.txt)
 ```
 
-Planned modules: `src/win16/` (NE loader + CPU engine + thunks).
+## Win16 engine
+
+`RetroLaunch program.exe` on a 16-bit NE executable runs it in-process:
+
+- **Loader:** each segment gets an LDT selector (Windows-style values, `0x0107`,
+  `0x010F`, …). Segment data is copied from the file and relocations are applied,
+  including chained fixups, internal/movable targets, and imports by ordinal or name.
+  DGROUP is extended by the heap and stack, and a PSP carries the command line.
+  The task starts with the registers the Windows loader sets (DS = DGROUP, DI =
+  hInstance, BX/CX = stack/heap sizes, ES = PSP).
+- **Memory:** every `selector:offset` access goes through the virtual LDT and is
+  checked like on a 286. A null or absent selector, an offset past the limit, a
+  write to code or an execute from data raises #GP.
+- **CPU:** a 286-class interpreter covering the 8086/80186 integer instruction set
+  with protected-mode segment loads. Faults stop the task with the exact `CS:IP`
+  and cause.
+- **System DLLs:** KERNEL, USER and GDI are built in. Imports are resolved to
+  `module-selector:ordinal` on a *host* segment, so a far call runs the C++
+  implementation. Calling an API that isn't implemented yet stops the task with
+  e.g. `USER.41 is not implemented yet`, rather than crashing. Implemented so far:
+  KERNEL `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `WaitEvent`,
+  `DOS3Call`; USER `InitApp`, `MessageBox` (printed to the console).
+- **Interrupts:** INT 21h (exit, version, console output, drive, PSP), INT 20h, and
+  INT 31h DPMI queries (segment base, version).
+
+Launcher exit code: the program's own (INT 21h/4Ch, `FatalExit`), or 6 if the task
+stopped on a fault or an unimplemented API.
+
+Not yet: windows and message loops (most of USER/GDI), other NE DLLs, resources,
+386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), x87 /
+WIN87EM, `GlobalAlloc` and friends, and iterated segments.
 
 ## Shim modules
 
@@ -183,5 +223,6 @@ RetroLaunch [options] <program.exe> [program arguments...]
   vendored unmodified in [third_party/d3d8to9](third_party/d3d8to9) at a pinned commit.
   Its licence is in [third_party/d3d8to9/LICENSE.md](third_party/d3d8to9/LICENSE.md).
 
-Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure.
-With `--wait`, the launcher returns the program's own exit code.
+Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure,
+6 Win16 task stopped (fault or unimplemented API). With `--wait`, and always for
+16-bit programs, the launcher returns the program's own exit code.

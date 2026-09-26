@@ -12,6 +12,7 @@
 #include "retro/ClampPolicy.h"
 #include "retro/ExeFormat.h"
 #include "retro/PathUtil.h"
+#include "Win16Host.h"
 
 namespace fs = std::filesystem;
 using retro::ToUtf8;
@@ -233,8 +234,8 @@ int wmain(int argc, wchar_t** argv) {
         inject = false;
         break;
     case retro::LaunchPath::Win16Engine:
-        std::fputs("error: the Win16 execution engine is not implemented yet.\n", stderr);
-        return Exit_Unsupported;
+        // 16-bit Windows: run in-process on the Win16 engine (no shim needed).
+        return retro::RunWin16Program(exe, ToUtf8(opt.arguments));
     case retro::LaunchPath::Unsupported:
     default:
         std::fprintf(stderr, "error: cannot launch: %s\n", reason.c_str());

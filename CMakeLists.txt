@@ -54,6 +54,7 @@ target_link_libraries(Detours::Detours INTERFACE
 
 add_subdirectory(third_party/d3d8to9)
 add_subdirectory(src/core)
+add_subdirectory(src/win16)
 add_subdirectory(src/shim)
 add_subdirectory(src/launcher)
 

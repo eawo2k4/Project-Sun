@@ -91,3 +91,38 @@ add_test(NAME Direct3D8Native COMMAND ${LAUNCH} ${PROBE} d3d8 60 native)
 add_test(NAME Direct3D8Bridge COMMAND ${LAUNCH} --d3d8to9 ${PROBE} d3d8 60 bridge)
 add_test(NAME Direct3D8BridgeOn12 COMMAND ${LAUNCH} --d3d8to9 --d3d9on12 ${PROBE} d3d8 60 bridge12)
 add_test(NAME Direct3D8Unpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} d3d8 0 native)
+
+# --- Win16 engine -----------------------------------------------------------------
+
+add_executable(Win16CpuTests win16/Win16CpuTests.cpp Check.h)
+target_link_libraries(Win16CpuTests PRIVATE RetroWin16)
+add_test(NAME Win16Cpu COMMAND Win16CpuTests)
+
+add_executable(Win16EngineTests win16/Win16EngineTests.cpp win16/Asm16.h win16/NeBuilder.h
+    win16/TestPrograms.h Check.h)
+target_link_libraries(Win16EngineTests PRIVATE RetroWin16)
+add_test(NAME Win16Engine COMMAND Win16EngineTests)
+
+# End to end: generate real NE executables, then run them through RetroLaunch.
+add_executable(MakeWin16Samples win16/MakeWin16Samples.cpp win16/Asm16.h win16/NeBuilder.h
+    win16/TestPrograms.h)
+set(WIN16_SAMPLES ${CMAKE_CURRENT_BINARY_DIR}/win16_samples)
+file(MAKE_DIRECTORY ${WIN16_SAMPLES})
+add_test(NAME Win16MakeSamples COMMAND MakeWin16Samples ${WIN16_SAMPLES})
+set_tests_properties(Win16MakeSamples PROPERTIES FIXTURES_SETUP win16_samples)
+
+add_test(NAME Win16InspectRoutesToEngine COMMAND $<TARGET_FILE:RetroLaunch> --inspect ${WIN16_SAMPLES}/win16_selftest.exe)
+add_test(NAME Win16SelfTestViaLauncher COMMAND ${LAUNCH} ${WIN16_SAMPLES}/win16_selftest.exe)
+add_test(NAME Win16HelloViaLauncher COMMAND ${LAUNCH} ${WIN16_SAMPLES}/win16_hello.exe)
+add_test(NAME Win16FatalExitViaLauncher COMMAND ${LAUNCH} ${WIN16_SAMPLES}/win16_fatalexit.exe)
+add_test(NAME Win16UnimplementedViaLauncher COMMAND ${LAUNCH} ${WIN16_SAMPLES}/win16_unimplemented.exe)
+set_tests_properties(Win16InspectRoutesToEngine Win16SelfTestViaLauncher Win16HelloViaLauncher
+    Win16FatalExitViaLauncher Win16UnimplementedViaLauncher PROPERTIES FIXTURES_REQUIRED win16_samples)
+set_tests_properties(Win16InspectRoutesToEngine PROPERTIES
+    PASS_REGULAR_EXPRESSION "16-bit NE.*Win16 execution engine")
+set_tests_properties(Win16HelloViaLauncher PROPERTIES
+    PASS_REGULAR_EXPRESSION "\\[win16\\] MessageBox \\[Project Sun\\]: Hello from Win16.*exited, code 0")
+set_tests_properties(Win16FatalExitViaLauncher PROPERTIES
+    PASS_REGULAR_EXPRESSION "fatal exit, code 7 - FatalExit\\(7\\)")
+set_tests_properties(Win16UnimplementedViaLauncher PROPERTIES
+    PASS_REGULAR_EXPRESSION "USER\\.41 is not implemented yet")
