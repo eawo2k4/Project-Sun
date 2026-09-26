@@ -399,6 +399,13 @@ RetroLaunch [options] <program.exe> [program arguments...]
 - [d3d8to9](https://github.com/crosire/d3d8to9) by Patrick Mours (BSD-2-Clause),
   vendored unmodified in [third_party/d3d8to9](third_party/d3d8to9) at a pinned commit.
   Its licence is in [third_party/d3d8to9/LICENSE.md](third_party/d3d8to9/LICENSE.md).
+- [Wine](https://www.winehq.org/) (LGPL-2.1-or-later): the Win16 API catalog
+  ([src/win16/ApiCatalog.cpp](src/win16/ApiCatalog.cpp)) is generated from Wine's
+  16-bit DLL `.spec` files by [tools/gen_win16_catalog.py](tools/gen_win16_catalog.py).
+  Only interface facts are taken: export ordinals and names, calling conventions,
+  parameter types and constant values. No Wine code is used, linked or run; the engine
+  and its API implementations are written independently. Ordinals were also checked
+  against the same files.
 
 Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure,
 6 Win16 task stopped (fault, unimplemented API, or blocked waiting for input). With `--wait`, and always for
