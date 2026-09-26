@@ -52,6 +52,7 @@ target_include_directories(Detours::Detours INTERFACE "${DETOURS_INCLUDE_DIR}")
 target_link_libraries(Detours::Detours INTERFACE
     "$<IF:$<CONFIG:Debug>,${DETOURS_LIBRARY_DEBUG},${DETOURS_LIBRARY_RELEASE}>")
 
+add_subdirectory(third_party/d3d8to9)
 add_subdirectory(src/core)
 add_subdirectory(src/shim)
 add_subdirectory(src/launcher)

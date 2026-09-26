@@ -16,6 +16,9 @@
 //   ShimProbe ddraw <fps>         IDirectDraw exclusive 640x480x8: virtualized, palette, pacing
 //   ShimProbe ddraw7 <fps>        same through IDirectDraw7 at 640x480x16
 //   ShimProbe d3d9 <fps> [on12]   fullscreen D3D9 device contained, Present paced
+//   ShimProbe d3d8 <fps> [native|bridge|bridge12]
+//                                 fullscreen D3D8 device contained (natively, or bridged
+//                                 through d3d8to9 onto D3D9 / D3D9On12), renders, paced
 
 #include <windows.h>
 
@@ -247,6 +250,13 @@ int wmain(int argc, wchar_t** argv) {
     if (mode == L"render") return probe::ProbeRender(ArgOr(argc, argv, 2, 60));
     if (mode == L"ddraw") return probe::ProbeDirectDraw(ArgOr(argc, argv, 2, 60), false);
     if (mode == L"ddraw7") return probe::ProbeDirectDraw(ArgOr(argc, argv, 2, 60), true);
+    if (mode == L"d3d8") {
+        const std::wstring path = argc > 3 ? argv[3] : L"native";
+        return probe::ProbeDirect3D8(ArgOr(argc, argv, 2, 60),
+                                     path == L"bridge12" ? probe::D3D8Path::BridgeOn12
+                                     : path == L"bridge" ? probe::D3D8Path::Bridge
+                                                         : probe::D3D8Path::Native);
+    }
     if (mode == L"d3d9")
         return probe::ProbeDirect3D9(ArgOr(argc, argv, 2, 60),
                                      argc > 3 && std::wstring(argv[3]) == L"on12");

@@ -24,8 +24,11 @@ add_test(NAME PixelConvert COMMAND PixelConvertTests)
 
 # ddraw is linked (loaded at startup); d3d9 is loaded with LoadLibrary at run
 # time, to cover both ways games pull in DirectX.
-add_executable(ShimProbe ShimProbe.cpp ProbeDisplay.cpp ProbeGraphics.cpp ProbeCommon.h)
+add_executable(ShimProbe ShimProbe.cpp ProbeDisplay.cpp ProbeGraphics.cpp ProbeD3D8.cpp
+    ProbeCommon.h)
 target_link_libraries(ShimProbe PRIVATE RetroCore shell32 ole32 opengl32 ddraw dxguid)
+# D3D8 interface declarations only (the SDK dropped d3d8.h); not the bridge itself.
+target_include_directories(ShimProbe PRIVATE ${PROJECT_SOURCE_DIR}/third_party/d3d8to9/source)
 
 set(LAUNCH $<TARGET_FILE:RetroLaunch> --wait)
 set(PROBE $<TARGET_FILE:ShimProbe>)
@@ -80,3 +83,11 @@ add_test(NAME DirectDrawUnpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} ddraw 0)
 add_test(NAME Direct3D9Contained COMMAND ${LAUNCH} ${PROBE} d3d9 60)
 add_test(NAME Direct3D9On12 COMMAND ${LAUNCH} --d3d9on12 ${PROBE} d3d9 60 on12)
 add_test(NAME Direct3D9Unpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} d3d9 0)
+
+# Direct3D 8: native containment, and the d3d8to9 bridge onto D3D9 / D3D9On12.
+# The probe renders a frame and reads it back, so a bridge that "succeeds" but
+# draws nothing fails.
+add_test(NAME Direct3D8Native COMMAND ${LAUNCH} ${PROBE} d3d8 60 native)
+add_test(NAME Direct3D8Bridge COMMAND ${LAUNCH} --d3d8to9 ${PROBE} d3d8 60 bridge)
+add_test(NAME Direct3D8BridgeOn12 COMMAND ${LAUNCH} --d3d8to9 --d3d9on12 ${PROBE} d3d8 60 bridge12)
+add_test(NAME Direct3D8Unpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} d3d8 0 native)

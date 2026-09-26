@@ -36,7 +36,9 @@ Project Sun/
 │     │  ├─ VtableHook.{h,cpp}     lazy COM vtable patching, per interface version
 │     │  ├─ ModuleWatch.{h,cpp}    hooks DLLs when they load (static import or LoadLibrary)
 │     │  ├─ DDraw.cpp              DirectDraw exclusive-mode containment + virtual primary
+│     │  ├─ D3D8.cpp               Direct3D 8 containment + pacing, or the d3d8to9 bridge
 │     │  ├─ D3D9.cpp               Direct3D 9 fullscreen containment, Present pacing, 9On12
+│     │  ├─ D3DCommon.h            containment shared by the D3D8 and D3D9 hooks
 │     │  └─ Graphics.{h,cpp}       module entry points, diagnostics
 │     ├─ Log.{h,cpp}               DllMain-safe logger
 │     ├─ RetroShim.def             exports ordinal #1 (required by Detours)
@@ -47,6 +49,8 @@ Project Sun/
 │        ├─ ProcessHooks.cpp       CreateProcessA/W + CreateProcessInternalW → child injection
 │        ├─ DisplayHooks.cpp       display modes, window sandbox, cursor, input coordinates
 │        └─ RenderHooks.cpp        GDI scaling + presentation frame pacing
+├─ third_party/
+│  └─ d3d8to9/             crosire/d3d8to9 (BSD-2), unmodified sources + our CMake wrapper
 └─ tests/
    ├─ Check.h              tiny test harness
    ├─ ExeFormatTests.cpp   parser unit tests (synthetic images + real system DLLs)
@@ -54,7 +58,7 @@ Project Sun/
    ├─ DisplayMathTests.cpp viewports, aspect, mapping round-trips, window classification
    ├─ FramePacingTests.cpp scheduler with a fake clock + one real-time measurement
    ├─ PixelConvertTests.cpp format conversion, channel expansion, CRC
-   └─ ShimProbe.cpp, ProbeDisplay.cpp, ProbeGraphics.cpp
+   └─ ShimProbe.cpp, ProbeDisplay.cpp, ProbeGraphics.cpp, ProbeD3D8.cpp
                            x86 target driven by the end-to-end tests (see tests/CMakeLists.txt)
 ```
 
@@ -79,6 +83,7 @@ Planned modules: `src/win16/` (NE loader + CPU engine + thunks).
 | graphics: DirectDraw | `DirectDrawCreate(Ex)`, then `IDirectDraw`/`2`/`4`/`7` and `IDirectDrawSurface`…`7` methods | `DDSCL_EXCLUSIVE \| DDSCL_FULLSCREEN` becomes `DDSCL_NORMAL`, and `SetDisplayMode` sets the virtual mode, so the real desktop never changes. The primary and back buffer are system-memory surfaces in the virtual format (8-bit palettized included), reported to the game as a flipping primary chain. Surfaces created without a pixel format get the virtual depth, not the desktop's. `EnumDisplayModes` and `GetDisplayMode` report classic and virtual modes. |
 | | `Flip`, `Blt`/`BltFast` to the primary, `Unlock`, `ReleaseDC`, `IDirectDrawPalette::SetEntries`, `WaitForVerticalBlank` | Presenting converts the primary to 32-bit BGRA (palette lookup for 8-bit) and draws it into the managed window's integer-scaled viewport. `Flip` and whole-frame blits are paced; partial updates are coalesced to one per frame period and flushed from the message pump. Palette changes (fades) re-present immediately. `WaitForVerticalBlank` is paced to the cap instead of the real 144/165 Hz refresh, and a `Flip` right after it counts as the same frame. |
 | graphics: Direct3D 9 | `Direct3DCreate9`, `IDirect3D9::CreateDevice`, `IDirect3DDevice9::Reset`/`Present`/`GetDisplayMode` | A fullscreen device is created windowed in the managed window, and its back buffer becomes the virtual mode. `Present` is paced and aimed at the viewport, with black bars. `--d3d9on12` routes `Direct3DCreate9` through `Direct3DCreate9On12`, so D3D9 runs on D3D12 queues. |
+| graphics: Direct3D 8 | `Direct3DCreate8`, `IDirect3D8::CreateDevice`, `IDirect3DDevice8::Reset`/`Present`/`GetDisplayMode` | By default native `d3d8.dll` gets the same treatment as D3D9: fullscreen becomes windowed in the sandbox, and `Present` is paced and letterboxed. With `--d3d8to9`, `Direct3DCreate8` returns the vendored [d3d8to9](third_party/d3d8to9) bridge, which implements D3D8 on D3D9. It gets its D3D9 through the hooked `Direct3DCreate9`, so the D3D9 containment and pacing apply, and `--d3d8to9 --d3d9on12` runs a D3D8 game on D3D12. |
 
 The display and render hooks only virtualize for **game code**. Calls coming from
 DLLs under the Windows directory (user32 internals, DirectDraw's own GDI use) see
@@ -91,7 +96,10 @@ load, including a `LoadLibrary` long after startup. Diagnostics exports:
 Known limits:
 - A DirectDraw primary created with `DDSCAPS_3DDEVICE` (Direct3D 3–7 rendering straight
   to the primary) can't live in system memory. That game gets the real exclusive mode
-  it asked for, and the log says so. Direct3D 8 and Direct3D 9Ex aren't intercepted yet.
+  it asked for, and the log says so. Direct3D 9Ex isn't intercepted yet.
+- The d3d8to9 bridge translates D3D8 shaders with D3DX (`d3dx9_43.dll`, from the DirectX
+  End-User Runtime). If it's missing, the bridge shows its own message box, and games
+  that use shaders won't render correctly. Fixed-function games don't need it.
 - DirectDraw presents through GDI (`StretchDIBits`) on the CPU: fine for 640×480-class
   games, but a GPU presenter would be cheaper at 4K.
 - Direct3D 9 windowed `Present` stretches with the driver's filter, so the image is
@@ -164,7 +172,16 @@ RetroLaunch [options] <program.exe> [program arguments...]
   --no-integer-scaling    Fill the screen with fractional (still 4:3) scaling
   --no-display-sandbox    Let the game change the real display mode (pacing still applies)
   --d3d9on12       Run Direct3D 9 games on Direct3D 12 (Direct3DCreate9On12)
+  --d3d8to9        Run Direct3D 8 games on Direct3D 9 (bundled d3d8to9); with
+                   --d3d9on12 they end up on Direct3D 12
 ```
+
+## Third-party code
+
+- [Microsoft Detours](https://github.com/microsoft/Detours) (MIT), via vcpkg.
+- [d3d8to9](https://github.com/crosire/d3d8to9) by Patrick Mours (BSD-2-Clause),
+  vendored unmodified in [third_party/d3d8to9](third_party/d3d8to9) at a pinned commit.
+  Its licence is in [third_party/d3d8to9/LICENSE.md](third_party/d3d8to9/LICENSE.md).
 
 Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure.
 With `--wait`, the launcher returns the program's own exit code.

@@ -42,17 +42,24 @@ enum DisplayFlag : uint32_t {
     DisplayFlag_Windowed         = 1u << 0,  // captioned window instead of borderless fullscreen
     DisplayFlag_NoIntegerScaling = 1u << 1,  // fill the screen with fractional scaling
     DisplayFlag_D3D9On12         = 1u << 2,  // run Direct3D 9 over D3D12 (Direct3DCreate9On12)
+    DisplayFlag_D3D8To9          = 1u << 3,  // run Direct3D 8 on Direct3D 9 (vendored d3d8to9)
 };
 
-// Filled by the diagnostic export RetroShimGetPresentStats: what the
-// DirectDraw presenter last put on screen.
+// Filled by the diagnostic export RetroShimGetPresentStats: what the graphics
+// layer has done so far. Append-only (cbSize tells versions apart).
 struct PresentStats {
     uint32_t cbSize = sizeof(PresentStats);
+    // DirectDraw presenter
     uint32_t frames = 0;         // frames presented from virtualized primaries
     uint32_t width = 0;          // size and depth of the last presented frame
     uint32_t height = 0;
     uint32_t bitsPerPixel = 0;
     uint32_t crc32 = 0;          // CRC-32 of the last frame as 32-bit BGRA (top-down)
+    // Direct3D
+    uint32_t d3d9DevicesContained = 0;   // fullscreen D3D9 devices made windowed
+    uint32_t d3d9On12Interfaces = 0;     // IDirect3D9 created through Direct3DCreate9On12
+    uint32_t d3d8DevicesContained = 0;   // fullscreen native D3D8 devices made windowed
+    uint32_t d3d8InterfacesBridged = 0;  // IDirect3D8 served by the d3d8to9 bridge
 };
 
 struct ShimConfig {

@@ -27,4 +27,8 @@ int ProbeRender(uint32_t fps);
 int ProbeDirectDraw(uint32_t fps, bool v7);
 int ProbeDirect3D9(uint32_t fps, bool on12);
 
+// ProbeD3D8.cpp
+enum class D3D8Path { Native, Bridge, BridgeOn12 };
+int ProbeDirect3D8(uint32_t fps, D3D8Path path);
+
 }  // namespace probe
