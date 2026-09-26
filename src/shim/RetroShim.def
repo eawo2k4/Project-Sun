@@ -1,0 +1,7 @@
+LIBRARY RetroShim
+
+EXPORTS
+    ; Detours requires every injected DLL to export ordinal #1. The target's
+    ; loader resolves this import when Detours patches it into the IAT, and the
+    ; function also serves the rundll32 helper used for cross-bitness injection.
+    DetourFinishHelperProcess @1 NONAME
