@@ -34,10 +34,11 @@ struct Options {
     bool inspectOnly = false;
     bool noShim = false;
     bool wait = false;
-    uint32_t fpsCap = 60;
+    uint32_t fpsCap = retro::kDefaultFpsCap;
     uint32_t diskCapMiB = retro::kDefaultDiskCapMiB;
     uint32_t memoryCapMiB = retro::kDefaultMemoryCapMiB;
     uint32_t features = retro::ShimFeature_Default;
+    uint32_t displayFlags = 0;
 };
 
 void PrintUsage() {
@@ -52,12 +53,17 @@ void PrintUsage() {
         "  --no-shim         Launch without injecting RetroShim.dll (baseline)\n"
         "  --shim <path>     Shim DLL to inject (default: RetroShim.dll beside RetroLaunch)\n"
         "  --cwd <dir>       Working directory (default: the program's folder)\n"
-        "  --fps <n>         Frame cap passed to the shim (default: 60)\n"
+        "  --fps-cap <n>     Frame rate cap at presentation, 0 = unlimited (default: 60)\n"
         "  --disk-cap <MiB>  Largest disk size/free space reported (64-16777216, default 8192)\n"
         "  --mem-cap <MiB>   Largest physical memory reported (16-2047, default 1024)\n"
         "  --no-clamp-disk   Don't hook GetDiskFreeSpace(Ex)\n"
         "  --no-clamp-mem    Don't hook GlobalMemoryStatus(Ex)\n"
         "  --no-propagate    Don't inject the shim into child processes\n"
+        "  --windowed        Show fullscreen games in a captioned window instead of\n"
+        "                    borderless fullscreen\n"
+        "  --no-integer-scaling  Fill the screen with fractional (still 4:3) scaling\n"
+        "  --no-display-sandbox  Let the game change the real display mode (no window\n"
+        "                    sandbox or GDI scaling; frame pacing still applies)\n"
         "  --                End of options\n",
         stderr);
 }
@@ -106,9 +112,15 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             const wchar_t* v = needValue();
             if (!v) return false;
             opt.workingDir = v;
-        } else if (a == L"--fps") {
+        } else if (a == L"--fps-cap" || a == L"--fps") {
             const wchar_t* v = needValue();
-            if (!v || !ParseRange(v, 1, 1000, "--fps", opt.fpsCap)) return false;
+            if (!v || !ParseRange(v, 0, retro::kMaxFpsCap, "--fps-cap", opt.fpsCap)) return false;
+        } else if (a == L"--windowed") {
+            opt.displayFlags |= retro::DisplayFlag_Windowed;
+        } else if (a == L"--no-integer-scaling") {
+            opt.displayFlags |= retro::DisplayFlag_NoIntegerScaling;
+        } else if (a == L"--no-display-sandbox") {
+            opt.features &= ~retro::ShimFeature_DisplaySandbox;
         } else if (a == L"--disk-cap") {
             const wchar_t* v = needValue();
             if (!v || !ParseRange(v, retro::kDiskCapMinMiB, retro::kDiskCapMaxMiB, "--disk-cap",
@@ -239,6 +251,8 @@ int wmain(int argc, wchar_t** argv) {
 
         req.config.fpsCap = opt.fpsCap;
         req.config.features = opt.features;
+        if (opt.fpsCap == 0) req.config.features &= ~retro::ShimFeature_FrameLimiter;
+        req.config.displayFlags = opt.displayFlags;
         req.config.diskCapMiB = opt.diskCapMiB;
         req.config.memoryCapMiB = opt.memoryCapMiB;
         const fs::path logDir = launcherDir / L"logs";
