@@ -11,6 +11,7 @@ add_library(RetroWin16 STATIC
     Memory.cpp
     NeImage.cpp
     NeLoader.cpp
+    Resources.cpp
     Runtime.cpp
     User.cpp
     include/win16/Api.h
@@ -20,6 +21,7 @@ add_library(RetroWin16 STATIC
     include/win16/Memory.h
     include/win16/NeImage.h
     include/win16/NeLoader.h
+    include/win16/Resources.h
     include/win16/Runtime.h
     include/win16/User.h)
 

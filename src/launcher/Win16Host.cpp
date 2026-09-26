@@ -2,6 +2,7 @@
 
 #include <windows.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -9,6 +10,7 @@
 #include <vector>
 
 #include "retro/DisplayMath.h"
+#include "retro/FramePacing.h"
 #include "retro/PathUtil.h"
 #include "win16/Runtime.h"
 
@@ -27,6 +29,7 @@ public:
 
     ~Win32WindowHost() override {
         for (const Entry& e : windows_) DestroyWindow(e.hwnd);
+        if (timer_) CloseHandle(timer_);
     }
 
     uint64_t Create(const WindowInfo& info) override {
@@ -109,30 +112,24 @@ public:
         DestroyWindow(hwnd);
     }
 
-    bool Pump(const Deliver& deliver, bool wait) override {
-        deliver_ = &deliver;
+    bool Pump(const Deliver& deliver, int64_t until) override {
         MSG msg;
-        bool delivered = false;
-        if (wait && !PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
-            // Only a user can produce input: with no visible window (or hidden
-            // mode) waiting would hang forever.
-            if (hidden_ || !AnyVisible()) {
-                deliver_ = nullptr;
-                return false;
-            }
-            if (GetMessageW(&msg, nullptr, 0, 0) > 0) {
-                TranslateMessage(&msg);
-                DispatchMessageW(&msg);
-                delivered = true;
+        if (until != kPoll && !PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
+            if (until == kForever) {
+                // Only a user can produce input: with no visible window (or
+                // hidden mode) waiting would hang forever.
+                if (hidden_ || !AnyVisible()) return false;
+                WaitMessage();
+            } else {
+                WaitForInputUntil(until);
             }
         }
+        deliver_ = &deliver;
         while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&msg);
             DispatchMessageW(&msg);
-            delivered = true;
         }
         deliver_ = nullptr;
-        (void)delivered;
         return true;
     }
 
@@ -148,6 +145,29 @@ private:
         std::vector<uint32_t> frame;  // last presented frame (for WM_PAINT)
         int frameWidth = 0, frameHeight = 0;
     };
+
+    // Sleeps until input arrives or the QPC deadline passes (a 16-bit timer is
+    // due). A high-resolution waitable timer keeps that accurate: the timeout
+    // of MsgWaitForMultipleObjects alone is only as good as the system timer
+    // resolution (15.6 ms by default).
+    void WaitForInputUntil(int64_t until) {
+        const int64_t remaining = until - QpcNow();
+        if (remaining <= 0) return;
+        if (!timer_) {
+            timer_ = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                            TIMER_ALL_ACCESS);
+            if (!timer_) timer_ = CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS);
+        }
+        LARGE_INTEGER due;  // relative, in 100 ns units
+        due.QuadPart = -std::max<int64_t>(1, remaining * 10'000'000 / QpcFrequency());
+        if (timer_ && SetWaitableTimerEx(timer_, &due, 0, nullptr, nullptr, nullptr, 0)) {
+            MsgWaitForMultipleObjectsEx(1, &timer_, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            CancelWaitableTimer(timer_);  // input may have come first
+        } else {
+            const DWORD ms = DWORD((remaining * 1000 + QpcFrequency() - 1) / QpcFrequency());
+            MsgWaitForMultipleObjectsEx(0, nullptr, ms, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        }
+    }
 
     static void Draw(const Entry& e, HDC dc) {
         if (e.frame.empty()) return;
@@ -238,6 +258,7 @@ private:
     }
 
     bool hidden_;
+    HANDLE timer_ = nullptr;  // for WaitForInputUntil
     const Deliver* deliver_ = nullptr;
     std::vector<Entry> windows_;
 };
@@ -268,8 +289,9 @@ int RunWin16Program(const std::filesystem::path& exe, const std::string& command
         return kWin16Stopped;
     }
     const win16::NeImage& image = runtime.Image();
-    std::printf("Win16 task  : %s, %zu segments, entry %u:%04X\n", image.moduleName.c_str(),
-                image.segments.size(), image.entrySegment, image.entryIp);
+    std::printf("Win16 task  : %s, %zu segments, %zu resources, entry %u:%04X\n",
+                image.moduleName.c_str(), image.segments.size(), image.resources.size(),
+                image.entrySegment, image.entryIp);
     std::fflush(stdout);
 
     const win16::TaskExit result = runtime.Run();

@@ -1,13 +1,15 @@
 #include "win16/NeImage.h"
 
+#include <cctype>
 #include <cstdio>
+#include <iterator>
 
 namespace retro::win16 {
 namespace {
 
 // NE header field offsets (relative to the "NE" signature).
 constexpr uint32_t kFlags = 0x0C, kAutoData = 0x0E, kHeap = 0x10, kStack = 0x12, kCsIp = 0x14,
-                   kSsSp = 0x18, kSegCount = 0x1C, kModCount = 0x1E, kSegTable = 0x22,
+                   kSsSp = 0x18, kSegCount = 0x1C, kModCount = 0x1E, kSegTable = 0x22, kResTable = 0x24,
                    kResNames = 0x26, kModTable = 0x28, kImpNames = 0x2A, kEntryTable = 0x04,
                    kEntryBytes = 0x06, kAlign = 0x32, kTargetOS = 0x36, kExpVer = 0x3E;
 constexpr uint32_t kHeaderSize = 0x40;
@@ -19,6 +21,7 @@ public:
     uint8_t U8(uint32_t off) const { return d_[off]; }
     uint16_t U16(uint32_t off) const { return uint16_t(d_[off] | (d_[off + 1] << 8)); }
     uint32_t U32(uint32_t off) const { return U16(off) | (uint32_t(U16(off + 2)) << 16); }
+    const uint8_t* Data() const { return d_.data(); }
     // Pascal (length-prefixed) string.
     bool PString(uint32_t off, std::string& out) const {
         if (!Has(off, 1) || !Has(off + 1, d_[off])) return false;
@@ -114,7 +117,83 @@ bool ParseEntries(const Reader& rd, uint32_t at, uint32_t size, NeImage& out, st
     return true;
 }
 
+// A type or name field of the resource table: 8000h | id, or the offset of a
+// Pascal string relative to the table.
+bool ResourceKey(const Reader& rd, uint32_t table, uint16_t field, uint16_t& id, std::string& name) {
+    if (field & 0x8000) {
+        id = uint16_t(field & 0x7FFF);
+        return true;
+    }
+    if (!rd.PString(table + field, name)) return false;
+    for (char& c : name) c = char(std::toupper(static_cast<unsigned char>(c)));
+    return true;
+}
+
+// Resource table: alignment shift, then TYPEINFO records { type, count,
+// reserved (4), NAMEINFO[count] { offset, length (both in alignment units),
+// flags, id, handle, usage } } up to a zero type, then the name strings.
+bool ParseResources(const Reader& rd, uint32_t table, NeImage& out, std::string& error) {
+    if (!rd.Has(table, 2)) {
+        error = "resource table outside the file";
+        return false;
+    }
+    const uint16_t shift = rd.U16(table);
+    if (shift > 15) {
+        error = Fmt("bad resource alignment shift %u", shift);
+        return false;
+    }
+    uint32_t at = table + 2;
+    for (;;) {
+        if (!rd.Has(at, 2)) {
+            error = "truncated resource table";
+            return false;
+        }
+        const uint16_t type = rd.U16(at);
+        if (type == 0) break;
+        if (!rd.Has(at, 8)) {
+            error = "truncated resource table";
+            return false;
+        }
+        const uint16_t count = rd.U16(at + 2);
+        at += 8;
+        if (!rd.Has(at, uint64_t(count) * 12)) {
+            error = "truncated resource table";
+            return false;
+        }
+        for (uint16_t i = 0; i < count; ++i, at += 12) {
+            NeResource r;
+            if (!ResourceKey(rd, table, type, r.typeId, r.typeName) ||
+                !ResourceKey(rd, table, rd.U16(at + 6), r.id, r.name)) {
+                error = "resource name outside the file";
+                return false;
+            }
+            r.flags = rd.U16(at + 4);
+            r.tableOffset = uint16_t(at - table);
+            const uint64_t offset = uint64_t(rd.U16(at)) << shift;
+            uint64_t length = uint64_t(rd.U16(at + 2)) << shift;
+            if (length && !rd.Has(offset, 1)) {
+                error = Fmt("resource %u data outside the file", unsigned(out.resources.size() + 1));
+                return false;
+            }
+            // The last resource's alignment padding may be missing from the file.
+            while (length && !rd.Has(offset, length)) --length;
+            if (length) r.data.assign(rd.Data() + offset, rd.Data() + offset + length);
+            out.resources.push_back(std::move(r));
+        }
+    }
+    return true;
+}
+
 }  // namespace
+
+std::string DescribeResourceType(const NeResource& r) {
+    if (r.typeId == 0) return r.typeName;
+    static const char* const kNames[] = {nullptr, "CURSOR", "BITMAP", "ICON", "MENU", "DIALOG", "STRING",
+                                         "FONTDIR", "FONT", "ACCELERATOR", "RCDATA", nullptr,
+                                         "GROUP_CURSOR", nullptr, "GROUP_ICON"};
+    if (r.typeId < std::size(kNames) && kNames[r.typeId]) return kNames[r.typeId];
+    return "#" + std::to_string(r.typeId);
+}
 
 const NeEntry* NeImage::FindEntry(uint16_t ordinal) const {
     for (const NeEntry& e : entries) {
@@ -153,6 +232,7 @@ bool ParseNe(const std::vector<uint8_t>& file, NeImage& out, std::string& error)
     const uint32_t modTable = ne + rd.U16(ne + kModTable);
     const uint32_t impNames = ne + rd.U16(ne + kImpNames);
     const uint32_t resNames = ne + rd.U16(ne + kResNames);
+    const uint32_t resTable = ne + rd.U16(ne + kResTable);
     uint16_t shift = rd.U16(ne + kAlign);
     if (shift == 0) shift = 9;  // 512-byte sectors
     if (shift > 15) {
@@ -209,6 +289,9 @@ bool ParseNe(const std::vector<uint8_t>& file, NeImage& out, std::string& error)
     const uint16_t entryBytes = rd.U16(ne + kEntryBytes);
     if (entryBytes && !ParseEntries(rd, ne + rd.U16(ne + kEntryTable), entryBytes, out, error))
         return false;
+
+    // An empty resource table has the same offset as the resident names.
+    if (resTable != resNames && !ParseResources(rd, resTable, out, error)) return false;
 
     auto validSegment = [&](uint16_t n) { return n >= 1 && n <= out.segments.size(); };
     if (!out.IsLibrary() && !validSegment(out.entrySegment)) {

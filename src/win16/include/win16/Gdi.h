@@ -16,6 +16,7 @@
 // the same scheduler as the display sandbox and hands dirty surfaces to the
 // WindowHost, which scales them onto the screen.
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -59,6 +60,11 @@ public:
     uint16_t StockObject(int index);
     uint16_t CreateBitmap(int width, int height, int planes, int bitsPerPixel, const void* bits);
     uint16_t CreateCompatibleBitmap(uint16_t hdc, int width, int height);
+    // A device-dependent bitmap from a packed DIB (BITMAPINFOHEADER or
+    // BITMAPCOREHEADER, colour table, bits), as stored in RT_BITMAP resources.
+    // Two-colour DIBs become monochrome bitmaps, like Windows' LoadBitmap.
+    // 0 if the DIB is malformed or truncated.
+    uint16_t CreateBitmapFromDib(const uint8_t* dib, size_t size);
     uint16_t CreateSolidBrush(uint32_t color);
     uint16_t CreatePen(int style, int width, uint32_t color);
     uint16_t Select(uint16_t hdc, uint16_t object);  // returns the previous object

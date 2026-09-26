@@ -1,4 +1,5 @@
-// KERNEL: task startup, termination, version, DOS calls and the global heap.
+// KERNEL: task startup, termination, version, DOS calls, the global heap and
+// resources.
 
 #include "win16/Kernel.h"
 
@@ -126,6 +127,41 @@ void GlobalSize(Runtime& rt, Cpu& cpu) {
     cpu.ReturnFar(2);
 }
 
+// --- Resources -------------------------------------------------------------------------------
+
+void FindResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name, LPCSTR type) -> HRSRC
+    const PascalArgs a(cpu, {2, 4, 4});
+    const FarPtr name = a.Ptr(1), type = a.Ptr(2);
+    cpu.Regs().r[AX] = rt.Resource().Find(ResourceId::FromFarPtr(rt.Mem(), type.sel, type.off),
+                                          ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void LoadResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> HGLOBAL
+    const PascalArgs a(cpu, {2, 2});
+    cpu.Regs().r[AX] = rt.Resource().Load(a.Word(1));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void LockResource(Runtime& rt, Cpu& cpu) {  // (HGLOBAL) -> void FAR*
+    const PascalArgs a(cpu, {2});
+    SetResult(cpu, rt.Globals().Lock(a.Word(0)));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void FreeResource(Runtime& rt, Cpu& cpu) {  // (HGLOBAL) -> 0 on success
+    const PascalArgs a(cpu, {2});
+    cpu.Regs().r[AX] = rt.Resource().Free(a.Word(0));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void SizeofResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> DWORD
+    const PascalArgs a(cpu, {2, 2});
+    const NeResource* r = rt.Resource().Get(a.Word(1));
+    SetResult(cpu, r ? uint32_t(r->data.size()) : 0);
+    cpu.ReturnFar(a.Bytes());
+}
+
 }  // namespace
 
 std::vector<ApiFunction> KernelApi() {
@@ -138,6 +174,11 @@ std::vector<ApiFunction> KernelApi() {
         {19, "GLOBALUNLOCK", GlobalUnlock},
         {20, "GLOBALSIZE", GlobalSize},
         {30, "WAITEVENT", WaitEvent},
+        {60, "FINDRESOURCE", FindResource},
+        {61, "LOADRESOURCE", LoadResource},
+        {62, "LOCKRESOURCE", LockResource},
+        {63, "FREERESOURCE", FreeResource},
+        {65, "SIZEOFRESOURCE", SizeofResource},
         {91, "INITTASK", InitTask},
         {102, "DOS3CALL", Dos3Call},
         {137, "FATALAPPEXIT", FatalAppExit},

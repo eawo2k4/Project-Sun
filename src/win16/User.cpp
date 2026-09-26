@@ -6,6 +6,7 @@
 #include <cctype>
 
 #include "retro/DisplayMath.h"
+#include "retro/FramePacing.h"
 #include "win16/Api.h"
 #include "win16/Runtime.h"
 
@@ -48,6 +49,8 @@ Msg16 ReadMsg(const Memory& mem, FarPtr p) {
 
 uint32_t MakeLong(int16_t lo, int16_t hi) { return uint16_t(lo) | (uint32_t(uint16_t(hi)) << 16); }
 
+int64_t MsToQpc(uint32_t ms) { return int64_t(ms) * QpcFrequency() / 1000; }
+
 }  // namespace
 
 // --- HeadlessHost ----------------------------------------------------------------------------
@@ -77,11 +80,15 @@ void HeadlessHost::Destroy(uint64_t window) {
     }
 }
 
-bool HeadlessHost::Pump(const Deliver& deliver, bool wait) {
+bool HeadlessHost::Pump(const Deliver& deliver, int64_t until) {
     // Queued input arrives when the task waits for it, like a user acting
     // while the program idles in GetMessage. That keeps tests deterministic.
-    if (!wait) return true;
-    if (events.empty()) return false;  // nothing will ever arrive
+    if (until == kPoll) return true;
+    if (events.empty()) {
+        if (until == kForever) return false;  // nothing will ever arrive
+        PreciseWaiter().WaitUntil(until);
+        return true;
+    }
     while (!events.empty()) {
         const Event e = events.front();
         events.pop_front();
@@ -273,6 +280,9 @@ bool User::Destroy(uint16_t hwnd) {
         windows_.erase(hwnd);
     }
     rt_.Graphics().DestroySurface(hwnd);
+    timers_.erase(std::remove_if(timers_.begin(), timers_.end(),
+                                 [&](const Timer& t) { return t.hwnd == hwnd; }),
+                  timers_.end());
     queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
                                 [&](const Msg16& m) { return m.hwnd == hwnd; }),
                  queue_.end());
@@ -417,12 +427,73 @@ bool User::Matches(const Msg16& m, uint16_t hwnd, uint16_t minMsg, uint16_t maxM
     return m.message >= minMsg && m.message <= maxMsg;
 }
 
-void User::PumpHost(bool wait, bool& canWait) {
-    canWait = host_->Pump(
+bool User::PumpHost(int64_t until) {
+    return host_->Pump(
         [this](uint16_t hwnd16, uint16_t message, uint16_t wParam, uint32_t lParam) {
             if (Find(hwnd16)) Post(hwnd16, message, wParam, lParam);
         },
-        wait);
+        until);
+}
+
+uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_t procSel,
+                          uint16_t procOff) {
+    if (hwnd && !Find(hwnd)) return 0;
+    if (procSel || procOff) {
+        const Descriptor* d = rt_.Mem().Lookup(procSel);
+        if (!d || d->kind != SegmentKind::Code) {
+            rt_.Print("SetTimer failed: the timer procedure is not in a code segment");
+            return 0;
+        }
+    }
+    auto find = [&](uint16_t h, uint16_t i) {
+        return std::find_if(timers_.begin(), timers_.end(),
+                            [&](const Timer& t) { return t.hwnd == h && t.id == i; });
+    };
+    if (!hwnd) {  // the id argument is ignored: every such timer gets a new one
+        do {
+            id = nextTimerId_++;
+        } while (id == 0 || find(0, id) != timers_.end());
+    }
+    const uint32_t interval = std::max<uint32_t>(elapseMs, kMinTimerMs);
+    const Timer t{hwnd, id, procSel, procOff, interval, QpcNow() + MsToQpc(interval)};
+    if (const auto it = find(hwnd, id); it != timers_.end()) {
+        *it = t;
+    } else {
+        timers_.push_back(t);
+    }
+    return id ? id : 1;
+}
+
+bool User::StopTimer(uint16_t hwnd, uint16_t id) {
+    const auto it = std::find_if(timers_.begin(), timers_.end(),
+                                 [&](const Timer& t) { return t.hwnd == hwnd && t.id == id; });
+    if (it == timers_.end()) return false;
+    timers_.erase(it);
+    return true;
+}
+
+bool User::IsTimerProc(uint16_t sel, uint16_t off) const {
+    return (sel || off) && std::any_of(timers_.begin(), timers_.end(), [&](const Timer& t) {
+               return t.procSel == sel && t.procOff == off;
+           });
+}
+
+User::Timer* User::DueTimer(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg, int64_t now) {
+    Timer* due = nullptr;
+    for (Timer& t : timers_) {
+        if (t.due <= now && Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg) &&
+            (!due || t.due < due->due))
+            due = &t;
+    }
+    return due;
+}
+
+int64_t User::NextTimerDue(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg) const {
+    int64_t next = WindowHost::kForever;
+    for (const Timer& t : timers_) {
+        if (Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg)) next = std::min(next, t.due);
+    }
+    return next;
 }
 
 User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_t maxMsg,
@@ -431,8 +502,7 @@ User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_
     // last call, paced to the frame cap.
     rt_.Graphics().PresentPending();
     for (;;) {
-        bool canWait = false;
-        PumpHost(false, canWait);
+        PumpHost(WindowHost::kPoll);
         for (auto it = queue_.begin(); it != queue_.end(); ++it) {
             if (Matches(*it, hwndFilter, minMsg, maxMsg)) {
                 out = *it;
@@ -455,9 +525,23 @@ User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_
                 return Fetch::Message;
             }
         }
+        // Last, WM_TIMER for the timer that has been due longest.
+        const int64_t now = QpcNow();
+        if (Timer* t = DueTimer(hwndFilter, minMsg, maxMsg, now)) {
+            out = Msg16{t->hwnd, wm::Timer, t->id, (uint32_t(t->procSel) << 16) | t->procOff,
+                        rt_.TickCount(), 0, 0};
+            if (remove) {
+                // Keep the cadence; after a stall, skip the missed ticks
+                // (one WM_TIMER, like Windows) rather than firing a burst.
+                const int64_t period = MsToQpc(t->intervalMs);
+                t->due += period;
+                if (t->due <= now) t->due = now + period;
+            }
+            return Fetch::Message;
+        }
         if (!wait) return Fetch::Empty;
-        PumpHost(true, canWait);
-        if (!canWait) return Fetch::NoInput;
+        // Sleep until input arrives or the next timer is due.
+        if (!PumpHost(NextTimerDue(hwndFilter, minMsg, maxMsg))) return Fetch::NoInput;
     }
 }
 
@@ -604,8 +688,73 @@ void TranslateMessage(Runtime&, Cpu& cpu) {
 
 void DispatchMessage(Runtime& rt, Cpu& cpu) {
     const Msg16 m = ReadMsg(rt.Mem(), ArgPtr(cpu, 0));
-    SetResult(cpu, m.hwnd ? rt.Windows().Send(m.hwnd, m.message, m.wParam, m.lParam) : 0);
+    uint32_t result = 0;
+    if (m.message == wm::Timer && m.lParam) {
+        // WM_TIMER of a timer with a TIMERPROC: call it instead of the window
+        // procedure, (hwnd, WM_TIMER, idTimer, dwTime), DS = the task's DGROUP.
+        // Only live timer procedures: lParam is just a number in the message.
+        const uint16_t sel = uint16_t(m.lParam >> 16), off = uint16_t(m.lParam);
+        if (rt.Windows().IsTimerProc(sel, off)) {
+            const uint32_t now = rt.TickCount();
+            result = rt.Processor().CallFar(sel, off,
+                                            {m.hwnd, m.message, m.wParam, uint16_t(now >> 16), uint16_t(now)},
+                                            rt.Module().dgroup);
+        }
+    } else if (m.hwnd) {
+        result = rt.Windows().Send(m.hwnd, m.message, m.wParam, m.lParam);
+    }
+    SetResult(cpu, result);
     cpu.ReturnFar(4);
+}
+
+void SetTimer(Runtime& rt, Cpu& cpu) {  // (HWND, UINT id, UINT elapse, TIMERPROC or NULL) -> id
+    const PascalArgs a(cpu, {2, 2, 2, 4});
+    const FarPtr proc = a.Ptr(3);
+    cpu.Regs().r[AX] = rt.Windows().StartTimer(a.Word(0), a.Word(1), a.Word(2), proc.sel, proc.off);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void KillTimer(Runtime& rt, Cpu& cpu) {  // (HWND, UINT id) -> BOOL
+    const PascalArgs a(cpu, {2, 2});
+    cpu.Regs().r[AX] = rt.Windows().StopTimer(a.Word(0), a.Word(1)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void LoadBitmap(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name) -> HBITMAP
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr namePtr = a.Ptr(1);
+    uint16_t bitmap = 0;
+    if (a.Word(0) == 0) {
+        rt.Print("LoadBitmap: system bitmaps (OBM_xxx) are not available yet");
+    } else {
+        const ResourceId name = ResourceId::FromFarPtr(rt.Mem(), namePtr.sel, namePtr.off);
+        const NeResource* r = rt.Resource().Lookup(ResourceId{res::Bitmap, {}}, name);
+        if (!r) {
+            rt.Print("LoadBitmap: no bitmap resource " + name.Describe());
+        } else if (!(bitmap = rt.Graphics().CreateBitmapFromDib(r->data.data(), r->data.size()))) {
+            rt.Print("LoadBitmap: bitmap resource " + name.Describe() + " is not a valid DIB");
+        }
+    }
+    cpu.Regs().r[AX] = bitmap;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void LoadString(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, UINT id, LPSTR buffer, int max) -> length
+    const PascalArgs a(cpu, {2, 2, 4, 2});
+    const FarPtr buffer = a.Ptr(2);
+    const int max = a.Int(3);
+    std::string s;
+    uint16_t copied = 0;
+    if (max > 0 && !buffer.IsNull()) {
+        if (rt.Resource().String(a.Word(1), s)) {
+            copied = uint16_t(std::min<size_t>(s.size(), size_t(max - 1)));
+            for (uint16_t i = 0; i < copied; ++i)
+                rt.Mem().Write8(buffer.sel, uint16_t(buffer.off + i), uint8_t(s[i]));
+        }
+        rt.Mem().Write8(buffer.sel, uint16_t(buffer.off + copied), 0);
+    }
+    cpu.Regs().r[AX] = copied;
+    cpu.ReturnFar(a.Bytes());
 }
 
 void UpdateWindow(Runtime& rt, Cpu& cpu) {  // (HWND)
@@ -715,6 +864,8 @@ std::vector<ApiFunction> UserApi() {
         {1, "MESSAGEBOX", MessageBox},
         {5, "INITAPP", InitApp},
         {6, "POSTQUITMESSAGE", PostQuitMessage},
+        {10, "SETTIMER", SetTimer},
+        {12, "KILLTIMER", KillTimer},
         {13, "GETTICKCOUNT", GetTickCount},
         {33, "GETCLIENTRECT", GetClientRect},
         {39, "BEGINPAINT", BeginPaint},
@@ -738,6 +889,8 @@ std::vector<ApiFunction> UserApi() {
         {127, "VALIDATERECT", ValidateRect},
         {173, "LOADCURSOR", LoadCursor},
         {174, "LOADICON", LoadIcon},
+        {175, "LOADBITMAP", LoadBitmap},
+        {176, "LOADSTRING", LoadString},
         {179, "GETSYSTEMMETRICS", GetSystemMetrics},
         {452, "CREATEWINDOWEX", CreateWindowEx},
     };

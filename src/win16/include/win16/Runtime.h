@@ -27,6 +27,7 @@
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
 #include "win16/NeLoader.h"
+#include "win16/Resources.h"
 #include "win16/User.h"
 
 namespace retro::win16 {
@@ -71,6 +72,7 @@ public:
     const NeImage& Image() const { return image_; }
     const LoadedModule& Module() const { return module_; }
     GlobalHeap& Globals() { return globals_; }
+    Resources& Resource() { return resources_; }
     User& Windows() { return *user_; }
     Gdi& Graphics() { return *gdi_; }
 
@@ -114,9 +116,10 @@ private:
     Memory memory_;
     Cpu cpu_;
     GlobalHeap globals_;
+    NeImage image_;
+    Resources resources_{image_, globals_, memory_};
     std::unique_ptr<User> user_;
     std::unique_ptr<Gdi> gdi_;  // after user_: destroyed first
-    NeImage image_;
     LoadedModule module_;
     std::vector<BuiltinModule> builtins_;
     Output output_;

@@ -666,6 +666,321 @@ inline NeProgram AnimationProgram(uint16_t frames) {
     return p;
 }
 
+// An 8x8 24-bit packed DIB (RT_BITMAP resource format) in quadrants:
+// red top left, green top right, blue bottom left, white bottom right.
+inline std::vector<uint8_t> QuadrantDib() {
+    std::vector<uint8_t> d(40 + 8 * 8 * 3, 0);
+    auto put32 = [&](size_t at, uint32_t v) {
+        for (int i = 0; i < 4; ++i) d[at + i] = uint8_t(v >> (8 * i));
+    };
+    put32(0, 40);       // biSize
+    put32(4, 8);        // biWidth
+    put32(8, 8);        // biHeight (bottom-up)
+    d[12] = 1;          // biPlanes
+    d[14] = 24;         // biBitCount
+    put32(20, 8 * 8 * 3);  // biSizeImage
+    for (int y = 0; y < 8; ++y) {
+        for (int x = 0; x < 8; ++x) {
+            const uint32_t c = y < 4 ? (x < 4 ? RGB16(255, 0, 0) : RGB16(0, 255, 0))
+                                     : (x < 4 ? RGB16(0, 0, 255) : RGB16(255, 255, 255));
+            const size_t at = 40 + size_t(7 - y) * 24 + size_t(x) * 3;
+            d[at] = uint8_t(c >> 16);  // B, G, R
+            d[at + 1] = uint8_t(c >> 8);
+            d[at + 2] = uint8_t(c);
+        }
+    }
+    return d;
+}
+
+// An RT_STRING block: 16 length-prefixed strings (ids 16*(block-1) ...).
+inline std::vector<uint8_t> StringBlock(const std::vector<std::string>& strings) {
+    std::vector<uint8_t> d;
+    for (size_t i = 0; i < 16; ++i) {
+        const std::string s = i < strings.size() ? strings[i] : "";
+        d.push_back(uint8_t(s.size()));
+        d.insert(d.end(), s.begin(), s.end());
+    }
+    return d;
+}
+
+constexpr const char* kResourceText = "Hello, Win16!";
+
+// Resources, timers and text. Resources: bitmap "LOGO" (QuadrantDib), the
+// string table (string 1 = kResourceText), and custom type "LEVELS" #3.
+//   1-7  FindResource("logo", RT_BITMAP) / SizeofResource / LoadResource /
+//        LockResource (reads the BITMAPINFOHEADER) / FreeResource /
+//        LoadString(1) / LoadBitmap("logo")
+//   8-10 a 64x48 window; SetTimer(hwnd, 1, 60 ms) posting WM_TIMER, and
+//        SetTimer(NULL, ..., 100 ms, TimerProc) with a callback
+//   On each WM_TIMER, through GetDC: BitBlt the bitmap to (8 * (tick - 1), 0),
+//   then TextOut the string at (0, 16) in yellow on opaque blue. After 5
+//   ticks: KillTimer and PostQuitMessage.
+//   11-20 the tick counts, callbacks, KillTimer results, and the picture read
+//   back with GetPixel (bitmap quadrants, text colours in the text band).
+// Exit 0 if every check passes.
+inline NeProgram ResourceProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI"};
+    p.resources = {
+        {2, "", 0, "LOGO", QuadrantDib()},
+        {6, "", 1, "", StringBlock({"", kResourceText})},
+        {0, "LEVELS", 3, "", {1, 2, 3, 4}},
+    };
+    constexpr uint8_t kHinst = 0x00, kHwnd = 0x02, kRsrc = 0x04, kHglobal = 0x06, kBmp = 0x08,
+                      kMemDc = 0x0A, kOldBmp = 0x0C, kTicks = 0x0E, kProcTicks = 0x10,
+                      kProcMsg = 0x12, kProcTimer = 0x14, kHdc = 0x16, kLen = 0x18, kX = 0x1A,
+                      kY = 0x1C, kYellow = 0x1E, kBlue = 0x20, kTextOk = 0x22, kPrev = 0x24,
+                      kKill = 0x26, kCheckDc = 0x28, kClass = 0x30, kTitle = 0x40, kLogo = 0x50,
+                      kWndClass = 0x60, kMsg = 0x80, kText = 0xA0;
+    std::vector<uint8_t> data(0xC0, 0);
+    const std::string cls = "ResWin", title = "Resources", logo = "logo";
+    std::copy(cls.begin(), cls.end(), data.begin() + kClass);
+    std::copy(title.begin(), title.end(), data.begin() + kTitle);
+    std::copy(logo.begin(), logo.end(), data.begin() + kLogo);  // names are case-insensitive
+    constexpr uint32_t kYellowRgb = RGB16(255, 255, 0), kBlueRgb = RGB16(0, 0, 255);
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    e.Call(Emit::KERNEL, 91);  // InitTask
+    a.db({0x89, 0x3E, kHinst, 0x00});
+
+    // 1. FindResource(hInst, "logo", MAKEINTRESOURCE(RT_BITMAP))
+    e.Mem(kHinst); e.Far(kLogo); e.Long(2);
+    e.Call(Emit::KERNEL, 60);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 1);
+    e.StoreAx(kRsrc);
+    // 2. SizeofResource = 240 (232 bytes rounded up to the 16-byte alignment)
+    e.Mem(kHinst); e.Mem(kRsrc);
+    e.Call(Emit::KERNEL, 65);
+    a.db({0x3D}).dw(240);
+    FailUnless(a, JZ, 2);
+    a.db({0x85, 0xD2});  // test dx, dx
+    FailUnless(a, JZ, 2);
+    // 3. LoadResource
+    e.Mem(kHinst); e.Mem(kRsrc);
+    e.Call(Emit::KERNEL, 61);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 3);
+    e.StoreAx(kHglobal);
+    // 4. LockResource: the bytes are the DIB (biSize 40, biWidth 8)
+    e.Mem(kHglobal);
+    e.Call(Emit::KERNEL, 62);
+    a.db({0x8E, 0xC2, 0x89, 0xC3});             // mov es, dx / mov bx, ax
+    a.db({0x26, 0x81, 0x3F}).dw(40);            // cmp word es:[bx], 40
+    FailUnless(a, JZ, 4);
+    a.db({0x26, 0x81, 0x7F, 0x04}).dw(8);       // cmp word es:[bx+4], 8
+    FailUnless(a, JZ, 4);
+    // 5. FreeResource = 0
+    e.Mem(kHglobal);
+    e.Call(Emit::KERNEL, 63);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 5);
+    // 6. LoadString(hInst, 1, text, 32) = 13
+    e.Mem(kHinst); e.Imm(1); e.Far(kText); e.Imm(32);
+    e.Call(Emit::USER, 176);
+    a.db({0x3D}).dw(13);
+    FailUnless(a, JZ, 6);
+    e.StoreAx(kLen);
+    // 7. LoadBitmap(hInst, "logo"), selected into a memory DC
+    e.Mem(kHinst); e.Far(kLogo);
+    e.Call(Emit::USER, 175);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 7);
+    e.StoreAx(kBmp);
+    e.Imm(0);
+    e.Call(Emit::GDI, 52);  // CreateCompatibleDC(NULL)
+    e.StoreAx(kMemDc);
+    e.Mem(kMemDc); e.Mem(kBmp);
+    e.Call(Emit::GDI, 45);
+    e.StoreAx(kOldBmp);
+    // 8. The window
+    e.RegisterClass(kWndClass, kClass, kHinst, "WndProc", 4 /* BLACK_BRUSH */);
+    e.CreatePopup(kClass, kTitle, 0, 0, 64, 48, kHinst);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 8);
+    e.StoreAx(kHwnd);
+    // 9. SetTimer(hwnd, 1, 60, NULL) = 1: WM_TIMER to the window
+    e.Mem(kHwnd); e.Imm(1); e.Imm(60); e.Long(0);
+    e.Call(Emit::USER, 10);
+    a.db({0x3D}).dw(1);
+    FailUnless(a, JZ, 9);
+    // 10. SetTimer(NULL, 0, 100, TimerProc): a new timer id, callback style
+    e.Imm(0); e.Imm(0); e.Imm(100);
+    a.db({0x0E, 0x68}).Abs16("TimerProc");      // push cs / push TimerProc
+    e.Call(Emit::USER, 10);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 10);
+    e.StoreAx(kProcTimer);
+
+    a.Label("loop");
+    e.Far(kMsg); e.Imm(0); e.Imm(0); e.Imm(0);
+    e.Call(Emit::USER, 108);  // GetMessage
+    a.db({0x85, 0xC0});
+    a.Short(JZ, "done");
+    e.Far(kMsg);
+    e.Call(Emit::USER, 114);  // DispatchMessage
+    a.Short(0xEB, "loop");
+    a.Label("done");
+
+    // 11. Five ticks, then KillTimer(hwnd, 1) succeeded
+    a.db({0x83, 0x3E, kTicks, 0x00, 0x05});
+    FailUnless(a, JZ, 11);
+    a.db({0x83, 0x3E, kKill, 0x00, 0x01});
+    FailUnless(a, JZ, 11);
+    // 12. The TIMERPROC ran, called with (NULL, WM_TIMER, ...)
+    a.db({0x83, 0x3E, kProcTicks, 0x00, 0x00});
+    FailUnless(a, JNZ, 12);
+    a.db({0x81, 0x3E, kProcMsg, 0x00}).dw(0x0113);
+    FailUnless(a, JZ, 12);
+    // 13. KillTimer(NULL, procTimer) = 1; KillTimer(hwnd, 1) again = 0
+    e.Imm(0); e.Mem(kProcTimer);
+    e.Call(Emit::USER, 12);
+    a.db({0x3D}).dw(1);
+    FailUnless(a, JZ, 13);
+    e.Mem(kHwnd); e.Imm(1);
+    e.Call(Emit::USER, 12);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 13);
+    // 14. Every TextOut succeeded, each on a DC whose text colour started black
+    a.db({0x83, 0x3E, kTextOk, 0x00, 0x05});
+    FailUnless(a, JZ, 14);
+
+    // Read the picture back.
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);  // GetDC
+    e.StoreAx(kCheckDc);
+    e.CheckPixel(kCheckDc, 1, 1, RGB16(255, 0, 0), 15);      // first blit, 4 quadrants
+    e.CheckPixel(kCheckDc, 6, 1, RGB16(0, 255, 0), 15);
+    e.CheckPixel(kCheckDc, 1, 6, RGB16(0, 0, 255), 15);
+    e.CheckPixel(kCheckDc, 6, 6, RGB16(255, 255, 255), 15);
+    e.CheckPixel(kCheckDc, 33, 1, RGB16(255, 0, 0), 16);     // fifth blit at x = 32
+    e.CheckPixel(kCheckDc, 38, 6, RGB16(255, 255, 255), 16);
+    e.CheckPixel(kCheckDc, 41, 1, RGB16(0, 0, 0), 17);       // no sixth
+    // 18. GetTextColor: black on a fresh DC, then what SetTextColor set
+    e.Mem(kCheckDc);
+    e.Call(Emit::GDI, 90);
+    a.db({0x09, 0xD0});  // or ax, dx
+    FailUnless(a, JZ, 18);
+    e.Mem(kCheckDc); e.Long(kYellowRgb);
+    e.Call(Emit::GDI, 9);
+    e.Mem(kCheckDc);
+    e.Call(Emit::GDI, 90);
+    a.db({0x3D}).dw(uint16_t(kYellowRgb));
+    FailUnless(a, JZ, 18);
+    a.db({0x81, 0xFA}).dw(uint16_t(kYellowRgb >> 16));
+    FailUnless(a, JZ, 18);
+    // 19. The text band (0,16)-(64,32) has yellow glyph pixels on blue
+    e.Set(kY, 16);
+    a.Label("scan_y");
+    e.Set(kX, 0);
+    a.Label("scan_x");
+    e.Mem(kCheckDc); e.Mem(kX); e.Mem(kY);
+    e.Call(Emit::GDI, 83);  // GetPixel
+    a.db({0x3D}).dw(uint16_t(kYellowRgb));
+    a.Short(JNZ, "not_yellow");
+    a.db({0x81, 0xFA}).dw(uint16_t(kYellowRgb >> 16));
+    a.Short(JNZ, "not_yellow");
+    a.db({0xFF, 0x06, kYellow, 0x00});  // inc word [yellow]
+    a.Short(0xEB, "scan_next");
+    a.Label("not_yellow");
+    a.db({0x3D}).dw(uint16_t(kBlueRgb & 0xFFFF));
+    a.Short(JNZ, "scan_next");
+    a.db({0x81, 0xFA}).dw(uint16_t(kBlueRgb >> 16));
+    a.Short(JNZ, "scan_next");
+    a.db({0xFF, 0x06, kBlue, 0x00});    // inc word [blue]
+    a.Label("scan_next");
+    a.db({0xFF, 0x06, kX, 0x00});       // inc word [x]
+    a.db({0x83, 0x3E, kX, 0x00, 64});   // cmp word [x], 64
+    a.Short(0x72, "scan_x");            // jb
+    a.db({0xFF, 0x06, kY, 0x00});
+    a.db({0x83, 0x3E, kY, 0x00, 32});
+    a.Short(0x72, "scan_y");
+    a.db({0x83, 0x3E, kYellow, 0x00, 0x00});
+    FailUnless(a, JNZ, 19);
+    a.db({0x83, 0x3E, kBlue, 0x00, 0x00});
+    FailUnless(a, JNZ, 19);
+    e.Mem(kHwnd); e.Mem(kCheckDc);
+    e.Call(Emit::USER, 68);  // ReleaseDC
+    // 20. Clean up: the bitmap can be deleted once deselected
+    e.Mem(kMemDc); e.Mem(kOldBmp);
+    e.Call(Emit::GDI, 45);
+    e.Mem(kBmp);
+    e.Call(Emit::GDI, 69);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 20);
+    e.Mem(kMemDc);
+    e.Call(Emit::GDI, 68);
+    e.Exit0();
+    e.FailStubs(20);
+
+    // WndProc: [bp+14] hwnd, [bp+12] msg, [bp+10] wParam, [bp+8]:[bp+6] lParam
+    a.Label("WndProc");
+    a.db({0x55, 0x89, 0xE5, 0x8B, 0x46, 0x0C});  // push bp / mov bp,sp / mov ax,[bp+12]
+    a.db({0x3D}).dw(0x0113);                     // WM_TIMER?
+    a.Short(JZ, "wp_timer");
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);                     // DefWindowProc
+    a.Near(0xE9, "wp_done");
+
+    a.Label("wp_timer");
+    a.db({0xFF, 0x06, kTicks, 0x00});            // inc word [ticks]
+    e.Arg(14);
+    e.Call(Emit::USER, 66);                      // GetDC
+    e.StoreAx(kHdc);
+    e.Mem(kHdc);
+    a.db({0xA1, kTicks, 0x00, 0x48});            // mov ax, [ticks] / dec ax
+    a.db({0xC1, 0xE0, 0x03, 0x50});              // shl ax, 3 / push ax
+    e.Imm(0); e.Imm(8); e.Imm(8); e.Mem(kMemDc); e.Imm(0); e.Imm(0); e.Long(kSrcCopy);
+    e.Call(Emit::GDI, 34);                       // BitBlt
+    e.Mem(kHdc); e.Long(kYellowRgb);
+    e.Call(Emit::GDI, 9);                        // SetTextColor -> previous
+    a.db({0x09, 0xD0});                          // or ax, dx (0: it was black)
+    e.StoreAx(kPrev);
+    e.Mem(kHdc); e.Long(kBlueRgb);
+    e.Call(Emit::GDI, 1);                        // SetBkColor
+    e.Mem(kHdc); e.Imm(2);
+    e.Call(Emit::GDI, 2);                        // SetBkMode(OPAQUE)
+    e.Mem(kHdc); e.Imm(0); e.Imm(16); e.Far(kText); e.Mem(kLen);
+    e.Call(Emit::GDI, 33);                       // TextOut
+    a.db({0x3D}).dw(1);
+    a.Short(JNZ, "wp_release");
+    a.db({0x83, 0x3E, kPrev, 0x00, 0x00});
+    a.Short(JNZ, "wp_release");
+    a.db({0xFF, 0x06, kTextOk, 0x00});           // inc word [textOk]
+    a.Label("wp_release");
+    e.Arg(14); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);                      // ReleaseDC
+    a.db({0x83, 0x3E, kTicks, 0x00, 0x05});      // cmp word [ticks], 5
+    a.Short(0x72, "wp_zero");                    // jb
+    e.Arg(14); e.Imm(1);
+    e.Call(Emit::USER, 12);                      // KillTimer(hwnd, 1)
+    e.StoreAx(kKill);
+    e.Imm(0);
+    e.Call(Emit::USER, 6);                       // PostQuitMessage(0)
+    a.Label("wp_zero");
+    a.db({0x31, 0xC0, 0x31, 0xD2});
+    a.Label("wp_done");
+    a.db({0x5D, 0xCA, 0x0A, 0x00});              // pop bp / retf 10
+
+    // TimerProc(hwnd, msg, idEvent, dwTime): same frame layout as WndProc.
+    a.Label("TimerProc");
+    a.db({0x55, 0x89, 0xE5});
+    a.db({0xFF, 0x06, kProcTicks, 0x00});        // inc word [procTicks]
+    a.db({0x8B, 0x46, 0x0C});                    // mov ax, [bp+12]
+    e.StoreAx(kProcMsg);
+    a.db({0x83, 0x7E, 0x0E, 0x00});              // cmp word [bp+14], 0 (hwnd)
+    a.Short(JZ, "tp_done");
+    e.Set(kProcMsg, 0xFFFF);                     // wrong hwnd: fails check 12
+    a.Label("tp_done");
+    a.db({0x5D, 0xCA, 0x0A, 0x00});              // pop bp / retf 10
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x200)};
+    return p;
+}
+
 // Calls KERNEL.FatalExit(code).
 inline NeProgram FatalExitProgram(uint16_t exitCode) {
     NeProgram p = BaseProgram();
@@ -700,12 +1015,12 @@ inline NeProgram HelloProgram() {
     return p;
 }
 
-// Calls an API the engine doesn't have yet (USER.10 = SetTimer).
+// Calls an API the engine doesn't have yet (USER.7 = ExitWindows).
 inline NeProgram UnimplementedApiProgram() {
     NeProgram p = BaseProgram();
     NeSeg code;
     Asm16 a;
-    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 10));
+    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 7));
     code.bytes = a.Finish();
     p.segments = {code, DataSegment({}, 0x100)};
     return p;

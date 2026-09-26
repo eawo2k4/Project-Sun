@@ -64,6 +64,27 @@ struct NeEntry {
     bool exported = false;
 };
 
+// Resource types (RT_xxx) with integer ids.
+namespace res {
+constexpr uint16_t Cursor = 1, Bitmap = 2, Icon = 3, Menu = 4, Dialog = 5, String = 6, FontDir = 7,
+                   Font = 8, Accelerator = 9, RcData = 10, GroupCursor = 12, GroupIcon = 14;
+}  // namespace res
+
+// A resource: type and name are each an integer id (id != 0) or a string
+// (upper case, as the resource compiler stores them).
+struct NeResource {
+    uint16_t typeId = 0;
+    std::string typeName;
+    uint16_t id = 0;
+    std::string name;
+    uint16_t flags = 0;
+    uint16_t tableOffset = 0;   // NAMEINFO offset in the resource table: the HRSRC
+    std::vector<uint8_t> data;  // the file bytes (length rounded up to the alignment)
+};
+
+// Readable resource type: "BITMAP", "#15", or the type's name.
+std::string DescribeResourceType(const NeResource& r);
+
 struct NeImage {
     std::string moduleName;
     uint16_t flags = 0;
@@ -81,6 +102,7 @@ struct NeImage {
     std::vector<NeSegment> segments;         // segment n is segments[n - 1]
     std::vector<std::string> moduleRefs;     // module n is moduleRefs[n - 1]
     std::vector<NeEntry> entries;
+    std::vector<NeResource> resources;
 
     bool IsLibrary() const { return (flags & 0x8000) != 0; }
     const NeEntry* FindEntry(uint16_t ordinal) const;

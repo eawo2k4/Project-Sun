@@ -125,7 +125,7 @@ set_tests_properties(Win16HelloViaLauncher PROPERTIES
 set_tests_properties(Win16FatalExitViaLauncher PROPERTIES
     PASS_REGULAR_EXPRESSION "fatal exit, code 7 - FatalExit\\(7\\)")
 set_tests_properties(Win16UnimplementedViaLauncher PROPERTIES
-    PASS_REGULAR_EXPRESSION "USER\\.10 is not implemented yet")
+    PASS_REGULAR_EXPRESSION "USER\\.7 is not implemented yet")
 
 # Windowing through the real Win32 host (windows created but never shown).
 add_test(NAME Win16WindowViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_window.exe)
@@ -143,3 +143,10 @@ add_test(NAME Win16PaintViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/
 add_test(NAME Win16AnimationViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_anim.exe)
 set_tests_properties(Win16PaintViaLauncher Win16AnimationViaLauncher PROPERTIES
     FIXTURES_REQUIRED win16_samples)
+
+# Resources, timers and text: the program checks its own results (exit 0);
+# its timers wait in the real host's message loop (a hidden window can't
+# get input, but timers still fire).
+add_test(NAME Win16ResourcesViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_resources.exe)
+set_tests_properties(Win16ResourcesViaLauncher PROPERTIES FIXTURES_REQUIRED win16_samples
+    PASS_REGULAR_EXPRESSION "Win16 task  : TESTAPP, 2 segments, 3 resources.*Win16 exit  : exited, code 0")

@@ -1,6 +1,7 @@
 // Win16 engine tests: NE parsing, loading (selectors, relocations, initial
-// registers) and running synthetic programs to completion.
+// registers), resources, timers, and running synthetic programs to completion.
 
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -187,7 +188,7 @@ void TestImportsByName() {
 void TestUnimplementedApiStopsCleanly() {
     const RunOutcome o = RunProgram(UnimplementedApiProgram());
     CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
-    CHECK(o.exit.message == "USER.10 is not implemented yet");
+    CHECK(o.exit.message == "USER.7 is not implemented yet");
 }
 
 void TestFaultsAreReported() {
@@ -429,6 +430,195 @@ void TestAnimationIsPaced() {
     CHECK(unpaced.presents >= kFrames - 1 && t0 < 0.15);
 }
 
+// --- Resources, timers, text -----------------------------------------------------------------
+
+void TestParseResources() {
+    const NeProgram program = ResourceProgram();
+    NeImage img;
+    std::string error;
+    CHECK(ParseNe(BuildNe(program), img, error));
+    CHECK(img.resources.size() == 3);
+    if (img.resources.size() != 3) return;
+    const NeResource& bmp = img.resources[0];
+    CHECK(bmp.typeId == res::Bitmap && bmp.id == 0 && bmp.name == "LOGO");
+    CHECK(bmp.data.size() == 240);  // 232 bytes in 16-byte units
+    CHECK(std::equal(program.resources[0].data.begin(), program.resources[0].data.end(), bmp.data.begin()));
+    const NeResource& str = img.resources[1];
+    CHECK(str.typeId == res::String && str.id == 1 && str.name.empty());
+    const NeResource& custom = img.resources[2];
+    CHECK(custom.typeId == 0 && custom.typeName == "LEVELS" && custom.id == 3);
+    CHECK(custom.data.size() == 16 && custom.data[0] == 1 && custom.data[3] == 4);
+    CHECK(DescribeResourceType(bmp) == "BITMAP" && DescribeResourceType(str) == "STRING" &&
+          DescribeResourceType(custom) == "LEVELS");
+    // HRSRCs are distinct NAMEINFO offsets.
+    CHECK(bmp.tableOffset && bmp.tableOffset != str.tableOffset && str.tableOffset != custom.tableOffset);
+
+    // No resources: an empty table.
+    CHECK(ParseNe(BuildNe(SelfTestProgram()), img, error) && img.resources.empty());
+    // A resource pointing past the end of the file is rejected.
+    std::vector<uint8_t> file = BuildNe(program);
+    const size_t ne = 0x40, table = ne + (file[ne + 0x24] | (file[ne + 0x25] << 8));
+    const size_t firstOffset = table + 2 + 8;  // first NAMEINFO's offset field
+    file[firstOffset] = 0xFF;
+    file[firstOffset + 1] = 0x7F;
+    CHECK(!ParseNe(file, img, error) && error.find("outside the file") != std::string::npos);
+}
+
+void TestResourceManager() {
+    Runtime rt;
+    std::string error;
+    CHECK(rt.Load(BuildNe(ResourceProgram()), "", error));
+    Resources& r = rt.Resource();
+    const ResourceId bitmapType{res::Bitmap, {}};
+    const uint16_t logo = r.Find(bitmapType, ResourceId{0, "LOGO"});
+    CHECK(logo != 0 && r.Get(logo) && r.Get(logo)->name == "LOGO");
+    CHECK(r.Find(ResourceId{0, "LEVELS"}, ResourceId{3, {}}) != 0);
+    CHECK(r.Find(bitmapType, ResourceId{0, "NOPE"}) == 0);
+    CHECK(r.Find(ResourceId{res::Icon, {}}, ResourceId{0, "LOGO"}) == 0);  // wrong type
+
+    // "#6" means id 6; other strings are upper-cased names.
+    Memory& mem = rt.Mem();
+    const uint16_t sel = mem.Allocate(64, SegmentKind::Data);
+    const char* texts[] = {"#6", "logo", "#x"};
+    for (int i = 0; i < 3; ++i) {
+        for (size_t j = 0; texts[i][j]; ++j) mem.Write8(sel, uint16_t(i * 16 + j), uint8_t(texts[i][j]));
+    }
+    const ResourceId six = ResourceId::FromFarPtr(mem, sel, 0);
+    CHECK(six.id == 6 && six.name.empty());
+    const ResourceId named = ResourceId::FromFarPtr(mem, sel, 16);
+    CHECK(named.id == 0 && named.name == "LOGO");
+    CHECK(ResourceId::FromFarPtr(mem, sel, 32).name == "#X");
+    CHECK(ResourceId::FromFarPtr(mem, 0, 2).id == 2);  // MAKEINTRESOURCE
+
+    // LoadResource shares one block while loaded; FreeResource counts down.
+    const uint16_t h = r.Load(logo);
+    CHECK(h != 0 && r.Load(logo) == h && r.LoadedCount() == 1);
+    const uint16_t hsel = uint16_t(rt.Globals().Lock(h) >> 16);
+    CHECK(hsel && mem.Read16(hsel, 0) == 40 && rt.Globals().Size(h) == 240);
+    rt.Globals().Unlock(h);
+    CHECK(r.Free(h) == 0 && r.LoadedCount() == 1);
+    CHECK(r.Free(h) == 0 && r.LoadedCount() == 0 && rt.Globals().Size(h) == 0);
+    CHECK(r.Free(h) == h);  // not loaded any more
+
+    std::string s;
+    CHECK(r.String(1, s) && s == kResourceText);
+    CHECK(!r.String(0, s) && !r.String(2, s) && !r.String(17, s));  // empty / missing block
+}
+
+void TestBitmapsFromDibs() {
+    Runtime rt;
+    Gdi& g = rt.Graphics();
+    const std::vector<uint8_t> dib = QuadrantDib();
+    const uint16_t bmp = g.CreateBitmapFromDib(dib.data(), dib.size());
+    CHECK(bmp != 0 && g.HostObject(bmp, Gdi::Kind::Bitmap));
+
+    // It selects into a memory DC like any bitmap (its pixels are checked by
+    // ResourceProgram, which blits it).
+    const uint16_t dc = g.CreateCompatibleDc(0);
+    const uint16_t old = g.Select(dc, bmp);
+    CHECK(old != 0 && !g.Delete(bmp));  // selected: refused
+    g.Select(dc, old);
+    CHECK(g.Delete(bmp) && g.DeleteDc(dc));
+
+    // Malformed or truncated DIBs are refused rather than over-read.
+    CHECK(g.CreateBitmapFromDib(dib.data(), dib.size() - 1) == 0);
+    CHECK(g.CreateBitmapFromDib(dib.data(), 20) == 0);
+    std::vector<uint8_t> bad = dib;
+    bad[14] = 7;  // 7 bits per pixel
+    CHECK(g.CreateBitmapFromDib(bad.data(), bad.size()) == 0);
+    bad = dib;
+    bad[0] = 99;  // unknown header size
+    CHECK(g.CreateBitmapFromDib(bad.data(), bad.size()) == 0);
+
+    // A two-colour DIB (with its 2-entry colour table) loads too.
+    std::vector<uint8_t> mono(40 + 8 + 8 * 4, 0);
+    mono[0] = 40;
+    mono[4] = 8;
+    mono[8] = 8;
+    mono[12] = 1;
+    mono[14] = 1;
+    mono[44] = mono[45] = mono[46] = 0xFF;  // entry 1: white
+    const uint16_t monoBmp = g.CreateBitmapFromDib(mono.data(), mono.size());
+    CHECK(monoBmp != 0 && g.Delete(monoBmp));
+}
+
+void TestTimerCadence() {
+    Runtime rt;  // no program needed: drive USER directly
+    User& u = rt.Windows();
+    const uint16_t id = u.StartTimer(0, 0, 1, 0, 0);  // 1 ms asks for too much: 55 ms
+    CHECK(id != 0 && u.TimerCount() == 1);
+    Msg16 m;
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Empty);  // not due yet
+
+    // GetMessage-style waits: sleeps until each tick, never blocks for good.
+    const int64_t start = retro::QpcNow();
+    for (int i = 0; i < 4; ++i) {
+        CHECK(u.Next(m, 0, 0, 0, true, true) == User::Fetch::Message);
+        CHECK(m.message == wm::Timer && m.hwnd == 0 && m.wParam == id && m.lParam == 0);
+    }
+    const double ms = double(retro::QpcNow() - start) * 1000.0 / double(retro::QpcFrequency());
+    std::printf("  4 ticks of a 55 ms timer: %.1f ms\n", ms);
+    CHECK(ms >= 4 * 55 * 0.97 && ms < 4 * 55 + 40);
+
+    // A filter no timer matches: nothing can ever arrive (headless).
+    CHECK(u.Next(m, 0x2004, 0, 0, true, true) == User::Fetch::NoInput);
+    CHECK(u.Next(m, 0, wm::Paint, wm::Paint, true, true) == User::Fetch::NoInput);
+
+    // After a stall: one WM_TIMER, not a burst of the missed ones.
+    retro::PreciseWaiter().WaitUntil(retro::QpcNow() + retro::QpcFrequency() / 4);
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Message && m.message == wm::Timer);
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Empty);
+
+    // Each timer without a window gets its own id; KillTimer.
+    const uint16_t id2 = u.StartTimer(0, 0, 55, 0, 0);
+    CHECK(id2 != 0 && id2 != id);
+    CHECK(u.StopTimer(0, id) && !u.StopTimer(0, id) && u.TimerCount() == 1);
+    CHECK(u.Next(m, 0, 0, 0, true, true) == User::Fetch::Message && m.wParam == id2);
+    CHECK(u.StopTimer(0, id2) && u.TimerCount() == 0);
+    CHECK(u.Next(m, 0, 0, 0, true, true) == User::Fetch::NoInput);  // no timers left
+
+    // A TIMERPROC must be code; timers of unknown windows are refused.
+    CHECK(u.StartTimer(0, 0, 55, rt.Mem().Allocate(16, SegmentKind::Data), 0) == 0);
+    CHECK(u.StartTimer(0x2004, 1, 55, 0, 0) == 0);
+}
+
+void TestResourceProgramRendersOnTimer() {
+    // The program checks its own results (exit code = failed check); this
+    // checks what reached the host and how long five 60 ms ticks took.
+    HeadlessHost host;
+    Runtime rt;
+    rt.SetFrameCap(0);
+    const int64_t start = retro::QpcNow();
+    const TaskExit e = RunWithHost(ResourceProgram(), host, rt);
+    const double ms = double(retro::QpcNow() - start) * 1000.0 / double(retro::QpcFrequency());
+    std::printf("  5 ticks of a 60 ms timer: %.1f ms\n", ms);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);
+    CHECK(ms >= 5 * 60 * 0.97 && ms < 5 * 60 + 150);
+    CHECK(rt.Windows().TimerCount() == 0 && rt.Resource().LoadedCount() == 0);
+
+    CHECK(host.presents >= 5);  // a frame per tick
+    const HeadlessHost::Frame& f = host.lastFrame;
+    CHECK(f.width == 64 && f.height == 48);
+    if (f.pixels.size() != 64u * 48u) return;
+    for (int tick = 0; tick < 5; ++tick) {
+        const int x = tick * 8;
+        CHECK(f.At(x + 1, 1) == 0xFF0000 && f.At(x + 6, 1) == 0x00FF00);
+        CHECK(f.At(x + 1, 6) == 0x0000FF && f.At(x + 6, 6) == 0xFFFFFF);
+    }
+    CHECK(f.At(41, 1) == 0x000000 && f.At(60, 40) == 0x000000);
+    int yellow = 0, blue = 0, other = 0;
+    for (int y = 16; y < 32; ++y) {
+        for (int x = 0; x < 64; ++x) {
+            const uint32_t c = f.At(x, y);
+            if (c == 0xFFFF00) ++yellow;
+            else if (c == 0x0000FF) ++blue;
+            else ++other;
+        }
+    }
+    std::printf("  text band: %d yellow, %d blue, %d other pixels\n", yellow, blue, other);
+    CHECK(yellow > 20 && blue > yellow);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -466,6 +656,11 @@ int main() {
         {"GdiHandleMapping", TestGdiHandleMapping},
         {"PaintLifecycle", TestPaintLifecycle},
         {"AnimationIsPaced", TestAnimationIsPaced},
+        {"ParseResources", TestParseResources},
+        {"ResourceManager", TestResourceManager},
+        {"BitmapsFromDibs", TestBitmapsFromDibs},
+        {"TimerCadence", TestTimerCadence},
+        {"ResourceProgramRendersOnTimer", TestResourceProgramRendersOnTimer},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

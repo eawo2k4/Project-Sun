@@ -1,5 +1,5 @@
 // GDI: 16-bit handles over host GDI objects, window surfaces, presentation,
-// and the GDI.EXE API.
+// text, and the GDI.EXE API.
 
 #include <windows.h>
 
@@ -219,6 +219,69 @@ uint16_t Gdi::CreateCompatibleBitmap(uint16_t hdc, int width, int height) {
     return dc ? Wrap(::CreateCompatibleBitmap(dc, width, height), Kind::Bitmap, true, false) : 0;
 }
 
+uint16_t Gdi::CreateBitmapFromDib(const uint8_t* dib, size_t size) {
+    if (!dib || size < sizeof(BITMAPCOREHEADER)) return 0;
+    uint32_t headerSize = 0;
+    std::memcpy(&headerSize, dib, 4);
+    int width = 0, height = 0, planes = 0, bpp = 0;
+    uint32_t compression = BI_RGB, sizeImage = 0, colors = 0, entrySize = 0;
+    if (headerSize == sizeof(BITMAPCOREHEADER)) {  // OS/2 1.x style
+        BITMAPCOREHEADER h;
+        std::memcpy(&h, dib, sizeof(h));
+        width = h.bcWidth;
+        height = h.bcHeight;
+        planes = h.bcPlanes;
+        bpp = h.bcBitCount;
+        entrySize = sizeof(RGBTRIPLE);
+        colors = bpp <= 8 ? 1u << bpp : 0;
+    } else if (headerSize >= sizeof(BITMAPINFOHEADER) && headerSize <= size) {
+        BITMAPINFOHEADER h;
+        std::memcpy(&h, dib, sizeof(h));
+        width = h.biWidth;
+        height = h.biHeight;
+        planes = h.biPlanes;
+        bpp = h.biBitCount;
+        compression = h.biCompression;
+        sizeImage = h.biSizeImage;
+        entrySize = sizeof(RGBQUAD);
+        colors = h.biClrUsed ? h.biClrUsed : (bpp <= 8 ? 1u << bpp : 0);
+        if (compression == BI_BITFIELDS && headerSize == sizeof(BITMAPINFOHEADER)) colors = 3;
+    } else {
+        return 0;
+    }
+    const bool rle = compression == BI_RLE8 || compression == BI_RLE4;
+    if (width <= 0 || height == 0 || height == INT32_MIN || planes != 1 ||
+        (bpp != 1 && bpp != 4 && bpp != 8 && bpp != 16 && bpp != 24 && bpp != 32) || colors > 256 ||
+        (compression != BI_RGB && compression != BI_BITFIELDS && !rle))
+        return 0;
+    const uint64_t rows = uint64_t(height < 0 ? -int64_t(height) : height);
+    const uint64_t stride = ((uint64_t(width) * uint64_t(bpp) + 31) / 32) * 4;
+    const uint64_t bitsOffset = uint64_t(headerSize) + uint64_t(colors) * entrySize;
+    const uint64_t bitsSize = rle ? sizeImage : stride * rows;
+    if (bitsSize == 0 || bitsOffset + bitsSize > size) return 0;
+
+    // Copies with the alignment GDI expects.
+    std::vector<uint32_t> info(size_t((bitsOffset + 3) / 4));
+    std::memcpy(info.data(), dib, size_t(bitsOffset));
+    const std::vector<uint8_t> bits(dib + bitsOffset, dib + bitsOffset + bitsSize);
+    const BITMAPINFO* bmi = reinterpret_cast<const BITMAPINFO*>(info.data());
+
+    HDC screen = GetDC(nullptr);
+    HBITMAP bmp = nullptr;
+    if (bpp == 1) {
+        bmp = ::CreateBitmap(width, int(rows), 1, 1, nullptr);
+        if (bmp && !SetDIBits(screen, bmp, 0, UINT(rows), bits.data(), bmi, DIB_RGB_COLORS)) {
+            DeleteObject(bmp);
+            bmp = nullptr;
+        }
+    } else {
+        bmp = CreateDIBitmap(screen, reinterpret_cast<const BITMAPINFOHEADER*>(info.data()), CBM_INIT,
+                             bits.data(), bmi, DIB_RGB_COLORS);
+    }
+    ReleaseDC(nullptr, screen);
+    return Wrap(bmp, Kind::Bitmap, true, false);
+}
+
 uint16_t Gdi::CreateSolidBrush(uint32_t color) {
     return Wrap(::CreateSolidBrush(color), Kind::Brush, true, false);
 }
@@ -354,6 +417,57 @@ void Api_StretchBlt(Runtime& rt, Cpu& cpu) {  // (HDC, x, y, w, h, HDC src, xs, 
     cpu.ReturnFar(a.Bytes());
 }
 
+// --- Text ---
+
+void Api_SetBkColor(Runtime& rt, Cpu& cpu) {  // (HDC, COLORREF) -> previous
+    const PascalArgs a(cpu, {2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    SetResult(cpu, dc ? SetBkColor(dc, a.Long(1)) : CLR_INVALID);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void Api_SetBkMode(Runtime& rt, Cpu& cpu) {  // (HDC, TRANSPARENT 1 | OPAQUE 2) -> previous
+    const PascalArgs a(cpu, {2, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    cpu.Regs().r[AX] = dc ? uint16_t(SetBkMode(dc, a.Int(1))) : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void Api_SetTextColor(Runtime& rt, Cpu& cpu) {  // (HDC, COLORREF) -> previous
+    const PascalArgs a(cpu, {2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    SetResult(cpu, dc ? SetTextColor(dc, a.Long(1)) : CLR_INVALID);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void Api_GetTextColor(Runtime& rt, Cpu& cpu) {  // (HDC) -> COLORREF
+    const PascalArgs a(cpu, {2});
+    HDC dc = Dc(rt, a.Word(0));
+    SetResult(cpu, dc ? GetTextColor(dc) : 0);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void Api_TextOut(Runtime& rt, Cpu& cpu) {  // (HDC, x, y, LPCSTR, int count) -> BOOL
+    const PascalArgs a(cpu, {2, 2, 2, 4, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    const FarPtr str = a.Ptr(3);
+    const int count = a.Int(4);
+    BOOL ok = FALSE;
+    if (dc && count >= 0) {
+        rt.Mem().Translate(str.sel, str.off, uint32_t(count), Access::Read);  // #GP if out of bounds
+        std::string text(size_t(count), '\0');
+        for (int i = 0; i < count; ++i) text[size_t(i)] = char(rt.Mem().Read8(str.sel, uint16_t(str.off + i)));
+        // Win16 text is ANSI (code page 1252), whatever the host's code page.
+        std::wstring wide(text.size(), L'\0');
+        const int n = text.empty() ? 0
+                                   : MultiByteToWideChar(1252, 0, text.data(), int(text.size()), wide.data(),
+                                                         int(wide.size()));
+        ok = TextOutW(dc, a.Int(1), a.Int(2), wide.data(), n);
+    }
+    cpu.Regs().r[AX] = ok ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
 void Api_SelectObject(Runtime& rt, Cpu& cpu) {  // (HDC, HGDIOBJ) -> previous
     const PascalArgs a(cpu, {2, 2});
     cpu.Regs().r[AX] = rt.Graphics().Select(a.Word(0), a.Word(1));
@@ -423,10 +537,14 @@ void Api_GetStockObject(Runtime& rt, Cpu& cpu) {  // (int)
 
 std::vector<ApiFunction> GdiApi() {
     return {
+        {1, "SETBKCOLOR", Api_SetBkColor},
+        {2, "SETBKMODE", Api_SetBkMode},
+        {9, "SETTEXTCOLOR", Api_SetTextColor},
         {27, "RECTANGLE", Api_Rectangle},
         {29, "PATBLT", Api_PatBlt},
         {31, "SETPIXEL", Api_SetPixel},
         {34, "BITBLT", Api_BitBlt},
+        {33, "TEXTOUT", Api_TextOut},
         {35, "STRETCHBLT", Api_StretchBlt},
         {45, "SELECTOBJECT", Api_SelectObject},
         {48, "CREATEBITMAP", Api_CreateBitmap},
@@ -438,6 +556,7 @@ std::vector<ApiFunction> GdiApi() {
         {69, "DELETEOBJECT", Api_DeleteObject},
         {83, "GETPIXEL", Api_GetPixel},
         {87, "GETSTOCKOBJECT", Api_GetStockObject},
+        {90, "GETTEXTCOLOR", Api_GetTextColor},
     };
 }
 

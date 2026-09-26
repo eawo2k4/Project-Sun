@@ -26,13 +26,14 @@ Project Sun/
 │  │  ├─ include/retro/ShimProtocol.h  launcher → shim config payload (GUID + struct)
 │  │  └─ *.cpp
 │  ├─ win16/               RetroWin16.lib: 16-bit Windows engine (no Windows headers)
-│  │  ├─ NeImage.cpp               NE parser: segments, relocations, imports, entry table
+│  │  ├─ NeImage.cpp               NE parser: segments, relocations, imports, entries, resources
 │  │  ├─ NeLoader.cpp              selectors per segment, fixup chains, PSP, initial registers
 │  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset
 │  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
-│  │  ├─ Kernel.cpp                KERNEL: task start/exit, version, DOS3Call, global heap
-│  │  ├─ User.cpp                  USER: classes, windows, message queue, WndProc callbacks
-│  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, back buffers, presentation
+│  │  ├─ Kernel.cpp                KERNEL: task start/exit, version, DOS3Call, global heap, resources
+│  │  ├─ Resources.cpp             resource lookup/loading, string tables
+│  │  ├─ User.cpp                  USER: classes, windows, message queue, timers, callbacks
+│  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, text, back buffers, presentation
 │  │  └─ Runtime.cpp               Win16 task: builtin DLL dispatch, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
@@ -97,18 +98,20 @@ Project Sun/
   yet stops the task with e.g. `USER.39 is not implemented yet`, rather than
   crashing. Implemented so far:
   - KERNEL: `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `WaitEvent`,
-    `DOS3Call`, `GlobalAlloc`, `GlobalLock`, `GlobalUnlock`, `GlobalFree`, `GlobalSize`.
+    `DOS3Call`, `GlobalAlloc`, `GlobalLock`, `GlobalUnlock`, `GlobalFree`, `GlobalSize`,
+    `FindResource`, `LoadResource`, `LockResource`, `FreeResource`, `SizeofResource`.
   - USER: `RegisterClass`, `CreateWindow`/`CreateWindowEx`, `ShowWindow`,
     `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `GetMessage`, `PeekMessage`,
     `PostMessage`, `SendMessage`, `TranslateMessage`, `DispatchMessage`,
     `PostQuitMessage`, `GetSystemMetrics` (a 640×480 screen), `GetTickCount`,
-    `LoadIcon`/`LoadCursor` (placeholder handles), `InitApp`, `MessageBox`
-    (printed to the console).
+    `SetTimer`, `KillTimer`, `LoadBitmap`, `LoadString`, `LoadIcon`/`LoadCursor`
+    (placeholder handles), `InitApp`, `MessageBox` (printed to the console).
   - USER painting: `BeginPaint`/`EndPaint` (real `PAINTSTRUCT`), `GetDC`/`ReleaseDC`,
     `InvalidateRect`/`ValidateRect`, `GetClientRect`, `FillRect`.
   - GDI: `CreateCompatibleDC`, `DeleteDC`, `CreateBitmap`, `CreateCompatibleBitmap`,
     `CreateSolidBrush`, `CreatePen`, `SelectObject`, `DeleteObject`, `GetStockObject`,
-    `BitBlt`, `StretchBlt`, `PatBlt`, `Rectangle`, `SetPixel`, `GetPixel`.
+    `BitBlt`, `StretchBlt`, `PatBlt`, `Rectangle`, `SetPixel`, `GetPixel`, `TextOut`,
+    `SetTextColor`, `GetTextColor`, `SetBkColor`, `SetBkMode`.
 - **Global heap:** each `GlobalAlloc` block is its own LDT segment. As in protected-mode
   Windows 3.x, a fixed block's handle is its selector, and a moveable block's handle is
   the selector with bit 0 cleared.
@@ -120,6 +123,29 @@ Project Sun/
   windows scaled by a whole number. Closing, keys and mouse come back as 16-bit
   messages, in the 16-bit window's coordinates. `WM_QUIT` is retrieved only after
   everything else, as in Windows.
+- **Resources:** the NE resource table is parsed at load: integer or named types
+  (`RT_BITMAP`, `RT_ICON`, `RT_CURSOR`, `RT_MENU`, `RT_STRING`, custom types) and
+  names. As in Windows 3.x, an `HRSRC` is the resource's `NAMEINFO` offset in the table,
+  and `LoadResource` copies the data into a moveable global block. Loading the same
+  resource again shares that block, with a usage count that `FreeResource` decrements.
+  Names match case-insensitively, and `"#12"` means id 12. `LoadBitmap` turns a
+  packed-DIB resource into a device-dependent bitmap (two-colour DIBs become monochrome
+  bitmaps, as in Windows), and refuses malformed or truncated DIBs. `LoadString` reads
+  the 16-string blocks.
+- **Timers:** `SetTimer` supports both styles: `WM_TIMER` to a window, and a
+  `TIMERPROC`, which `DispatchMessage` calls on the interpreter as
+  `(hwnd, WM_TIMER, id, dwTime)`. It only calls procedures of live timers, since
+  `lParam` is just a number. Timers are due times, not queued messages. Like
+  `WM_PAINT`, a `WM_TIMER` is synthesized when nothing else is queued, at most one
+  per timer. After a stall, missed ticks are skipped rather than delivered as a burst.
+  `GetMessage` sleeps until input arrives or the next timer is due. The Win32 host
+  waits on a high-resolution waitable timer together with its message queue, so ticks
+  land within about a millisecond, and an idle task uses no CPU. Intervals below 55 ms
+  run at 55 ms: Windows 3.x timers ticked with the 18.2 Hz PC timer, and programs
+  written for it assume that rate.
+- **Text:** `TextOut` draws with the DC's text colour, background colour and mode.
+  Strings are converted from code page 1252 (Win16's ANSI), whatever the host's code
+  page. Each `GetDC` starts from the default colours, as with Windows' common DCs.
 - **Callbacks:** `SendMessage`, `DispatchMessage` and `CreateWindow` (`WM_NCCREATE`/
   `WM_CREATE` with a real `CREATESTRUCT`, then `WM_SIZE`/`WM_MOVE`) call the 16-bit
   window procedure on the interpreter. `Cpu::CallFar` pushes the Pascal arguments and
@@ -154,12 +180,14 @@ the program exits with it), or 6 if the task stopped on a fault, an unimplemente
 while waiting for input that can never arrive. `--hidden` creates a 16-bit program's host
 windows without showing them; the tests use it.
 
-Not yet: text and fonts (`TextOut`), lines and other shapes, regions, palettes (8-bit
-games), mapping modes, non-client areas (a 16-bit window is all client area), child
-windows (they get no back buffer), child controls and system classes
-(`BUTTON`, `EDIT`, …), timers, other NE DLLs, resources, huge (> 64 KB) global blocks,
-386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), x87 / WIN87EM,
-and iterated segments.
+Not yet: fonts (`CreateFont`; text uses the host's default font) and text metrics,
+lines and other shapes, regions, palettes (8-bit games), mapping modes, non-client areas
+(a 16-bit window is all client area), child windows (they get no back buffer), child
+controls and system classes (`BUTTON`, `EDIT`, …), menus, dialogs, icons and cursors
+from resources (they're parsed, but `LoadIcon`/`LoadCursor` return placeholders),
+system bitmaps (`OBM_xxx`), `SetSystemTimer`, other NE DLLs, huge (> 64 KB) global
+blocks, 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`),
+x87 / WIN87EM, and iterated segments.
 
 ## Shim modules
 

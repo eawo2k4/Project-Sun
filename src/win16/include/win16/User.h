@@ -12,9 +12,15 @@
 // Messages for a 16-bit window are handled by calling its window procedure
 // on the interpreter (Cpu::CallFar), from SendMessage and DispatchMessage.
 // Host input (close button, keys, mouse) comes back as posted messages.
+//
+// Timers (SetTimer) are kept as due times, not queued messages: like
+// WM_PAINT, a WM_TIMER is synthesized when the queue is otherwise empty and a
+// timer is due, at most one per timer. GetMessage sleeps until the next due
+// time (or input), so an idle task costs nothing and timers fire on time.
 
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <functional>
 #include <map>
 #include <string>
@@ -30,7 +36,7 @@ constexpr uint16_t Create = 0x0001, Destroy = 0x0002, Move = 0x0003, Size = 0x00
                    NcCreate = 0x0081, NcDestroy = 0x0082,
                    KeyDown = 0x0100, KeyUp = 0x0101, Char = 0x0102, MouseMove = 0x0200,
                    LButtonDown = 0x0201, LButtonUp = 0x0202, RButtonDown = 0x0204,
-                   RButtonUp = 0x0205, User = 0x0400;
+                   RButtonUp = 0x0205, Timer = 0x0113, User = 0x0400;
 }  // namespace wm
 
 namespace ws {
@@ -68,6 +74,10 @@ public:
         bool fullscreen = false;  // covers the 16-bit screen: present it borderless
     };
 
+    // Pump deadlines: QPC times (retro::QpcNow).
+    static constexpr int64_t kPoll = 0;
+    static constexpr int64_t kForever = std::numeric_limits<int64_t>::max();
+
     virtual ~WindowHost() = default;
     virtual uint64_t Create(const WindowInfo& info) = 0;  // 0 = failed
     virtual void Show(uint64_t window, bool show) = 0;
@@ -75,14 +85,16 @@ public:
     // A new frame of the window's content: 32-bit BGRA, top-down, width x
     // height (the 16-bit window size). The host scales it onto the screen.
     virtual void Present(uint64_t window, const uint32_t* pixels, int width, int height) = 0;
-    // Delivers pending host input as 16-bit messages. With `wait`, blocks until
-    // something arrives; returns false if nothing ever can (so waiting would
-    // hang the task).
-    virtual bool Pump(const Deliver& deliver, bool wait) = 0;
+    // Delivers pending host input as 16-bit messages. If there is none, waits
+    // for some until the QPC deadline `until` (kPoll: don't wait; kForever: no
+    // deadline). Returns false only for kForever when no input can ever arrive
+    // (so waiting would hang the task).
+    virtual bool Pump(const Deliver& deliver, int64_t until) = 0;
 };
 
 // No real windows: records them, and delivers input that tests queue up
-// (addressed to host windows, like real input) once the task waits for input.
+// (addressed to host windows, like real input) once the task waits. A wait
+// with a deadline and nothing queued sleeps until the deadline.
 class HeadlessHost : public WindowHost {
 public:
     struct Record {
@@ -108,7 +120,7 @@ public:
     void Show(uint64_t window, bool show) override;
     void Destroy(uint64_t window) override;
     void Present(uint64_t window, const uint32_t* pixels, int width, int height) override;
-    bool Pump(const Deliver& deliver, bool wait) override;
+    bool Pump(const Deliver& deliver, int64_t until) override;
 
     std::vector<Record> windows;
     std::deque<Event> events;  // delivered on the next Pump
@@ -149,7 +161,17 @@ public:
         uint16_t parent = 0, menu = 0, hInstance = 0;
         uint16_t paramSel = 0, paramOff = 0;
     };
+    struct Timer {
+        uint16_t hwnd = 0, id = 0;
+        uint16_t procSel = 0, procOff = 0;  // TIMERPROC, or 0:0 for WM_TIMER to the window
+        uint32_t intervalMs = 0;
+        int64_t due = 0;  // QPC
+    };
     enum class Fetch { Message, Quit, Empty, NoInput };
+
+    // Windows 3.x timers tick with the PC timer (18.2 Hz): nothing fires more
+    // often than every 55 ms, and programs written for it rely on that.
+    static constexpr uint32_t kMinTimerMs = 55;
 
     // (Method names avoid the Win32 API names: <windows.h> defines CreateWindow,
     // SendMessage, ... as macros, and hosts include both.)
@@ -171,6 +193,14 @@ public:
     Fetch Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_t maxMsg, bool remove,
                bool wait);
 
+    // SetTimer: returns the timer id (a new one for hwnd 0), 0 on failure.
+    // Setting an existing (hwnd, id) timer again restarts it.
+    uint16_t StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_t procSel, uint16_t procOff);
+    bool StopTimer(uint16_t hwnd, uint16_t id);  // KillTimer
+    // True if sel:off is a live timer's TIMERPROC (DispatchMessage only calls those).
+    bool IsTimerProc(uint16_t sel, uint16_t off) const;
+    size_t TimerCount() const { return timers_.size(); }
+
     // Painting. `rect` null = the whole client area.
     void Invalidate(uint16_t hwnd, const Rect16* rect, bool erase);
     void Validate(uint16_t hwnd, const Rect16* rect);
@@ -190,7 +220,9 @@ public:
 private:
     Window* FindMutable(uint16_t hwnd);
     bool Matches(const Msg16& m, uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg) const;
-    void PumpHost(bool wait, bool& canWait);
+    bool PumpHost(int64_t until);
+    Timer* DueTimer(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg, int64_t now);
+    int64_t NextTimerDue(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg) const;
 
     Runtime& rt_;
     HeadlessHost headless_;
@@ -199,6 +231,8 @@ private:
     std::map<uint16_t, Window> windows_;
     std::map<uint64_t, uint16_t> hostToHwnd_;
     std::deque<Msg16> queue_;
+    std::vector<Timer> timers_;
+    uint16_t nextTimerId_ = 1;  // for timers without a window
     bool quitPending_ = false;
     uint16_t quitCode_ = 0;
     uint16_t nextHwnd_ = 0x2004;
