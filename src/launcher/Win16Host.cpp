@@ -36,48 +36,71 @@ public:
         RegisterClassOnce();
         const DPI_AWARENESS_CONTEXT previous =
             SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-
-        MONITORINFO mi{};
-        mi.cbSize = sizeof(mi);
-        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
-        const Rect monitor{mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom};
-        const Rect work{mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom};
-
-        const Size virt = info.fullscreen ? Size{win16::kScreenWidth, win16::kScreenHeight}
-                                          : Size{info.width, info.height};
-        DWORD style;
-        WindowLayout layout;
-        if (info.fullscreen) {
-            style = WS_POPUP;
-            layout = PlanFullscreenLayout(virt, monitor, {});
-        } else {
-            style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
-            RECT frame{0, 0, 0, 0};
-            AdjustWindowRectExForDpi(&frame, style, FALSE, 0, GetDpiForSystem());
-            layout = PlanWindowedLayout(virt, work, {-frame.left, -frame.top, frame.right, frame.bottom}, {});
-        }
-
+        const Plan plan = PlanFor(info);
         const std::wstring title = Widen(info.title);
-        HWND hwnd = CreateWindowExW(0, kClassName, title.c_str(), style, layout.window.left,
-                                    layout.window.top, layout.window.Width(), layout.window.Height(),
-                                    nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        HWND hwnd = CreateWindowExW(0, kClassName, title.c_str(), plan.style, plan.layout.window.left,
+                                    plan.layout.window.top, plan.layout.window.Width(),
+                                    plan.layout.window.Height(), nullptr, nullptr, GetModuleHandleW(nullptr),
+                                    nullptr);
         SetThreadDpiAwarenessContext(previous);
         if (!hwnd) return 0;
 
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
-        const Rect vp{layout.viewport.left - layout.client.left, layout.viewport.top - layout.client.top,
-                      layout.viewport.right - layout.client.left,
-                      layout.viewport.bottom - layout.client.top};
-        windows_.push_back({hwnd, info.hwnd16, ViewportMap(vp, virt), info.fullscreen});
-
-        const std::string scale = layout.integerScale ? "x" + std::to_string(layout.integerScale)
-                                                      : std::string("fractional");
-        std::printf("[win16] host window for HWND16 %04X \"%s\": %dx%d -> %dx%d (%s), %s%s\n",
-                    info.hwnd16, info.title.c_str(), virt.w, virt.h, layout.viewport.Width(),
-                    layout.viewport.Height(), scale.c_str(),
-                    info.fullscreen ? "borderless fullscreen" : "windowed", hidden_ ? ", hidden" : "");
-        std::fflush(stdout);
+        windows_.push_back({hwnd, info.hwnd16, plan.map, info.fullscreen, info.width, info.height});
+        Describe("host window for", info, plan);
         return reinterpret_cast<uint64_t>(hwnd);
+    }
+
+    // Moved, resized (possibly into or out of fullscreen) or retitled.
+    void Update(uint64_t window, const WindowInfo& info) override {
+        Entry* e = Find(reinterpret_cast<HWND>(window));
+        if (!e) return;
+        const DPI_AWARENESS_CONTEXT previous =
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        const Plan plan = PlanFor(info);
+        const bool relayout = e->map.RealViewport().Width() != plan.map.RealViewport().Width() ||
+                              e->map.RealViewport().Height() != plan.map.RealViewport().Height() ||
+                              e->fullscreen != info.fullscreen || e->virtWidth != info.width ||
+                              e->virtHeight != info.height;
+        SetWindowTextW(e->hwnd, Widen(info.title).c_str());
+        if (relayout) {
+            SetWindowLongPtrW(e->hwnd, GWL_STYLE, LONG_PTR(plan.style | (e->visible && !hidden_ ? WS_VISIBLE : 0)));
+            SetWindowPos(e->hwnd, nullptr, plan.layout.window.left, plan.layout.window.top,
+                         plan.layout.window.Width(), plan.layout.window.Height(),
+                         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            e->map = plan.map;
+            e->fullscreen = info.fullscreen;
+            e->virtWidth = info.width;
+            e->virtHeight = info.height;
+            InvalidateRect(e->hwnd, nullptr, TRUE);
+            Describe("host window for", info, plan);
+        }
+        SetThreadDpiAwarenessContext(previous);
+    }
+
+    void SetCursorShape(uint16_t shape) override {
+        cursorShape_ = shape;
+        POINT p;
+        if (GetCursorPos(&p)) {
+            HWND under = WindowFromPoint(p);
+            if (Find(under)) ApplyCursor();
+        }
+    }
+
+    void Capture(uint64_t window, bool capture) override {
+        if (capture) {
+            SetCapture(reinterpret_cast<HWND>(window));
+        } else if (GetCapture() == reinterpret_cast<HWND>(window)) {
+            ReleaseCapture();
+        }
+    }
+
+    // A real message box (MB_xxx flags are the same in Win16 and Win32), except
+    // in hidden mode, where nobody could answer it.
+    int ShowMessage(uint64_t owner, const std::string& caption, const std::string& text, uint16_t type) override {
+        if (hidden_) return -1;
+        return MessageBoxW(reinterpret_cast<HWND>(owner), Widen(text).c_str(), Widen(caption).c_str(),
+                           UINT(type) | MB_SETFOREGROUND);
     }
 
     void Show(uint64_t window, bool show) override {
@@ -136,11 +159,65 @@ public:
 private:
     static constexpr const wchar_t* kClassName = L"RetroWin16Window";
 
+    struct Plan {
+        DWORD style = 0;
+        WindowLayout layout;
+        ViewportMap map;
+        Size virt;
+    };
+
+    // Style and placement of a host window for a 16-bit window: borderless
+    // fullscreen with the 640x480 screen integer-scaled if it covers the 16-bit
+    // screen, else a captioned window with the client area integer-scaled.
+    static Plan PlanFor(const WindowInfo& info) {
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        const Rect monitor{mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom};
+        const Rect work{mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom};
+        Plan p;
+        p.virt = info.fullscreen ? Size{win16::kScreenWidth, win16::kScreenHeight}
+                                 : Size{std::max<int>(info.width, 1), std::max<int>(info.height, 1)};
+        if (info.fullscreen) {
+            p.style = WS_POPUP;
+            p.layout = PlanFullscreenLayout(p.virt, monitor, {});
+        } else {
+            p.style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+            RECT frame{0, 0, 0, 0};
+            AdjustWindowRectExForDpi(&frame, p.style, FALSE, 0, GetDpiForSystem());
+            p.layout = PlanWindowedLayout(p.virt, work, {-frame.left, -frame.top, frame.right, frame.bottom}, {});
+        }
+        const Rect vp{p.layout.viewport.left - p.layout.client.left, p.layout.viewport.top - p.layout.client.top,
+                      p.layout.viewport.right - p.layout.client.left,
+                      p.layout.viewport.bottom - p.layout.client.top};
+        p.map = ViewportMap(vp, p.virt);
+        return p;
+    }
+
+    void Describe(const char* what, const WindowInfo& info, const Plan& p) const {
+        const std::string scale = p.layout.integerScale ? "x" + std::to_string(p.layout.integerScale)
+                                                        : std::string("fractional");
+        std::printf("[win16] %s HWND16 %04X \"%s\": %dx%d -> %dx%d (%s), %s%s\n", what, info.hwnd16,
+                    info.title.c_str(), p.virt.w, p.virt.h, p.layout.viewport.Width(), p.layout.viewport.Height(),
+                    scale.c_str(), info.fullscreen ? "borderless fullscreen" : "windowed", hidden_ ? ", hidden" : "");
+        std::fflush(stdout);
+    }
+
+    void ApplyCursor() const {
+        HCURSOR c = nullptr;
+        if (cursorShape_) {
+            c = LoadCursorW(nullptr, MAKEINTRESOURCEW(cursorShape_));
+            if (!c) c = LoadCursorW(nullptr, IDC_ARROW);
+        }
+        SetCursor(c);
+    }
+
     struct Entry {
         HWND hwnd;
         uint16_t hwnd16;
         ViewportMap map;  // client coordinates <-> 16-bit window coordinates
         bool fullscreen;
+        int virtWidth = 0, virtHeight = 0;  // the 16-bit window's size
         bool visible = false;
         std::vector<uint32_t> frame;  // last presented frame (for WM_PAINT)
         int frameWidth = 0, frameHeight = 0;
@@ -223,6 +300,10 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Win32WindowHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         Entry* e = self ? self->Find(hwnd) : nullptr;
+        if (e && msg == WM_SETCURSOR && LOWORD(lp) == HTCLIENT) {  // the 16-bit program's cursor
+            self->ApplyCursor();
+            return TRUE;
+        }
         if (e && msg == WM_PAINT) {  // uncovered: show the last frame again (bars stay black)
             PAINTSTRUCT ps;
             HDC dc = BeginPaint(hwnd, &ps);
@@ -242,11 +323,20 @@ private:
         case WM_CHAR:
             deliver(e->hwnd16, uint16_t(msg), uint16_t(wp), uint32_t(lp));
             return 0;
+        case WM_SYSKEYDOWN:  // Alt+key: the program sees it; Windows still handles Alt+F4
+        case WM_SYSKEYUP:
+        case WM_SYSCHAR:
+            deliver(e->hwnd16, uint16_t(msg), uint16_t(wp), uint32_t(lp));
+            return DefWindowProcW(hwnd, msg, wp, lp);
         case WM_MOUSEMOVE:
         case WM_LBUTTONDOWN:
         case WM_LBUTTONUP:
         case WM_RBUTTONDOWN:
-        case WM_RBUTTONUP: {
+        case WM_RBUTTONUP:
+        case WM_MBUTTONDOWN:
+        case WM_MBUTTONUP:
+        case WM_LBUTTONDBLCLK:
+        case WM_RBUTTONDBLCLK: {
             const Point p = e->map.ToVirtual({short(LOWORD(lp)), short(HIWORD(lp))});
             deliver(e->hwnd16, uint16_t(msg), uint16_t(wp),
                     uint32_t(uint16_t(p.x)) | (uint32_t(uint16_t(p.y)) << 16));
@@ -258,6 +348,7 @@ private:
     }
 
     bool hidden_;
+    uint16_t cursorShape_ = win16::kArrowCursor;  // IDC_xxx, 0 = hidden
     HANDLE timer_ = nullptr;  // for WaitForInputUntil
     const Deliver* deliver_ = nullptr;
     std::vector<Entry> windows_;
@@ -281,6 +372,7 @@ int RunWin16Program(const std::filesystem::path& exe, const std::string& command
     runtime.SetTrace(options.trace);
     runtime.SetStubMissing(options.stubMissing);
     runtime.SetExactTimers(options.exactTimers);
+    runtime.SetMute(options.mute);
     runtime.SetProgram(exe);
     runtime.SetOutput([](const std::string& line) {
         std::printf("[win16] %s\n", line.c_str());

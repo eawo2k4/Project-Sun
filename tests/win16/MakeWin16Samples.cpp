@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
         {"win16_resources.exe", win16test::ResourceProgram()},
         {"win16_crt.exe", win16test::CrtProgram()},
         {"win16_shell.exe", win16test::MissingModuleProgram()},
+        {"win16_ui.exe", win16test::UiProgram()},
     };
     for (const auto& s : samples) {
         const std::vector<uint8_t> bytes = win16test::BuildNe(s.program);

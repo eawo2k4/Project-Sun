@@ -17,7 +17,9 @@ template <size_t N>
 int RunAll(const Case (&cases)[N]) {
     for (const Case& c : cases) {
         std::printf("[ RUN ] %s\n", c.name);
+        std::fflush(stdout);  // a crash in a test still shows which one
         c.fn();
+        std::fflush(stdout);
     }
     std::printf(g_failures ? "%d check(s) FAILED\n" : "All tests passed\n", g_failures);
     return g_failures ? 1 : 0;

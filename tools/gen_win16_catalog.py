@@ -29,7 +29,9 @@ MODULES = [
 # Parameter type -> one character (see ApiCatalog.h).
 PARAMS = {"word": "w", "s_word": "s", "long": "l", "ptr": "p", "segptr": "P", "str": "z", "segstr": "Z"}
 
-LINE = re.compile(r"^\s*(\d+)\s+(\w+)\s+((?:-\S+\s+)*)([^\s(]+)(?:\(([^)]*)\))?\s*(\S*)")
+# ordinal, kind, flags, name, (parameters), rest. Wine sometimes puts a space
+# before the parameter list ("Polygon (word ptr word)").
+LINE = re.compile(r"^\s*(\d+)\s+(\w+)\s+((?:-\S+\s+)*)([^\s(]+)\s*(?:\(([^)]*)\))?\s*(\S*)")
 
 
 def parse(path):
@@ -52,8 +54,8 @@ def parse(path):
                 entry["kind"] = "Register"
             else:
                 entry["kind"] = "Pascal"
-                types = (params or "").split()
-                if all(t in PARAMS for t in types):
+                types = params.split() if params is not None else None
+                if types is not None and all(t in PARAMS for t in types):
                     entry["params"] = "".join(PARAMS[t] for t in types)
         elif kind == "varargs":
             entry["kind"] = "Varargs"

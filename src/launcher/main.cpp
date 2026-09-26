@@ -39,6 +39,7 @@ struct Options {
     bool trace16 = false;
     bool stubMissing = false;
     bool exactTimers = false;
+    bool mute = false;
     uint32_t fpsCap = retro::kDefaultFpsCap;
     uint32_t diskCapMiB = retro::kDefaultDiskCapMiB;
     uint32_t memoryCapMiB = retro::kDefaultMemoryCapMiB;
@@ -62,6 +63,7 @@ void PrintUsage() {
         "                    return 0 instead of stopping the program (logged once each)\n"
         "  --exact-timers    16-bit programs: timers fire at the requested interval\n"
         "                    instead of Windows 3.x's 55 ms minimum\n"
+        "  --mute            16-bit programs: no sound\n"
         "  --no-shim         Launch without injecting RetroShim.dll (baseline)\n"
         "  --shim <path>     Shim DLL to inject (default: RetroShim.dll beside RetroLaunch)\n"
         "  --cwd <dir>       Working directory (default: the program's folder)\n"
@@ -123,6 +125,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             opt.stubMissing = true;
         } else if (a == L"--exact-timers") {
             opt.exactTimers = true;
+        } else if (a == L"--mute") {
+            opt.mute = true;
         } else if (a == L"--wait") {
             opt.wait = true;
         } else if (a == L"--no-shim") {
@@ -257,7 +261,7 @@ int wmain(int argc, wchar_t** argv) {
         return retro::RunWin16Program(
             exe, ToUtf8(opt.arguments),
             {opt.hidden, (opt.features & retro::ShimFeature_FrameLimiter) ? opt.fpsCap : 0, opt.trace16,
-             opt.stubMissing, opt.exactTimers});
+             opt.stubMissing, opt.exactTimers, opt.mute});
     case retro::LaunchPath::Unsupported:
     default:
         std::fprintf(stderr, "error: cannot launch: %s\n", reason.c_str());

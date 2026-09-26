@@ -51,6 +51,34 @@ uint32_t MakeLong(int16_t lo, int16_t hi) { return uint16_t(lo) | (uint32_t(uint
 
 int64_t MsToQpc(uint32_t ms) { return int64_t(ms) * QpcFrequency() / 1000; }
 
+WindowHost::WindowInfo InfoFor(const User::Window& w) {
+    WindowHost::WindowInfo info;
+    info.hwnd16 = w.hwnd;
+    info.title = w.title;
+    info.x = w.x;
+    info.y = w.y;
+    info.width = w.cx;
+    info.height = w.cy;
+    info.fullscreen = CoversScreen({w.x, w.y, w.x + w.cx, w.y + w.cy}, {kScreenWidth, kScreenHeight});
+    return info;
+}
+
+bool IsMouseMessage(uint16_t m) { return m >= wm::MouseMove && m <= wm::MButtonUp; }
+
+}  // namespace
+
+uint32_t ClassicSysColor(int index) {
+    // Windows 3.1 "Windows Default" scheme, COLOR_SCROLLBAR .. COLOR_BTNHIGHLIGHT.
+    static const uint32_t kColors[] = {
+        0xC0C0C0, 0xC0C0C0, 0x800000, 0xFFFFFF, 0xFFFFFF, 0xFFFFFF, 0x000000, 0x000000,
+        0x000000, 0xFFFFFF, 0xC0C0C0, 0xC0C0C0, 0xFFFFFF, 0x800000, 0xFFFFFF, 0xC0C0C0,
+        0x808080, 0x808080, 0x000000, 0x000000, 0xFFFFFF,
+    };
+    return index >= 0 && index < int(std::size(kColors)) ? kColors[index] : 0;
+}
+
+namespace {
+
 }  // namespace
 
 // --- HeadlessHost ----------------------------------------------------------------------------
@@ -72,6 +100,12 @@ void HeadlessHost::Present(uint64_t window, const uint32_t* pixels, int width, i
     lastFrame.height = height;
     lastFrame.pixels.assign(pixels, pixels + size_t(width) * height);
     ++presents;
+}
+
+void HeadlessHost::Update(uint64_t window, const WindowInfo& info) {
+    for (Record& r : windows) {
+        if (r.id == window) r.info = info;
+    }
 }
 
 void HeadlessHost::Destroy(uint64_t window) {
@@ -155,6 +189,7 @@ uint16_t User::RegisterWindowClass(uint16_t sel, uint16_t off) {
                                        : "window procedure is not in a code segment"));
         return 0;
     }
+    c.extra.assign(std::min<uint16_t>(c.clsExtra, 1024), 0);
     c.atom = nextAtom_++;
     classes_.push_back(c);
     return c.atom;
@@ -202,6 +237,8 @@ uint16_t User::Create(const CreateParams& p) {
     w.hInstance = p.hInstance ? p.hInstance : cls->hInstance;
     w.procSel = cls->procSel;
     w.procOff = cls->procOff;
+    w.extra.assign(std::min<uint16_t>(cls->wndExtra, 1024), 0);
+    w.enabled = !(p.style & ws::Disabled);
     const uint16_t hwnd = w.hwnd;
     windows_[hwnd] = w;
 
@@ -239,16 +276,7 @@ uint16_t User::Create(const CreateParams& p) {
     if (!win) return 0;  // destroyed while being created
 
     if (!(win->style & ws::Child)) {
-        WindowHost::WindowInfo info;
-        info.hwnd16 = hwnd;
-        info.title = win->title;
-        info.x = win->x;
-        info.y = win->y;
-        info.width = win->cx;
-        info.height = win->cy;
-        info.fullscreen = CoversScreen({win->x, win->y, win->x + win->cx, win->y + win->cy},
-                                       {kScreenWidth, kScreenHeight});
-        win->host = host_->Create(info);
+        win->host = host_->Create(InfoFor(*win));
         if (win->host) hostToHwnd_[win->host] = hwnd;
         rt_.Graphics().CreateSurface(hwnd, win->cx, win->cy);
     }
@@ -280,6 +308,9 @@ bool User::Destroy(uint16_t hwnd) {
         windows_.erase(hwnd);
     }
     rt_.Graphics().DestroySurface(hwnd);
+    if (focus_ == hwnd) focus_ = 0;
+    if (active_ == hwnd) active_ = 0;
+    if (capture_ == hwnd) SetCaptureTo(0);
     timers_.erase(std::remove_if(timers_.begin(), timers_.end(),
                                  [&](const Timer& t) { return t.hwnd == hwnd; }),
                   timers_.end());
@@ -298,6 +329,11 @@ bool User::Show(uint16_t hwnd, uint16_t cmdShow) {
         w->visible = show;
         if (w->host) host_->Show(w->host, show);
         Send(hwnd, wm::ShowWindow, show ? 1 : 0, 0);
+        // The task's first visible top-level window becomes the active one
+        // (WM_ACTIVATEAPP, WM_ACTIVATE, WM_SETFOCUS), as when Windows starts a program.
+        const Window* shown = Find(hwnd);
+        if (show && shown && shown->host && !active_) Activate(hwnd);
+        if (!show && active_ == hwnd) active_ = 0;
         if (show) Invalidate(hwnd, nullptr, true);  // newly visible: paint it all
     }
     return previous;
@@ -307,6 +343,7 @@ uint32_t User::Send(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lPara
     const Window* w = Find(hwnd);
     if (!w) return 0;
     if (!w->procSel) return DefProc(hwnd, msg, wParam, lParam);
+    if (rt_.HasExited()) return 0;  // the task has ended: no more calls into it
     // The window procedure runs on the interpreter; Pascal arguments
     // (hwnd, msg, wParam, lParam), DS = the window's instance data.
     return rt_.Processor().CallFar(w->procSel, w->procOff,
@@ -314,7 +351,8 @@ uint32_t User::Send(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lPara
                                    w->hInstance);
 }
 
-uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t) {
+uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParamFull) {
+    auto lParamLo = [](uint32_t l) { return uint16_t(l); };
     switch (msg) {
     case wm::NcCreate: return 1;
     case wm::Close: Destroy(hwnd); return 0;
@@ -323,6 +361,15 @@ uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t) {
         Runtime::Scratch ps(rt_, 32);
         BeginPaint(hwnd, ps.Selector(), ps.Offset());
         EndPaint(hwnd, ps.Selector(), ps.Offset());
+        return 0;
+    }
+    case 0x0020: {  // WM_SETCURSOR over the client area: the class cursor
+        const Window* w = Find(hwnd);
+        const WindowClass* c = w ? FindClass(w->className) : nullptr;
+        if ((lParamLo(lParamFull) == 1) && c && c->hCursor) {
+            SetCursorHandle(c->hCursor);
+            return 1;
+        }
         return 0;
     }
     case wm::EraseBkgnd: {  // fill with the class background brush
@@ -336,6 +383,7 @@ uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t) {
 }
 
 Rect16 User::ClientRect(uint16_t hwnd) const {
+    if (hwnd == kDesktopHwnd) return {0, 0, kScreenWidth, kScreenHeight};
     const Window* w = Find(hwnd);
     return w ? Rect16{0, 0, w->cx, w->cy} : Rect16{};
 }
@@ -430,9 +478,259 @@ bool User::Matches(const Msg16& m, uint16_t hwnd, uint16_t minMsg, uint16_t maxM
 bool User::PumpHost(int64_t until) {
     return host_->Pump(
         [this](uint16_t hwnd16, uint16_t message, uint16_t wParam, uint32_t lParam) {
-            if (Find(hwnd16)) Post(hwnd16, message, wParam, lParam);
+            if (!Find(hwnd16)) return;
+            TrackInput(hwnd16, message, wParam, lParam);
+            // Mouse input goes to the window that has captured it.
+            Post(capture_ && IsMouseMessage(message) ? capture_ : hwnd16, message, wParam, lParam);
         },
         until);
+}
+
+void User::TrackInput(uint16_t hwnd, uint16_t message, uint16_t wParam, uint32_t lParam) {
+    const uint8_t vk = uint8_t(wParam);
+    switch (message) {
+    case wm::KeyDown:
+    case wm::SysKeyDown:
+        if (!(keys_[vk] & 0x80)) keys_[vk] ^= 1;  // toggles on each press
+        keys_[vk] |= 0x80;
+        return;
+    case wm::KeyUp:
+    case wm::SysKeyUp:
+        keys_[vk] &= ~0x80;
+        return;
+    default:
+        break;
+    }
+    if (!IsMouseMessage(message)) return;
+    const Rect16 r = WindowRect(hwnd);
+    mouseX_ = int16_t(r.left + int16_t(lParam));
+    mouseY_ = int16_t(r.top + int16_t(lParam >> 16));
+    // VK_LBUTTON, VK_RBUTTON, VK_MBUTTON from the MK_ flags every mouse message carries.
+    keys_[1] = uint8_t((keys_[1] & 1) | ((wParam & 0x01) ? 0x80 : 0));
+    keys_[2] = uint8_t((keys_[2] & 1) | ((wParam & 0x02) ? 0x80 : 0));
+    keys_[4] = uint8_t((keys_[4] & 1) | ((wParam & 0x10) ? 0x80 : 0));
+}
+
+int16_t User::KeyState(uint8_t vk) const {
+    return int16_t(((keys_[vk] & 0x80) ? 0x8000 : 0) | (keys_[vk] & 1));
+}
+
+std::vector<uint16_t> User::Handles() const {
+    std::vector<uint16_t> handles;
+    for (const auto& [h, w] : windows_) handles.push_back(h);  // handles only grow
+    return handles;
+}
+
+User::WindowClass* User::EditClass(const std::string& name) {
+    for (WindowClass& c : classes_) {
+        if (c.name == name) return &c;
+    }
+    return nullptr;
+}
+
+Rect16 User::WindowRect(uint16_t hwnd) const {
+    if (hwnd == kDesktopHwnd) return {0, 0, kScreenWidth, kScreenHeight};
+    const Window* w = Find(hwnd);
+    if (!w) return {};
+    int16_t x = w->x, y = w->y;
+    for (const Window* p = Find(w->parent); p && (w->style & ws::Child); p = Find(p->parent)) {
+        x = int16_t(x + p->x);
+        y = int16_t(y + p->y);
+        if (!(p->style & ws::Child)) break;
+    }
+    return {x, y, int16_t(x + w->cx), int16_t(y + w->cy)};
+}
+
+bool User::Reposition(uint16_t hwnd, int16_t x, int16_t y, int16_t cx, int16_t cy, uint16_t flags) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return false;
+    if (flags & swp::HideWindow) Show(hwnd, 0);
+    if (!(w = FindMutable(hwnd))) return false;
+    const int16_t nx = (flags & swp::NoMove) ? w->x : x, ny = (flags & swp::NoMove) ? w->y : y;
+    const int16_t ncx = (flags & swp::NoSize) ? w->cx : std::max<int16_t>(cx, 0);
+    const int16_t ncy = (flags & swp::NoSize) ? w->cy : std::max<int16_t>(cy, 0);
+    const bool moved = nx != w->x || ny != w->y, sized = ncx != w->cx || ncy != w->cy;
+    w->x = nx;
+    w->y = ny;
+    w->cx = ncx;
+    w->cy = ncy;
+    if (sized && w->host) rt_.Graphics().ResizeSurface(hwnd, ncx, ncy);
+    if ((moved || sized) && w->host) host_->Update(w->host, InfoFor(*w));
+    if (sized) Send(hwnd, wm::Size, 0, MakeLong(ncx, ncy));
+    if (moved && Find(hwnd)) Send(hwnd, wm::Move, 0, MakeLong(nx, ny));
+    if (sized && !(flags & swp::NoRedraw) && Find(hwnd)) Invalidate(hwnd, nullptr, true);
+    if ((flags & swp::ShowWindow) && Find(hwnd)) Show(hwnd, 5 /* SW_SHOW */);
+    return Find(hwnd) != nullptr;
+}
+
+bool User::SetText(uint16_t hwnd, const std::string& text) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return false;
+    w->title = text;
+    if (w->host) host_->Update(w->host, InfoFor(*w));
+    return true;
+}
+
+bool User::Enable(uint16_t hwnd, bool enable) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return false;
+    const bool wasDisabled = !w->enabled;
+    if (w->enabled != enable) {
+        w->enabled = enable;
+        Send(hwnd, wm::Enable, enable ? 1 : 0, 0);
+    }
+    return wasDisabled;
+}
+
+uint16_t User::SetFocusTo(uint16_t hwnd) {
+    if (hwnd && !Find(hwnd)) return 0;
+    const uint16_t previous = focus_;
+    if (previous == hwnd) return previous;
+    focus_ = hwnd;
+    if (previous && Find(previous)) Send(previous, wm::KillFocus, hwnd, 0);
+    if (hwnd && Find(hwnd)) Send(hwnd, wm::SetFocus, previous, 0);
+    return previous;
+}
+
+uint16_t User::Activate(uint16_t hwnd) {
+    if (hwnd && !Find(hwnd)) return 0;
+    const uint16_t previous = active_;
+    if (previous == hwnd) return previous;
+    if (!previous && hwnd) Send(hwnd, wm::ActivateApp, 1, 0);  // the task comes to the front
+    active_ = hwnd;
+    if (previous && Find(previous)) Send(previous, wm::Activate, 0 /* WA_INACTIVE */, hwnd);
+    if (hwnd && Find(hwnd)) {
+        Send(hwnd, wm::Activate, 1 /* WA_ACTIVE */, previous);
+        // What DefWindowProc does with WM_ACTIVATE: focus the window, unless
+        // the window procedure already focused one of its children.
+        bool focusedInside = false;
+        for (const Window* f = Find(focus_); f; f = (f->style & ws::Child) ? Find(f->parent) : nullptr) {
+            if (f->hwnd == hwnd) focusedInside = true;
+        }
+        if (!focusedInside && Find(hwnd)) SetFocusTo(hwnd);
+    }
+    return previous;
+}
+
+uint16_t User::SetCaptureTo(uint16_t hwnd) {
+    const uint16_t previous = capture_;
+    if (hwnd && !Find(hwnd)) return previous;
+    auto topHost = [&](uint16_t h) {
+        const Window* w = Find(h);
+        while (w && (w->style & ws::Child)) w = Find(w->parent);
+        return w ? w->host : 0;
+    };
+    if (previous && previous != hwnd) {
+        if (const uint64_t host = topHost(previous)) host_->Capture(host, false);
+    }
+    capture_ = hwnd;
+    if (hwnd) {
+        if (const uint64_t host = topHost(hwnd)) host_->Capture(host, true);
+    }
+    return previous;
+}
+
+uint16_t User::CursorHandle(uint16_t shape) {
+    for (const auto& [h, s] : cursors_) {
+        if (s == shape) return h;
+    }
+    const uint16_t h = uint16_t(0x0E10 + 2 * cursors_.size());
+    cursors_[h] = shape;
+    return h;
+}
+
+uint16_t User::SetCursorHandle(uint16_t handle) {
+    const uint16_t previous = cursor_;
+    cursor_ = handle;
+    cursorSet_ = true;
+    ApplyCursor();
+    return previous;
+}
+
+int User::ShowCursorCount(bool show) {
+    cursorCount_ += show ? 1 : -1;
+    ApplyCursor();
+    return cursorCount_;
+}
+
+void User::ApplyCursor() {
+    uint16_t shape = kArrowCursor;
+    if (cursorCount_ < 0 || (cursorSet_ && cursor_ == 0)) {
+        shape = 0;  // hidden: SetCursor(NULL), or ShowCursor(FALSE) more than TRUE
+    } else if (const auto it = cursors_.find(cursor_); it != cursors_.end()) {
+        shape = it->second;
+    }
+    host_->SetCursorShape(shape);
+}
+
+uint16_t User::ShowMessageBox(uint16_t owner, const std::string& caption, const std::string& text,
+                              uint16_t type) {
+    const Window* w = Find(owner ? owner : active_);
+    while (w && (w->style & ws::Child)) w = Find(w->parent);
+    const int pressed = host_->ShowMessage(w ? w->host : 0, caption, text, type);
+    if (pressed > 0) return uint16_t(pressed);
+    // No real box: the default button (MB_DEFBUTTONn) of the MB_xxx button set.
+    static const std::vector<uint16_t> kButtons[] = {
+        {1}, {1, 2}, {3, 4, 5}, {6, 7, 2}, {6, 7}, {4, 2},  // OK, OKCANCEL, ARI, YNC, YN, RC
+    };
+    const std::vector<uint16_t>& set = kButtons[std::min<size_t>(type & 0x0F, 5)];
+    return set[std::min<size_t>((type >> 8) & 0x0F, set.size() - 1)];
+}
+
+uint16_t User::StartMultimediaTimer(uint16_t delayMs, uint16_t procSel, uint16_t procOff, uint32_t user,
+                                    bool periodic) {
+    const Descriptor* d = rt_.Mem().Lookup(procSel);
+    if (!d || d->kind != SegmentKind::Code) return 0;
+    uint16_t id = 0;
+    do {
+        id = nextMmTimerId_++;
+    } while (id == 0 || std::any_of(timers_.begin(), timers_.end(),
+                                    [&](const Timer& t) { return t.multimedia && t.id == id; }));
+    Timer t;
+    t.id = id;
+    t.procSel = procSel;
+    t.procOff = procOff;
+    t.intervalMs = std::max<uint32_t>(delayMs, 1);
+    t.due = QpcNow() + MsToQpc(t.intervalMs);
+    t.multimedia = true;
+    t.periodic = periodic;
+    t.user = user;
+    timers_.push_back(t);
+    return id;
+}
+
+bool User::StopMultimediaTimer(uint16_t id) {
+    const auto it = std::find_if(timers_.begin(), timers_.end(),
+                                 [&](const Timer& t) { return t.multimedia && t.id == id; });
+    if (it == timers_.end()) return false;
+    timers_.erase(it);
+    return true;
+}
+
+bool User::RunMultimediaTimers(int64_t now) {
+    std::vector<uint16_t> due;
+    for (const Timer& t : timers_) {
+        if (t.multimedia && t.due <= now) due.push_back(t.id);
+    }
+    for (uint16_t id : due) {
+        const auto it = std::find_if(timers_.begin(), timers_.end(),
+                                     [&](const Timer& t) { return t.multimedia && t.id == id; });
+        if (it == timers_.end()) continue;  // killed by an earlier callback
+        const Timer t = *it;
+        if (t.periodic) {
+            const int64_t period = MsToQpc(t.intervalMs);
+            it->due += period;
+            if (it->due <= now) it->due = now + period;
+        } else {
+            timers_.erase(it);
+        }
+        // void CALLBACK TimeProc(UINT id, UINT msg, DWORD dwUser, DWORD dw1, DWORD dw2)
+        rt_.Processor().CallFar(t.procSel, t.procOff,
+                                {t.id, 0, uint16_t(t.user >> 16), uint16_t(t.user), 0, 0, 0, 0},
+                                rt_.Module().dgroup);
+        if (rt_.HasExited()) return true;
+    }
+    return false;
 }
 
 uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_t procSel,
@@ -447,7 +745,7 @@ uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_
     }
     auto find = [&](uint16_t h, uint16_t i) {
         return std::find_if(timers_.begin(), timers_.end(),
-                            [&](const Timer& t) { return t.hwnd == h && t.id == i; });
+                            [&](const Timer& t) { return !t.multimedia && t.hwnd == h && t.id == i; });
     };
     if (!hwnd) {  // the id argument is ignored: every such timer gets a new one
         do {
@@ -455,7 +753,13 @@ uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_
         } while (id == 0 || find(0, id) != timers_.end());
     }
     const uint32_t interval = std::max<uint32_t>(elapseMs, minTimerMs_);
-    const Timer t{hwnd, id, procSel, procOff, interval, QpcNow() + MsToQpc(interval)};
+    Timer t;
+    t.hwnd = hwnd;
+    t.id = id;
+    t.procSel = procSel;
+    t.procOff = procOff;
+    t.intervalMs = interval;
+    t.due = QpcNow() + MsToQpc(interval);
     if (const auto it = find(hwnd, id); it != timers_.end()) {
         *it = t;
     } else {
@@ -466,7 +770,7 @@ uint16_t User::StartTimer(uint16_t hwnd, uint16_t id, uint16_t elapseMs, uint16_
 
 bool User::StopTimer(uint16_t hwnd, uint16_t id) {
     const auto it = std::find_if(timers_.begin(), timers_.end(),
-                                 [&](const Timer& t) { return t.hwnd == hwnd && t.id == id; });
+                                 [&](const Timer& t) { return !t.multimedia && t.hwnd == hwnd && t.id == id; });
     if (it == timers_.end()) return false;
     timers_.erase(it);
     return true;
@@ -474,14 +778,14 @@ bool User::StopTimer(uint16_t hwnd, uint16_t id) {
 
 bool User::IsTimerProc(uint16_t sel, uint16_t off) const {
     return (sel || off) && std::any_of(timers_.begin(), timers_.end(), [&](const Timer& t) {
-               return t.procSel == sel && t.procOff == off;
+               return !t.multimedia && t.procSel == sel && t.procOff == off;
            });
 }
 
 User::Timer* User::DueTimer(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg, int64_t now) {
     Timer* due = nullptr;
     for (Timer& t : timers_) {
-        if (t.due <= now && Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg) &&
+        if (!t.multimedia && t.due <= now && Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg) &&
             (!due || t.due < due->due))
             due = &t;
     }
@@ -491,7 +795,8 @@ User::Timer* User::DueTimer(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg, int
 int64_t User::NextTimerDue(uint16_t hwnd, uint16_t minMsg, uint16_t maxMsg) const {
     int64_t next = WindowHost::kForever;
     for (const Timer& t : timers_) {
-        if (Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg)) next = std::min(next, t.due);
+        // Multimedia timers wake the pump whatever the filter: their callbacks run there.
+        if (t.multimedia || Matches(Msg16{t.hwnd, wm::Timer}, hwnd, minMsg, maxMsg)) next = std::min(next, t.due);
     }
     return next;
 }
@@ -503,10 +808,17 @@ User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_
     rt_.Graphics().PresentPending();
     for (;;) {
         PumpHost(WindowHost::kPoll);
+        if (RunMultimediaTimers(QpcNow())) return Fetch::Empty;  // a callback ended the task
         for (auto it = queue_.begin(); it != queue_.end(); ++it) {
             if (Matches(*it, hwndFilter, minMsg, maxMsg)) {
                 out = *it;
-                if (remove) queue_.erase(it);
+                if (remove) {
+                    queue_.erase(it);
+                    // Before a mouse message is processed, the window gets to set
+                    // the cursor (WM_SETCURSOR, HTCLIENT); DefWindowProc uses the class cursor.
+                    if (IsMouseMessage(out.message) && out.hwnd && Find(out.hwnd))
+                        Send(out.hwnd, 0x0020, out.hwnd, MakeLong(1, int16_t(out.message)));
+                }
                 return Fetch::Message;
             }
         }
@@ -549,13 +861,14 @@ User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_
 
 namespace {
 
-void MessageBox(Runtime& rt, Cpu& cpu) {
-    // (hwnd, text, caption, type)
-    const FarPtr caption = ArgPtr(cpu, 2), text = ArgPtr(cpu, 6);
-    rt.Print("MessageBox [" + rt.Mem().ReadString(caption.sel, caption.off) +
-             "]: " + rt.Mem().ReadString(text.sel, text.off));
-    cpu.Regs().r[AX] = 1;  // IDOK
-    cpu.ReturnFar(12);
+void MessageBox(Runtime& rt, Cpu& cpu) {  // (hwnd, text, caption, type) -> button
+    const PascalArgs a(cpu, {2, 4, 4, 2});
+    const FarPtr text = a.Ptr(1), caption = a.Ptr(2);
+    const std::string c = caption.IsNull() ? "Error" : rt.Mem().ReadString(caption.sel, caption.off);
+    const std::string t = text.IsNull() ? "" : rt.Mem().ReadString(text.sel, text.off);
+    rt.Print("MessageBox [" + c + "]: " + t);
+    cpu.Regs().r[AX] = rt.Windows().ShowMessageBox(a.Word(0), c, t, a.Word(3));
+    cpu.ReturnFar(a.Bytes());
 }
 
 void InitApp(Runtime&, Cpu& cpu) {
@@ -797,7 +1110,7 @@ void EndPaint(Runtime& rt, Cpu& cpu) {  // (HWND, const PAINTSTRUCT FAR*)
 
 void GetDC(Runtime& rt, Cpu& cpu) {  // (HWND) -> HDC
     const PascalArgs a(cpu, {2});
-    const uint16_t hwnd = a.Word(0);
+    const uint16_t hwnd = a.Word(0) == kDesktopHwnd ? 0 : a.Word(0);
     cpu.Regs().r[AX] = hwnd && !rt.Windows().Find(hwnd) ? 0 : rt.Graphics().GetWindowDc(hwnd);
     cpu.ReturnFar(a.Bytes());
 }
@@ -830,9 +1143,17 @@ void ValidateRect(Runtime& rt, Cpu& cpu) {  // (HWND, const RECT FAR* or NULL)
     cpu.ReturnFar(a.Bytes());
 }
 
-void LoadCursor(Runtime&, Cpu& cpu) {
-    cpu.Regs().r[AX] = 0x0F10;  // placeholder handle (no resources yet)
-    cpu.ReturnFar(6);
+void LoadCursor(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name) -> HCURSOR
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr name = a.Ptr(1);
+    uint16_t shape = kArrowCursor;
+    if (a.Word(0) == 0 && name.sel == 0) {
+        shape = name.off;  // IDC_xxx
+    } else {
+        rt.Note("cursor-resource", "cursors from a program's resources show as the arrow for now");
+    }
+    cpu.Regs().r[AX] = rt.Windows().CursorHandle(shape);
+    cpu.ReturnFar(a.Bytes());
 }
 
 void LoadIcon(Runtime&, Cpu& cpu) {
@@ -860,7 +1181,7 @@ void GetSystemMetrics(Runtime&, Cpu& cpu) {
 }  // namespace
 
 std::vector<ApiFunction> UserApi() {
-    return {
+    std::vector<ApiFunction> api = {
         {1, "MESSAGEBOX", MessageBox},
         {5, "INITAPP", InitApp},
         {6, "POSTQUITMESSAGE", PostQuitMessage},
@@ -894,6 +1215,9 @@ std::vector<ApiFunction> UserApi() {
         {179, "GETSYSTEMMETRICS", GetSystemMetrics},
         {452, "CREATEWINDOWEX", CreateWindowEx},
     };
+    for (auto part : {UserWindowApi(), MenuApi(), UserDrawApi(), UserSoundApi()})
+        api.insert(api.end(), part.begin(), part.end());
+    return api;
 }
 
 }  // namespace retro::win16

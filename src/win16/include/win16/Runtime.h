@@ -38,6 +38,7 @@
 #include "win16/Gdi.h"
 #include "win16/Kernel.h"
 #include "win16/LocalHeap.h"
+#include "win16/Menus.h"
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
 #include "win16/NeLoader.h"
@@ -87,6 +88,8 @@ public:
     // The program's .exe on the host: its directory is what the task's file
     // APIs see (call before Load).
     void SetProgram(const std::filesystem::path& exe) { files_.SetProgram(exe); }
+    // No sound output (beeps and sounds are still counted).
+    void SetMute(bool mute) { mute_ = mute; }
 
     // The Windows flags reported by GetWinFlags / __WINFLAGS: protected mode,
     // 286, standard mode, no coprocessor (the interpreter is a 286 without x87).
@@ -104,7 +107,12 @@ public:
     LocalHeaps& Locals() { return locals_; }
     FileSystem& Files() { return files_; }
     Profiles& Profile() { return profiles_; }
+    Menus& MenuTable() { return menus_; }
     uint16_t Environment() const { return envSel_; }
+    bool Muted() const { return mute_; }
+    void CountSound() { ++sounds_; }
+    uint32_t SoundsPlayed() const { return sounds_; }
+    std::vector<uint8_t>& PlayingSound() { return playingSound_; }  // sndPlaySound's buffer
     uint16_t ModuleHandle() const { return moduleDb_; }  // the program's hModule
     User& Windows() { return *user_; }
     Gdi& Graphics() { return *gdi_; }
@@ -147,6 +155,7 @@ public:
         std::string name;
         std::vector<ApiFunction> functions;  // empty: a stub module
         const CatalogModule* catalog = nullptr;
+        bool silent = false;  // every call returns 0 (SOUND.DRV: PC-speaker music)
         uint16_t selector = 0;
         std::vector<std::string> unknownNames;  // by-name imports we don't know
     };
@@ -178,6 +187,7 @@ private:
     Cpu cpu_;
     GlobalHeap globals_;
     LocalHeaps locals_{memory_};
+    Menus menus_;
     FileSystem files_;
     Profiles profiles_{files_};
     NeImage image_;
@@ -195,6 +205,9 @@ private:
     uint16_t moduleDb_ = 0;  // hModule: a copy of the NE header, like Windows'
     bool trace_ = false;
     bool stubMissing_ = false;
+    bool mute_ = false;
+    uint32_t sounds_ = 0;
+    std::vector<uint8_t> playingSound_;
     std::vector<TraceFrame> traceStack_;
     std::set<std::string> notes_;
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();

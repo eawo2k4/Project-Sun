@@ -379,20 +379,22 @@ struct Emit {
     }
     void Imm(uint16_t v) { a.db({0x68}).dw(v); }                     // push imm16
     void Long(uint32_t v) { Imm(uint16_t(v >> 16)); Imm(uint16_t(v)); }  // push a DWORD (hi, lo)
-    void Mem(uint8_t off) { a.db({0xFF, 0x36, off, 0x00}); }         // push word [off]
+    void Mem(uint16_t off) { a.db({0xFF, 0x36}).dw(off); }           // push word [off]
     void Arg(uint8_t bpOff) { a.db({0xFF, 0x76, bpOff}); }           // push word [bp+off]
-    void Far(uint8_t off) { a.db({0x1E}); Imm(off); }                // push ds / push off
-    void StoreAx(uint8_t off) { a.db({0xA3, off, 0x00}); }           // mov [off], ax
-    void Set(uint8_t off, uint16_t v) { a.db({0xC7, 0x06, off, 0x00}).dw(v); }  // mov word [off], v
+    void Far(uint16_t off) { a.db({0x1E}); Imm(off); }               // push ds / push off
+    void StoreAx(uint16_t off) { a.db({0xA3}).dw(off); }             // mov [off], ax
+    void Set(uint16_t off, uint16_t v) { a.db({0xC7, 0x06}).dw(off).dw(v); }  // mov word [off], v
+    void CmpAx(uint16_t v) { a.db({0x3D}).dw(v); }                   // cmp ax, v
+    void CmpMem(uint16_t off, uint16_t v) { a.db({0x81, 0x3E}).dw(off).dw(v); }  // cmp word [off], v
 
     // Registers a class (lpfnWndProc = CS:<wndProc label>) with a stock background brush.
     void RegisterClass(uint8_t wndClass, uint8_t className, uint8_t hinst, const std::string& wndProc,
-                       uint16_t stockBrush) {
+                       uint16_t stockBrush, uint16_t wndExtra = 0) {
         Set(wndClass, 0);
         a.db({0xC7, 0x06, wndClass + 2, 0x00}).Abs16(wndProc);
         a.db({0x8C, 0x0E, wndClass + 4, 0x00});                    // selector = CS
         Set(uint8_t(wndClass + 6), 0);
-        Set(uint8_t(wndClass + 8), 0);
+        Set(uint8_t(wndClass + 8), wndExtra);
         a.db({0xA1, hinst, 0x00});
         StoreAx(uint8_t(wndClass + 10));
         Set(uint8_t(wndClass + 12), 0);
@@ -1095,7 +1097,7 @@ inline NeProgram MissingModuleProgram(const std::string& module = "SHELL", uint1
 //       initial heap, fixed blocks          7 GlobalReAlloc to 40000 bytes
 //   8 lstrcpy/lstrcat/lstrlen   9-10 private profile reads, a write read back
 //   11 _lopen/_lread/_llseek   12 files outside the directory / for writing
-//   13 INT 21h open/read/close  14 GetModuleHandle/GetProcAddress
+//   13 INT 21h open/read/close  14 GetModuleHandle/GetProcAddress (WINHELP: missing)
 //   15 GetModuleFileName, GetDOSEnvironment   16 LoadLibrary
 // It imports SHELL.ShellAbout but never calls it.
 inline NeProgram CrtProgram() {
@@ -1120,7 +1122,7 @@ inline NeProgram CrtProgram() {
     put(kSecret, "..\\SECRET.TXT");
     put(kUserName, "USER");
     put(kGetMessage, "GETMESSAGE");
-    put(kDialogBox, "DIALOGBOX");
+    put(kDialogBox, "WINHELP");
     put(kMmsystem, "MMSYSTEM.DLL");
     put(kNoSuch, "NOSUCH.DLL");
     put(kAbc, "abc");
@@ -1302,7 +1304,7 @@ inline NeProgram CrtProgram() {
     a.db({0xB4, 0x3E, 0xCD, 0x21});  // close BX
     FailUnless(a, 0x73, 13);
 
-    // 14. GetModuleHandle("USER"); GetProcAddress: GETMESSAGE yes, DIALOGBOX (not implemented) no
+    // 14. GetModuleHandle("USER"); GetProcAddress: GETMESSAGE yes, WINHELP (not implemented) no
     e.Far(kUserName);
     e.Call(Emit::KERNEL, 47);
     a.db({0x85, 0xC0});
@@ -1345,6 +1347,393 @@ inline NeProgram CrtProgram() {
 
     code.bytes = a.Finish();
     p.segments = {code, DataSegment(data, 0x100)};
+    return p;
+}
+
+// Menu template (RT_MENU): "&Game" popup {"&New\tF2" 100, "E&xit" 101}, "&Help" 200.
+inline std::vector<uint8_t> GameMenuTemplate() {
+    std::vector<uint8_t> d = {0, 0, 0, 0};  // version 0, no extra header
+    auto item = [&](uint16_t flags, int id, const std::string& text) {
+        d.push_back(uint8_t(flags));
+        d.push_back(uint8_t(flags >> 8));
+        if (id >= 0) {
+            d.push_back(uint8_t(id));
+            d.push_back(uint8_t(id >> 8));
+        }
+        d.insert(d.end(), text.begin(), text.end());
+        d.push_back(0);
+    };
+    item(0x0010, -1, "&Game");          // MF_POPUP
+    item(0x0000, 100, "&New\tF2");
+    item(0x0080, 101, "E&xit");         // MF_END: last in the popup
+    item(0x0080, 200, "&Help");         // MF_END: last at the top
+    return d;
+}
+
+// USER breadth, GDI drawing and sound, in a 64x48 window that becomes
+// fullscreen. Exit 0, or the failed check:
+//   1 window words (cbWndExtra 4)   2 GetWindowRect, ClientToScreen
+//   3 MoveWindow to 640x480: WM_SIZE, GetClientRect   4 activation and focus
+//   5 SetWindowText / GetWindowTextLength   6-7 menus from RT_MENU
+//   8 wsprintf   9 CreateFont, GetTextMetrics, GetTextExtent, DrawText(DT_CALCRECT)
+//   10 GetDeviceCaps   11 GetObject(bitmap)   12 Ellipse, MoveTo/LineTo
+//   13 StretchDIBits (a 2x2 DIB, 4x)   14 GetSysColor   15 rectangles
+//   16 cursor and capture   17 MessageBox default button, DialogBox
+//   18 sound: SOUND.DRV silent, no wave devices, missing WAV
+//   19 timeSetEvent callbacks -> WM_USER -> a posted F2 -> TranslateAccelerator
+//      -> WM_COMMAND 100 -> quit   20 the timer callback's dwUser
+inline NeProgram UiProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI", "MMSYSTEM", "SOUND"};
+    std::vector<uint8_t> dib(40 + 16, 0);  // 2x2, 24-bit, bottom-up
+    dib[0] = 40;
+    dib[4] = 2;
+    dib[8] = 2;
+    dib[12] = 1;
+    dib[14] = 24;
+    const uint8_t bits[16] = {0, 255, 0, 255, 0, 0, 0, 0,          // bottom row: green, blue (BGR)
+                              0, 0, 255, 255, 255, 255, 0, 0};     // top row: red, white
+    std::copy(std::begin(bits), std::end(bits), dib.begin() + 40);
+    p.resources = {
+        {4, "", 1, "", GameMenuTemplate()},
+        {9, "", 1, "", {0x81, 0x71, 0x00, 100, 0x00}},  // VK_F2 -> 100 (FVIRTKEY, last)
+        {5, "", 0, "ABOUT", std::vector<uint8_t>(16, 0)},
+    };
+    constexpr uint16_t kHinst = 0x00, kHwnd = 0x02, kMenu = 0x04, kAccel = 0x06, kHdc = 0x08, kFont = 0x0A,
+                       kBrush = 0x0C, kBmp = 0x0E, kTicks = 0x12, kSizeLo = 0x14, kSizeHi = 0x16,
+                       kActivated = 0x18, kCommand = 0x1A, kUserSeen = 0x1C, kBadUser = 0x1E,
+                       kClass = 0x20, kTitle = 0x28, kRenamed = 0x2C, kNoWav = 0x34, kAbout = 0x40,
+                       kQuit = 0x48, kHi = 0x50, kFace = 0x54, kWndClass = 0x60, kPoint = 0x7C, kMsg = 0x80,
+                       kRect = 0x94, kTm = 0xA0, kObj = 0xC0, kFmt = 0xD0, kOk = 0xE4, kExpected = 0xE8,
+                       kBuf = 0x100, kDib = 0x140;
+    std::vector<uint8_t> data(0x180, 0);
+    auto put = [&](uint16_t at, const std::string& s) { std::copy(s.begin(), s.end(), data.begin() + at); };
+    put(kClass, "UiWin");
+    put(kTitle, "UI");
+    put(kRenamed, "Renamed");
+    put(kNoWav, "NOSUCH.WAV");
+    put(kAbout, "ABOUT");
+    put(kQuit, "Quit?");
+    put(kHi, "Hi");
+    put(kFace, "Courier New");
+    put(kFmt, "%d-%04x-%s-%c-%ld");
+    put(kOk, "ok");
+    put(kExpected, "-5-00ab-ok-Z-70000");
+    std::copy(dib.begin(), dib.end(), data.begin() + kDib);
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    constexpr uint16_t MMSYSTEM = 4, SOUND = 5;
+    auto ok = [&](int fail) { a.db({0x85, 0xC0}); FailUnless(a, JNZ, fail); };  // AX != 0
+    auto eq = [&](uint16_t v, int fail) { e.CmpAx(v); FailUnless(a, JZ, fail); };
+
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    e.RegisterClass(kWndClass, kClass, kHinst, "WndProc", 4 /* BLACK_BRUSH */, 4);
+    e.CreatePopup(kClass, kTitle, 10, 20, 64, 48, kHinst);
+    ok(1);
+    e.StoreAx(kHwnd);
+
+    // 1. SetWindowWord(hwnd, 0, 1234h) = 0; GetWindowWord = 1234h; GetWindowLong(0) = 00001234h
+    e.Mem(kHwnd); e.Imm(0); e.Imm(0x1234);
+    e.Call(Emit::USER, 134);
+    eq(0, 1);
+    e.Mem(kHwnd); e.Imm(0);
+    e.Call(Emit::USER, 133);
+    eq(0x1234, 1);
+    e.Mem(kHwnd); e.Imm(0);
+    e.Call(Emit::USER, 135);
+    eq(0x1234, 1);
+    a.db({0x85, 0xD2});
+    FailUnless(a, JZ, 1);
+    // 2. GetWindowRect = (10, 20, 74, 68); ClientToScreen(5, 5) = (15, 25)
+    e.Mem(kHwnd); e.Far(kRect);
+    e.Call(Emit::USER, 32);
+    e.CmpMem(kRect, 10); FailUnless(a, JZ, 2);
+    e.CmpMem(kRect + 6, 68); FailUnless(a, JZ, 2);
+    e.Set(kPoint, 5); e.Set(kPoint + 2, 5);
+    e.Mem(kHwnd); e.Far(kPoint);
+    e.Call(Emit::USER, 28);
+    e.CmpMem(kPoint, 15); FailUnless(a, JZ, 2);
+    e.CmpMem(kPoint + 2, 25); FailUnless(a, JZ, 2);
+    // 3. MoveWindow(hwnd, 0, 0, 640, 480, TRUE): WM_SIZE 640x480, GetClientRect
+    e.Mem(kHwnd); e.Imm(0); e.Imm(0); e.Imm(640); e.Imm(480); e.Imm(1);
+    e.Call(Emit::USER, 56);
+    ok(3);
+    e.CmpMem(kSizeLo, 640); FailUnless(a, JZ, 3);
+    e.CmpMem(kSizeHi, 480); FailUnless(a, JZ, 3);
+    e.Mem(kHwnd); e.Far(kRect);
+    e.Call(Emit::USER, 33);
+    e.CmpMem(kRect + 4, 640); FailUnless(a, JZ, 3);
+    // 4. Shown at creation: WM_ACTIVATEAPP seen, active and focused
+    e.CmpMem(kActivated, 1); FailUnless(a, JZ, 4);
+    e.Call(Emit::USER, 60);  // GetActiveWindow
+    a.db({0x3B, 0x06}).dw(kHwnd); FailUnless(a, JZ, 4);
+    e.Call(Emit::USER, 23);  // GetFocus
+    a.db({0x3B, 0x06}).dw(kHwnd); FailUnless(a, JZ, 4);
+    // 5. SetWindowText("Renamed"); GetWindowTextLength = 7
+    e.Mem(kHwnd); e.Far(kRenamed);
+    e.Call(Emit::USER, 37);
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 38);
+    eq(7, 5);
+    // 6. LoadMenu(#1), SetMenu, GetMenu; 2 items, a popup first
+    e.Mem(kHinst); e.Long(1);
+    e.Call(Emit::USER, 150);
+    ok(6);
+    e.StoreAx(kMenu);
+    e.Mem(kHwnd); e.Mem(kMenu);
+    e.Call(Emit::USER, 158);
+    ok(6);
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 157);
+    a.db({0x3B, 0x06}).dw(kMenu); FailUnless(a, JZ, 6);
+    e.Mem(kMenu);
+    e.Call(Emit::USER, 263);  // GetMenuItemCount
+    eq(2, 6);
+    e.Mem(kMenu); e.Imm(0);
+    e.Call(Emit::USER, 159);  // GetSubMenu
+    ok(6);
+    // 7. CheckMenuItem(101, MF_CHECKED) = 0 then GetMenuState has MF_CHECKED; EnableMenuItem(200, MF_GRAYED) = 0
+    e.Mem(kMenu); e.Imm(101); e.Imm(0x0008);
+    e.Call(Emit::USER, 154);
+    eq(0, 7);
+    e.Mem(kMenu); e.Imm(101); e.Imm(0);
+    e.Call(Emit::USER, 250);
+    eq(0x0008, 7);
+    e.Mem(kMenu); e.Imm(200); e.Imm(0x0001);
+    e.Call(Emit::USER, 155);
+    eq(0, 7);
+
+    // 8. wsprintf(buf, "%d-%04x-%s-%c-%ld", -5, 0xAB, "ok", 'Z', 70000L) = "-5-00ab-ok-Z-70000"
+    e.Long(70000); e.Imm('Z'); e.Far(kOk); e.Imm(0xAB); e.Imm(uint16_t(-5)); e.Far(kFmt); e.Far(kBuf);
+    e.Call(Emit::USER, 420);
+    a.db({0x83, 0xC4, 22});  // add sp, 22: C convention, the caller removes the arguments
+    eq(18, 8);
+    a.db({0x1E, 0x07, 0xBE}).dw(kBuf).db({0xBF}).dw(kExpected).db({0xB9, 19, 0, 0xFC, 0xF3, 0xA6});
+    FailUnless(a, JZ, 8);  // push ds / pop es / mov si / mov di / mov cx, 19 / cld / repe cmpsb
+
+    // Drawing, through a window DC.
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);
+    e.StoreAx(kHdc);
+    // 9. CreateFont(-16, ..., "Courier New"); GetTextMetrics; GetTextExtent("Hi"); DrawText(DT_CALCRECT)
+    e.Imm(uint16_t(-16));
+    for (int i = 0; i < 3; ++i) e.Imm(0);
+    e.Imm(400);
+    for (int i = 0; i < 8; ++i) e.Imm(0);
+    e.Far(kFace);
+    e.Call(Emit::GDI, 56);
+    ok(9);
+    e.StoreAx(kFont);
+    e.Mem(kHdc); e.Mem(kFont);
+    e.Call(Emit::GDI, 45);
+    e.Mem(kHdc); e.Far(kTm);
+    e.Call(Emit::GDI, 93);
+    ok(9);
+    e.CmpMem(kTm, 0); FailUnless(a, 0x7F /* JG */, 9);  // tmHeight > 0
+    e.Mem(kHdc); e.Far(kHi); e.Imm(2);
+    e.Call(Emit::GDI, 91);
+    ok(9);   // cx
+    a.db({0x85, 0xD2}); FailUnless(a, JNZ, 9);  // cy
+    e.Set(kRect, 0); e.Set(kRect + 2, 0); e.Set(kRect + 4, 0); e.Set(kRect + 6, 0);
+    e.Mem(kHdc); e.Far(kHi); e.Imm(0xFFFF); e.Far(kRect); e.Imm(0x0400);
+    e.Call(Emit::USER, 85);
+    ok(9);
+    e.CmpMem(kRect + 4, 0); FailUnless(a, JNZ, 9);  // right grew
+    // 10. GetDeviceCaps: HORZRES 640, BITSPIXEL 24
+    e.Mem(kHdc); e.Imm(8);
+    e.Call(Emit::GDI, 80);
+    eq(640, 10);
+    e.Mem(kHdc); e.Imm(12);
+    e.Call(Emit::GDI, 80);
+    eq(24, 10);
+    // 11. GetObject(CreateCompatibleBitmap(hdc, 8, 4)): 14 bytes, 8 x 4
+    e.Mem(kHdc); e.Imm(8); e.Imm(4);
+    e.Call(Emit::GDI, 51);
+    ok(11);
+    e.StoreAx(kBmp);
+    e.Mem(kBmp); e.Imm(14); e.Far(kObj);
+    e.Call(Emit::GDI, 82);
+    eq(14, 11);
+    e.CmpMem(kObj + 2, 8); FailUnless(a, JZ, 11);
+    e.CmpMem(kObj + 4, 4); FailUnless(a, JZ, 11);
+    e.Mem(kBmp);
+    e.Call(Emit::GDI, 69);
+    // 12. Ellipse with a red brush; a white line with MoveTo/LineTo
+    e.Long(RGB16(255, 0, 0));
+    e.Call(Emit::GDI, 66);
+    e.StoreAx(kBrush);
+    e.Mem(kHdc); e.Mem(kBrush);
+    e.Call(Emit::GDI, 45);
+    e.Mem(kHdc); e.Imm(200); e.Imm(200); e.Imm(240); e.Imm(240);
+    e.Call(Emit::GDI, 24);
+    ok(12);
+    e.Imm(6);               // WHITE_PEN
+    e.Call(Emit::GDI, 87);
+    e.StoreAx(kBmp);
+    e.Mem(kHdc); e.Mem(kBmp);
+    e.Call(Emit::GDI, 45);
+    e.Mem(kHdc); e.Imm(300); e.Imm(10);
+    e.Call(Emit::GDI, 20);  // MoveTo
+    e.Mem(kHdc); e.Imm(340); e.Imm(10);
+    e.Call(Emit::GDI, 19);  // LineTo
+    ok(12);
+    e.CheckPixel(uint8_t(kHdc), 220, 220, RGB16(255, 0, 0), 12);
+    e.CheckPixel(uint8_t(kHdc), 320, 10, RGB16(255, 255, 255), 12);
+    // 13. StretchDIBits: the 2x2 DIB at (100,100), 8x8
+    e.Mem(kHdc); e.Imm(100); e.Imm(100); e.Imm(8); e.Imm(8); e.Imm(0); e.Imm(0); e.Imm(2); e.Imm(2);
+    e.Far(kDib + 40); e.Far(kDib); e.Imm(0); e.Long(kSrcCopy);
+    e.Call(Emit::GDI, 439);
+    eq(2, 13);
+    e.CheckPixel(uint8_t(kHdc), 101, 101, RGB16(255, 0, 0), 13);
+    e.CheckPixel(uint8_t(kHdc), 105, 101, RGB16(255, 255, 255), 13);
+    e.CheckPixel(uint8_t(kHdc), 101, 105, RGB16(0, 255, 0), 13);
+    e.CheckPixel(uint8_t(kHdc), 105, 105, RGB16(0, 0, 255), 13);
+    e.Mem(kHwnd); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);  // ReleaseDC
+    // 14. GetSysColor(COLOR_BTNFACE) = C0C0C0h (Windows 3.1)
+    e.Imm(15);
+    e.Call(Emit::USER, 180);
+    eq(0xC0C0, 14);
+    a.db({0x81, 0xFA}).dw(0x00C0); FailUnless(a, JZ, 14);
+    // 15. SetRect(1,2,3,4), InflateRect(1,1) -> (0,1,4,5); PtInRect((3,4)) = TRUE
+    e.Far(kRect); e.Imm(1); e.Imm(2); e.Imm(3); e.Imm(4);
+    e.Call(Emit::USER, 72);
+    e.Far(kRect); e.Imm(1); e.Imm(1);
+    e.Call(Emit::USER, 78);
+    e.CmpMem(kRect, 0); FailUnless(a, JZ, 15);
+    e.CmpMem(kRect + 6, 5); FailUnless(a, JZ, 15);
+    e.Far(kRect); e.Long(0x00040003);
+    e.Call(Emit::USER, 76);
+    ok(15);
+    // 16. ShowCursor(FALSE) = -1, (TRUE) = 0; SetCursor(IDC_WAIT); SetCapture / GetCapture / ReleaseCapture
+    e.Imm(0);
+    e.Call(Emit::USER, 71);
+    eq(0xFFFF, 16);
+    e.Imm(1);
+    e.Call(Emit::USER, 71);
+    eq(0, 16);
+    e.Imm(0); e.Long(32514);
+    e.Call(Emit::USER, 173);  // LoadCursor(NULL, IDC_WAIT)
+    ok(16);
+    a.db({0x50});             // push ax
+    e.Call(Emit::USER, 69);   // SetCursor
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 18);   // SetCapture -> previous (none)
+    eq(0, 16);
+    e.Call(Emit::USER, 236);  // GetCapture
+    a.db({0x3B, 0x06}).dw(kHwnd); FailUnless(a, JZ, 16);
+    e.Call(Emit::USER, 19);   // ReleaseCapture
+    e.Call(Emit::USER, 236);
+    eq(0, 16);
+    // 17. MessageBox(MB_YESNO | MB_DEFBUTTON2) = IDNO without a real box; DialogBox("ABOUT") = IDCANCEL
+    e.Mem(kHwnd); e.Far(kQuit); e.Far(kTitle); e.Imm(0x0104);
+    e.Call(Emit::USER, 1);
+    eq(7, 17);
+    e.Mem(kHinst); e.Far(kAbout); e.Mem(kHwnd);
+    a.db({0x0E, 0x68}).Abs16("WndProc");
+    e.Call(Emit::USER, 87);
+    eq(2, 17);
+    // 18. SOUND.DRV is silent; no wave devices; a missing WAV fails; MessageBeep
+    e.Call(SOUND, 1);  // OpenSound
+    e.Imm(1); e.Imm(60); e.Imm(4); e.Imm(0);
+    e.Call(SOUND, 4);  // SetVoiceNote
+    e.Call(MMSYSTEM, 401);
+    eq(0, 18);
+    e.Far(kNoWav); e.Imm(0x0003);  // SND_ASYNC | SND_NODEFAULT
+    e.Call(MMSYSTEM, 2);
+    eq(0, 18);
+    e.Imm(0);
+    e.Call(Emit::USER, 104);
+
+    // 19. timeSetEvent(10 ms, periodic, TimeProc, dwUser 1234h), accelerators, then the loop
+    e.Mem(kHinst); e.Long(1);
+    e.Call(Emit::USER, 177);  // LoadAccelerators(#1)
+    ok(19);
+    e.StoreAx(kAccel);
+    e.Imm(10); e.Imm(1);
+    a.db({0x0E, 0x68}).Abs16("TimeProc");
+    e.Long(0x1234); e.Imm(1);
+    e.Call(MMSYSTEM, 602);
+    ok(19);
+    a.Label("loop");
+    e.Far(kMsg); e.Imm(0); e.Imm(0); e.Imm(0);
+    e.Call(Emit::USER, 108);
+    a.db({0x85, 0xC0});
+    a.Short(JZ, "done");
+    e.Mem(kHwnd); e.Mem(kAccel); e.Far(kMsg);
+    e.Call(Emit::USER, 178);  // TranslateAccelerator
+    a.db({0x85, 0xC0});
+    a.Short(JNZ, "loop");
+    e.Far(kMsg);
+    e.Call(Emit::USER, 114);
+    a.Short(0xEB, "loop");
+    a.Label("done");
+    e.CmpMem(kUserSeen, 1); FailUnless(a, JZ, 19);
+    e.CmpMem(kTicks, 3); FailUnless(a, JZ, 19);
+    e.CmpMem(kCommand, 100); FailUnless(a, JZ, 19);
+    // 20. The callback got dwUser = 1234h every time
+    e.CmpMem(kBadUser, 0); FailUnless(a, JZ, 20);
+    e.Exit0();
+    e.FailStubs(20);
+
+    // WndProc: [bp+14] hwnd, [bp+12] msg, [bp+10] wParam, [bp+8]:[bp+6] lParam
+    a.Label("WndProc");
+    a.db({0x55, 0x89, 0xE5, 0x8B, 0x46, 0x0C});  // push bp / mov bp,sp / mov ax,[bp+12]
+    e.CmpAx(0x001C); a.Short(JZ, "wp_activateapp");
+    e.CmpAx(0x0005); a.Short(JZ, "wp_size");
+    e.CmpAx(0x0400); a.Short(JZ, "wp_user");
+    e.CmpAx(0x0111); a.Short(JZ, "wp_command");
+    a.Label("wp_default");
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);                     // DefWindowProc
+    a.Near(0xE9, "wp_done");
+    a.Label("wp_activateapp");
+    e.Set(kActivated, 1);
+    a.Short(0xEB, "wp_default");
+    a.Label("wp_size");                          // lParam = cx | cy << 16
+    a.db({0x8B, 0x46, 0x06});
+    e.StoreAx(kSizeLo);
+    a.db({0x8B, 0x46, 0x08});
+    e.StoreAx(kSizeHi);
+    a.Near(0xE9, "wp_zero");
+    a.Label("wp_user");                          // post ourselves an F2 key press
+    e.Set(kUserSeen, 1);
+    e.Arg(14); e.Imm(0x0100); e.Imm(0x71); e.Long(0);
+    e.Call(Emit::USER, 110);                     // PostMessage(WM_KEYDOWN, VK_F2)
+    a.Near(0xE9, "wp_zero");
+    a.Label("wp_command");                       // from the accelerator: the command id
+    a.db({0x8B, 0x46, 0x0A});
+    e.StoreAx(kCommand);
+    e.Imm(0);
+    e.Call(Emit::USER, 6);                       // PostQuitMessage(0)
+    a.Label("wp_zero");
+    a.db({0x31, 0xC0, 0x31, 0xD2});
+    a.Label("wp_done");
+    a.db({0x5D, 0xCA, 0x0A, 0x00});              // pop bp / retf 10
+
+    // TimeProc(UINT id, UINT msg, DWORD dwUser, DWORD dw1, DWORD dw2): 16 bytes.
+    // [bp+20] id, [bp+18] msg, [bp+16]:[bp+14] dwUser, [bp+12]:[bp+10] dw1, [bp+8]:[bp+6] dw2
+    a.Label("TimeProc");
+    a.db({0x55, 0x89, 0xE5});
+    a.db({0x81, 0x7E, 14}).dw(0x1234);           // cmp word [bp+14], 1234h
+    a.Short(JZ, "tp_user_ok");
+    e.Set(kBadUser, 1);
+    a.Label("tp_user_ok");
+    a.db({0xFF, 0x06}).dw(kTicks);               // inc word [ticks]
+    e.CmpMem(kTicks, 3);
+    a.Short(JNZ, "tp_done");
+    e.Arg(20);
+    e.Call(MMSYSTEM, 603);                       // timeKillEvent(id)
+    e.Mem(kHwnd); e.Imm(0x0400); e.Imm(0); e.Long(0);
+    e.Call(Emit::USER, 110);                     // PostMessage(WM_USER)
+    a.Label("tp_done");
+    a.db({0x5D, 0xCA, 0x10, 0x00});              // pop bp / retf 16
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x200)};
     return p;
 }
 

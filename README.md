@@ -36,7 +36,11 @@ Project Sun/
 │  │  ├─ Files.cpp                 the task's file view (program directory, read-only), INI files
 │  │  ├─ Resources.cpp             resource lookup/loading, string tables
 │  │  ├─ User.cpp                  USER: classes, windows, message queue, timers, callbacks
+│  │  ├─ UserWindow.cpp            USER: geometry, window words, focus, input state, cursor, wsprintf
+│  │  ├─ Menus.cpp                 USER: menus (model), accelerators, dialog boxes (not shown yet)
 │  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, text, back buffers, presentation
+│  │  ├─ GdiDraw.cpp               GDI: fonts, shapes, DIBs, GetObject, device caps; DrawText
+│  │  ├─ Sound.cpp                 MessageBeep, MMSYSTEM (sndPlaySound, multimedia timers)
 │  │  └─ Runtime.cpp               Win16 task: DLL dispatch, stub modules, trace, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
@@ -139,18 +143,58 @@ Project Sun/
       `WriteProfileString`, `WritePrivateProfileString`.
     - Resources: `FindResource`, `LoadResource`, `LockResource`, `FreeResource`,
       `SizeofResource`.
-  - USER: `RegisterClass`, `CreateWindow`/`CreateWindowEx`, `ShowWindow`,
-    `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `GetMessage`, `PeekMessage`,
-    `PostMessage`, `SendMessage`, `TranslateMessage`, `DispatchMessage`,
-    `PostQuitMessage`, `GetSystemMetrics` (a 640×480 screen), `GetTickCount`,
-    `SetTimer`, `KillTimer`, `LoadBitmap`, `LoadString`, `LoadIcon`/`LoadCursor`
-    (placeholder handles), `InitApp`, `MessageBox` (printed to the console).
+  - USER:
+    - Windows and messages: `RegisterClass`, `CreateWindow`/`CreateWindowEx`,
+      `ShowWindow`, `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `CallWindowProc`,
+      `GetMessage`, `PeekMessage`, `PostMessage`, `SendMessage`, `TranslateMessage`,
+      `DispatchMessage`, `PostQuitMessage`, `SetTimer`, `KillTimer`, `InitApp`,
+      `GetTickCount`, `GetSystemMetrics` (a 640×480 screen), `GetSysColor` (the
+      Windows 3.1 colours).
+    - Geometry and state: `MoveWindow`, `SetWindowPos`, `GetWindowRect`,
+      `ClientToScreen`/`ScreenToClient`, `Get`/`SetWindowWord`, `Get`/`SetWindowLong`
+      (including `GWL_WNDPROC` subclassing), `GetClassWord`/`SetClassWord`/`GetClassLong`,
+      `SetWindowText`/`GetWindowText`/`GetWindowTextLength`, `EnableWindow`,
+      `IsWindow…`, `GetParent`, `GetWindow`, `GetDesktopWindow`, `BringWindowToTop`.
+    - Focus and input: `SetFocus`/`GetFocus`, `SetActiveWindow`/`GetActiveWindow`,
+      `GetKeyState`/`GetAsyncKeyState`, `SetCapture`/`ReleaseCapture`/`GetCapture`,
+      `SetCursor`, `ShowCursor`, `LoadCursor` (standard cursors), `GetCursorPos`.
+      `SetCursorPos` and `ClipCursor` are accepted but ignored.
+    - Rectangles: `SetRect`, `SetRectEmpty`, `CopyRect`, `OffsetRect`, `InflateRect`,
+      `IntersectRect`, `UnionRect`, `PtInRect`, `IsRectEmpty`, `EqualRect`.
+    - Menus and accelerators: `LoadMenu`, `CreateMenu`/`CreatePopupMenu`, `AppendMenu`,
+      `InsertMenu`, `ModifyMenu`, `RemoveMenu`/`DeleteMenu`, `SetMenu`/`GetMenu`,
+      `CheckMenuItem`, `EnableMenuItem`, `GetMenuState`, `GetSubMenu`,
+      `GetMenuItemCount`/`ID`/`String`, `GetSystemMenu`, `LoadAccelerators`,
+      `TranslateAccelerator`.
+    - Dialogs: `DialogBox`/`DialogBoxParam` answer `IDCANCEL` with a note, and
+      `CreateDialog` fails with one. `IsDialogMessage`, `EndDialog` and `GetDlgItem` are
+      there for message loops.
+    - Text: `MessageBox` (a real one, see below), `wsprintf`/`wvsprintf`, `DrawText`,
+      `LoadString`.
+    - Resources: `LoadBitmap`; `LoadIcon` still returns a placeholder.
   - USER painting: `BeginPaint`/`EndPaint` (real `PAINTSTRUCT`), `GetDC`/`ReleaseDC`,
-    `InvalidateRect`/`ValidateRect`, `GetClientRect`, `FillRect`.
-  - GDI: `CreateCompatibleDC`, `DeleteDC`, `CreateBitmap`, `CreateCompatibleBitmap`,
-    `CreateSolidBrush`, `CreatePen`, `SelectObject`, `DeleteObject`, `GetStockObject`,
-    `BitBlt`, `StretchBlt`, `PatBlt`, `Rectangle`, `SetPixel`, `GetPixel`, `TextOut`,
-    `SetTextColor`, `GetTextColor`, `SetBkColor`, `SetBkMode`.
+    `InvalidateRect`/`ValidateRect`, `GetClientRect`, `FillRect`, `FrameRect`,
+    `InvertRect`.
+  - GDI:
+    - DCs and objects: `CreateCompatibleDC`, `DeleteDC`, `SaveDC`/`RestoreDC`,
+      `SelectObject`, `DeleteObject`, `GetStockObject`, `GetObject`, `GetDeviceCaps`.
+    - Bitmaps: `CreateBitmap`, `CreateCompatibleBitmap`, `CreateDIBitmap`,
+      `Get`/`SetBitmapBits`, `Get`/`SetDIBits`, `SetDIBitsToDevice`, `StretchDIBits`,
+      `BitBlt`, `StretchBlt`, `PatBlt`.
+    - Brushes and pens: `CreateSolidBrush`, `CreateHatchBrush`, `CreatePatternBrush`,
+      `CreateBrushIndirect`, `CreatePen`, `CreatePenIndirect`.
+    - Shapes: `Rectangle`, `RoundRect`, `Ellipse`, `Arc`, `Pie`, `Polygon`, `Polyline`,
+      `MoveTo`/`MoveToEx`/`LineTo`, `SetPixel`/`GetPixel`.
+    - Text: `CreateFont`/`CreateFontIndirect`, `TextOut`, `ExtTextOut`,
+      `GetTextMetrics`, `GetTextExtent`/`GetTextExtentPoint`, `GetTextFace`,
+      `Set`/`GetTextAlign`, `SetTextCharacterExtra`, `Set`/`GetTextColor`,
+      `Set`/`GetBkColor`, `Set`/`GetBkMode`.
+    - Modes and clipping: `SetROP2`, `SetStretchBltMode`, `SetPolyFillMode`,
+      `Set`/`GetMapMode`, `SetWindowOrg`/`Ext`, `SetViewportOrg`/`Ext`,
+      `IntersectClipRect`, `ExcludeClipRect`, `GetClipBox`, `GetNearestColor`.
+  - Sound: `MessageBeep`; MMSYSTEM `sndPlaySound`, `timeSetEvent`/`timeKillEvent`,
+    `timeGetTime`, `timeBegin`/`EndPeriod`, `timeGetDevCaps`, `timeGetSystemTime`, the
+    device queries, and MCI (which fails politely). SOUND.DRV calls are ignored.
 - **Global heap:** each `GlobalAlloc` block is its own LDT segment. As in protected-mode
   Windows 3.x, a fixed block's handle is its selector, and a moveable block's handle is
   the selector with bit 0 cleared.
@@ -201,6 +245,35 @@ Project Sun/
 - **Text:** `TextOut` draws with the DC's text colour, background colour and mode.
   Strings are converted from code page 1252 (Win16's ANSI), whatever the host's code
   page. Each `GetDC` starts from the default colours, as with Windows' common DCs.
+  - The stock fonts (`SYSTEM_FONT`, `ANSI_VAR_FONT`, …) are the engine's own 96-DPI
+    equivalents of Windows 3.1's (System 16 px bold, MS Sans Serif 13 px, …). The
+    host's stock fonts scale with the host's DPI, so they would come out too big in a
+    640×480 world.
+  - Every DC starts with `SYSTEM_FONT`, and no font is antialiased, as in Windows 3.1.
+- **Windows beyond painting:**
+  - `MoveWindow`/`SetWindowPos` resize the back buffer and lay the host window out
+    again, so a program that grows its window to 640×480 goes borderless fullscreen,
+    and back when it shrinks.
+  - The first visible window gets `WM_ACTIVATEAPP`, `WM_ACTIVATE` and `WM_SETFOCUS`, as
+    when Windows starts a program.
+  - Key and mouse-button state (`GetKeyState`) follows the input the host delivers,
+    Alt combinations included.
+  - `WM_SETCURSOR` precedes mouse messages, so class cursors work. `SetCursor(NULL)`
+    and `ShowCursor(FALSE)` hide the pointer.
+  - `MessageBox` shows a real message box, and returns the default button with
+    `--hidden`.
+- **Menus:** menus are a model. They're loaded from `RT_MENU` or built with the API,
+  with check, enable and query state, so programs that manage their menus work. The
+  menu bar isn't drawn yet. Accelerators (`TranslateAccelerator`) turn keys into
+  `WM_COMMAND`, which is how commands like "F2: new game" are reachable meanwhile.
+- **Sound:**
+  - `sndPlaySound` plays WAV files from the program's directory, or WAV images in
+    memory, through the host. `MessageBeep` works too.
+  - Multimedia timers (`timeSetEvent`) call back at millisecond resolution from the
+    message pump.
+  - Wave, MIDI, auxiliary and joystick devices report "none", which programs handle by
+    running silently. MCI (MIDI music, CD audio) returns "device not available".
+  - `--mute` silences everything.
 - **Callbacks:** `SendMessage`, `DispatchMessage` and `CreateWindow` (`WM_NCCREATE`/
   `WM_CREATE` with a real `CREATESTRUCT`, then `WM_SIZE`/`WM_MOVE`) call the 16-bit
   window procedure on the interpreter. `Cpu::CallFar` pushes the Pascal arguments and
@@ -260,21 +333,29 @@ RetroLaunch --trace-win16 C:\Games\SKI\SKIFREE.EXE > trace.txt
   arguments can't be removed safely still stop: register-based ones, and those with
   unknown parameters. The program may misbehave afterwards, but you see everything it
   needs in one run instead of one run per gap.
-- `--exact-timers` makes `SetTimer` honour intervals below 55 ms.
+- `--exact-timers` makes `SetTimer` honour intervals below 55 ms. `--mute` turns sound off.
+- An API that removes the wrong number of argument bytes would be an engine bug. Every
+  call is checked against the catalog, and a mismatch prints an "internal error" note.
 - Writing files isn't supported yet: a game that saves (high scores, settings in its
   own files) gets "access denied", and the launcher notes it once. INI settings work
   for the run.
 
-Not yet: fonts (`CreateFont`; text uses the host's default font) and text metrics,
-lines and other shapes, regions, palettes (8-bit games), mapping modes, non-client areas
-(a 16-bit window is all client area), child windows (they get no back buffer), child
-controls and system classes (`BUTTON`, `EDIT`, …), menus, dialogs, icons and cursors
-from resources (they're parsed, but `LoadIcon`/`LoadCursor` return placeholders),
-system bitmaps (`OBM_xxx`), `SetSystemTimer`, sound (MMSYSTEM, SOUND), writing files,
-loading NE DLLs (a game's own DLLs load as stubs), huge (> 64 KB) global blocks, 386
-instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), floating point
-(WIN87EM's emulation interrupts and x87 instructions stop the task with a clear
-message), and `Catch`/`Throw`.
+Not yet:
+- Graphics: regions, palettes (8-bit games; `GetDeviceCaps` reports a true-colour
+  display, and `DIB_PAL_COLORS` isn't supported), and system bitmaps (`OBM_xxx`).
+- Windowing: non-client areas (a 16-bit window is all client area), a drawn menu bar
+  and popup menus, dialog boxes, and child windows (they get no back buffer).
+- Controls: child controls and the system classes (`BUTTON`, `EDIT`, …).
+- Resources: icons and cursors from a program's resources (they're parsed, but
+  `LoadIcon` returns a placeholder and custom cursors show as the arrow).
+- Sound: wave and MIDI output (`waveOut`, `midiOut`) and MCI.
+- Timers: `SetSystemTimer`.
+- Files and memory: writing files, loading NE DLLs (a game's own DLLs load as stubs),
+  and huge (> 64 KB) global blocks.
+- CPU: 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), and
+  floating point. WIN87EM's emulation interrupts and x87 instructions stop the task
+  with a clear message.
+- KERNEL: `Catch`/`Throw`.
 
 ## Shim modules
 
@@ -376,6 +457,7 @@ RetroLaunch [options] <program.exe> [program arguments...]
   --stub-missing   16-bit programs: missing APIs with known parameters return 0
                    instead of stopping the program (logged once each)
   --exact-timers   16-bit programs: timers honour intervals below Windows 3.x's 55 ms
+  --mute           16-bit programs: no sound
   --no-shim        Launch without injection (baseline comparison)
   --shim <path>    Shim DLL (default: RetroShim.dll beside RetroLaunch)
   --cwd <dir>      Working directory (default: the program's folder)
