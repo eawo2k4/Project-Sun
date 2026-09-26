@@ -63,6 +63,14 @@ void HeadlessHost::Show(uint64_t window, bool show) {
     }
 }
 
+void HeadlessHost::Present(uint64_t window, const uint32_t* pixels, int width, int height) {
+    lastFrame.window = window;
+    lastFrame.width = width;
+    lastFrame.height = height;
+    lastFrame.pixels.assign(pixels, pixels + size_t(width) * height);
+    ++presents;
+}
+
 void HeadlessHost::Destroy(uint64_t window) {
     for (Record& r : windows) {
         if (r.id == window) r.destroyed = true;
@@ -235,6 +243,7 @@ uint16_t User::Create(const CreateParams& p) {
                                        {kScreenWidth, kScreenHeight});
         win->host = host_->Create(info);
         if (win->host) hostToHwnd_[win->host] = hwnd;
+        rt_.Graphics().CreateSurface(hwnd, win->cx, win->cy);
     }
     const int16_t cx = win->cx, cy = win->cy, x = win->x, y = win->y;
     if (win->style & ws::Visible) Show(hwnd, 1);
@@ -263,6 +272,7 @@ bool User::Destroy(uint16_t hwnd) {
         }
         windows_.erase(hwnd);
     }
+    rt_.Graphics().DestroySurface(hwnd);
     queue_.erase(std::remove_if(queue_.begin(), queue_.end(),
                                 [&](const Msg16& m) { return m.hwnd == hwnd; }),
                  queue_.end());
@@ -278,6 +288,7 @@ bool User::Show(uint16_t hwnd, uint16_t cmdShow) {
         w->visible = show;
         if (w->host) host_->Show(w->host, show);
         Send(hwnd, wm::ShowWindow, show ? 1 : 0, 0);
+        if (show) Invalidate(hwnd, nullptr, true);  // newly visible: paint it all
     }
     return previous;
 }
@@ -293,12 +304,100 @@ uint32_t User::Send(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lPara
                                    w->hInstance);
 }
 
-uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t, uint32_t) {
+uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t) {
     switch (msg) {
     case wm::NcCreate: return 1;
     case wm::Close: Destroy(hwnd); return 0;
+    case wm::Paint: {
+        // Nobody painted: validate, or WM_PAINT would come back forever.
+        Runtime::Scratch ps(rt_, 32);
+        BeginPaint(hwnd, ps.Selector(), ps.Offset());
+        EndPaint(hwnd, ps.Selector(), ps.Offset());
+        return 0;
+    }
+    case wm::EraseBkgnd: {  // fill with the class background brush
+        const Window* w = Find(hwnd);
+        const WindowClass* c = w ? FindClass(w->className) : nullptr;
+        if (!c || !c->hbrBackground) return 0;
+        return rt_.Graphics().Fill(wParam, ClientRect(hwnd), c->hbrBackground) ? 1 : 0;
+    }
     default: return 0;
     }
+}
+
+Rect16 User::ClientRect(uint16_t hwnd) const {
+    const Window* w = Find(hwnd);
+    return w ? Rect16{0, 0, w->cx, w->cy} : Rect16{};
+}
+
+void User::Invalidate(uint16_t hwnd, const Rect16* rect, bool erase) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return;
+    Rect16 r = rect ? *rect : ClientRect(hwnd);
+    r.left = std::max<int16_t>(r.left, 0);
+    r.top = std::max<int16_t>(r.top, 0);
+    r.right = std::min<int16_t>(r.right, w->cx);
+    r.bottom = std::min<int16_t>(r.bottom, w->cy);
+    if (r.Empty()) return;
+    if (w->update.Empty()) {
+        w->update = r;
+    } else {  // keep a bounding box
+        w->update.left = std::min(w->update.left, r.left);
+        w->update.top = std::min(w->update.top, r.top);
+        w->update.right = std::max(w->update.right, r.right);
+        w->update.bottom = std::max(w->update.bottom, r.bottom);
+    }
+    w->erase = w->erase || erase;
+}
+
+void User::Validate(uint16_t hwnd, const Rect16* rect) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return;
+    // Bounding-box region: validating a part that covers it clears it.
+    const bool coversAll = !rect || (rect->left <= w->update.left && rect->top <= w->update.top &&
+                                     rect->right >= w->update.right && rect->bottom >= w->update.bottom);
+    if (coversAll) {
+        w->update = {};
+        w->erase = false;
+    }
+}
+
+bool User::Update(uint16_t hwnd) {
+    const Window* w = Find(hwnd);
+    if (!w) return false;
+    if (w->visible && !w->update.Empty()) Send(hwnd, wm::Paint, 0, 0);
+    return true;
+}
+
+uint16_t User::BeginPaint(uint16_t hwnd, uint16_t sel, uint16_t off) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return 0;
+    const Rect16 paint = w->update;
+    const bool erase = w->erase;
+    w->update = {};  // BeginPaint validates
+    w->erase = false;
+
+    const uint16_t hdc = rt_.Graphics().GetWindowDc(hwnd);
+    if (!hdc) return 0;
+    rt_.Graphics().ClipTo(hdc, paint);  // drawing is limited to the invalid area
+    const bool erased = erase && Send(hwnd, wm::EraseBkgnd, hdc, 0) != 0;
+
+    // PAINTSTRUCT (Win16): hdc, fErase, rcPaint (4 ints), fRestore,
+    // fIncUpdate, rgbReserved[16] = 32 bytes.
+    Memory& mem = rt_.Mem();
+    mem.Write16(sel, off, hdc);
+    mem.Write16(sel, uint16_t(off + 2), erase && !erased ? 1 : 0);  // TRUE: the app must erase
+    mem.Write16(sel, uint16_t(off + 4), uint16_t(paint.left));
+    mem.Write16(sel, uint16_t(off + 6), uint16_t(paint.top));
+    mem.Write16(sel, uint16_t(off + 8), uint16_t(paint.right));
+    mem.Write16(sel, uint16_t(off + 10), uint16_t(paint.bottom));
+    for (uint16_t i = 12; i < 32; i += 2) mem.Write16(sel, uint16_t(off + i), 0);
+    return hdc;
+}
+
+bool User::EndPaint(uint16_t hwnd, uint16_t sel, uint16_t off) {
+    if (!Find(hwnd)) return false;
+    return rt_.Graphics().ReleaseWindowDc(rt_.Mem().Read16(sel, off));
 }
 
 bool User::Post(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam) {
@@ -328,6 +427,9 @@ void User::PumpHost(bool wait, bool& canWait) {
 
 User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_t maxMsg,
                        bool remove, bool wait) {
+    // The message pump is the frame boundary: show what was drawn since the
+    // last call, paced to the frame cap.
+    rt_.Graphics().PresentPending();
     for (;;) {
         bool canWait = false;
         PumpHost(false, canWait);
@@ -343,6 +445,15 @@ User::Fetch User::Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_
             out = Msg16{0, wm::Quit, quitCode_, 0, rt_.TickCount(), 0, 0};
             if (remove) quitPending_ = false;
             return Fetch::Quit;
+        }
+        // Then WM_PAINT for a window with an invalid area. It stays "in the
+        // queue" until BeginPaint (or ValidateRect) validates it.
+        for (const auto& [h, w] : windows_) {
+            if (w.visible && !w.update.Empty() && (!hwndFilter || h == hwndFilter) &&
+                Matches(Msg16{h, wm::Paint}, hwndFilter, minMsg, maxMsg)) {
+                out = Msg16{h, wm::Paint, 0, 0, rt_.TickCount(), 0, 0};
+                return Fetch::Message;
+            }
         }
         if (!wait) return Fetch::Empty;
         PumpHost(true, canWait);
@@ -497,9 +608,77 @@ void DispatchMessage(Runtime& rt, Cpu& cpu) {
     cpu.ReturnFar(4);
 }
 
-void UpdateWindow(Runtime&, Cpu& cpu) {
-    cpu.Regs().r[AX] = 1;  // no painting yet, so nothing to update
-    cpu.ReturnFar(2);
+void UpdateWindow(Runtime& rt, Cpu& cpu) {  // (HWND)
+    const PascalArgs a(cpu, {2});
+    cpu.Regs().r[AX] = rt.Windows().Update(a.Word(0)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+// RECT (Win16): left, top, right, bottom as ints.
+Rect16 ReadRect(const Memory& mem, FarPtr p) {
+    return {int16_t(mem.Read16(p.sel, p.off)), int16_t(mem.Read16(p.sel, uint16_t(p.off + 2))),
+            int16_t(mem.Read16(p.sel, uint16_t(p.off + 4))), int16_t(mem.Read16(p.sel, uint16_t(p.off + 6)))};
+}
+
+void GetClientRect(Runtime& rt, Cpu& cpu) {  // (HWND, RECT FAR*)
+    const PascalArgs a(cpu, {2, 4});
+    const Rect16 r = rt.Windows().ClientRect(a.Word(0));
+    const FarPtr p = a.Ptr(1);
+    Memory& mem = rt.Mem();
+    mem.Write16(p.sel, p.off, uint16_t(r.left));
+    mem.Write16(p.sel, uint16_t(p.off + 2), uint16_t(r.top));
+    mem.Write16(p.sel, uint16_t(p.off + 4), uint16_t(r.right));
+    mem.Write16(p.sel, uint16_t(p.off + 6), uint16_t(r.bottom));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void BeginPaint(Runtime& rt, Cpu& cpu) {  // (HWND, PAINTSTRUCT FAR*) -> HDC
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr ps = a.Ptr(1);
+    cpu.Regs().r[AX] = rt.Windows().BeginPaint(a.Word(0), ps.sel, ps.off);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void EndPaint(Runtime& rt, Cpu& cpu) {  // (HWND, const PAINTSTRUCT FAR*)
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr ps = a.Ptr(1);
+    rt.Windows().EndPaint(a.Word(0), ps.sel, ps.off);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void GetDC(Runtime& rt, Cpu& cpu) {  // (HWND) -> HDC
+    const PascalArgs a(cpu, {2});
+    const uint16_t hwnd = a.Word(0);
+    cpu.Regs().r[AX] = hwnd && !rt.Windows().Find(hwnd) ? 0 : rt.Graphics().GetWindowDc(hwnd);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void ReleaseDC(Runtime& rt, Cpu& cpu) {  // (HWND, HDC)
+    const PascalArgs a(cpu, {2, 2});
+    cpu.Regs().r[AX] = rt.Graphics().ReleaseWindowDc(a.Word(1)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void FillRect(Runtime& rt, Cpu& cpu) {  // (HDC, const RECT FAR*, HBRUSH)
+    const PascalArgs a(cpu, {2, 4, 2});
+    cpu.Regs().r[AX] = rt.Graphics().Fill(a.Word(0), ReadRect(rt.Mem(), a.Ptr(1)), a.Word(2)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void InvalidateRect(Runtime& rt, Cpu& cpu) {  // (HWND, const RECT FAR* or NULL, BOOL erase)
+    const PascalArgs a(cpu, {2, 4, 2});
+    const FarPtr p = a.Ptr(1);
+    const Rect16 r = p.IsNull() ? Rect16{} : ReadRect(rt.Mem(), p);
+    rt.Windows().Invalidate(a.Word(0), p.IsNull() ? nullptr : &r, a.Word(2) != 0);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void ValidateRect(Runtime& rt, Cpu& cpu) {  // (HWND, const RECT FAR* or NULL)
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr p = a.Ptr(1);
+    const Rect16 r = p.IsNull() ? Rect16{} : ReadRect(rt.Mem(), p);
+    rt.Windows().Validate(a.Word(0), p.IsNull() ? nullptr : &r);
+    cpu.ReturnFar(a.Bytes());
 }
 
 void LoadCursor(Runtime&, Cpu& cpu) {
@@ -537,10 +716,16 @@ std::vector<ApiFunction> UserApi() {
         {5, "INITAPP", InitApp},
         {6, "POSTQUITMESSAGE", PostQuitMessage},
         {13, "GETTICKCOUNT", GetTickCount},
+        {33, "GETCLIENTRECT", GetClientRect},
+        {39, "BEGINPAINT", BeginPaint},
+        {40, "ENDPAINT", EndPaint},
         {41, "CREATEWINDOW", CreateWindow},
         {42, "SHOWWINDOW", ShowWindow},
         {53, "DESTROYWINDOW", DestroyWindow},
         {57, "REGISTERCLASS", RegisterClass},
+        {66, "GETDC", GetDC},
+        {68, "RELEASEDC", ReleaseDC},
+        {81, "FILLRECT", FillRect},
         {107, "DEFWINDOWPROC", DefWindowProc},
         {108, "GETMESSAGE", GetMessage},
         {109, "PEEKMESSAGE", PeekMessage},
@@ -549,6 +734,8 @@ std::vector<ApiFunction> UserApi() {
         {113, "TRANSLATEMESSAGE", TranslateMessage},
         {114, "DISPATCHMESSAGE", DispatchMessage},
         {124, "UPDATEWINDOW", UpdateWindow},
+        {125, "INVALIDATERECT", InvalidateRect},
+        {127, "VALIDATERECT", ValidateRect},
         {173, "LOADCURSOR", LoadCursor},
         {174, "LOADICON", LoadIcon},
         {179, "GETSYSTEMMETRICS", GetSystemMetrics},

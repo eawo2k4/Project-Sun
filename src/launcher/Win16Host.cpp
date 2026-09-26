@@ -84,6 +84,20 @@ public:
         if (!hidden_) ShowWindow(e->hwnd, show ? SW_SHOW : SW_HIDE);
     }
 
+    // A complete frame from the window's back buffer: one nearest-neighbour
+    // blit into the integer-scaled viewport, composited by DWM (no tearing).
+    void Present(uint64_t window, const uint32_t* pixels, int width, int height) override {
+        Entry* e = Find(reinterpret_cast<HWND>(window));
+        if (!e) return;
+        e->frame.assign(pixels, pixels + size_t(width) * height);
+        e->frameWidth = width;
+        e->frameHeight = height;
+        if (HDC dc = GetDC(e->hwnd)) {
+            Draw(*e, dc);
+            ReleaseDC(e->hwnd, dc);
+        }
+    }
+
     void Destroy(uint64_t window) override {
         const HWND hwnd = reinterpret_cast<HWND>(window);
         for (auto it = windows_.begin(); it != windows_.end(); ++it) {
@@ -131,7 +145,24 @@ private:
         ViewportMap map;  // client coordinates <-> 16-bit window coordinates
         bool fullscreen;
         bool visible = false;
+        std::vector<uint32_t> frame;  // last presented frame (for WM_PAINT)
+        int frameWidth = 0, frameHeight = 0;
     };
+
+    static void Draw(const Entry& e, HDC dc) {
+        if (e.frame.empty()) return;
+        BITMAPINFO bmi{};
+        bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bmi.bmiHeader.biWidth = e.frameWidth;
+        bmi.bmiHeader.biHeight = -e.frameHeight;  // top-down
+        bmi.bmiHeader.biPlanes = 1;
+        bmi.bmiHeader.biBitCount = 32;
+        bmi.bmiHeader.biCompression = BI_RGB;
+        const Rect& vp = e.map.RealViewport();
+        SetStretchBltMode(dc, COLORONCOLOR);
+        StretchDIBits(dc, vp.left, vp.top, vp.Width(), vp.Height(), 0, 0, e.frameWidth,
+                      e.frameHeight, e.frame.data(), &bmi, DIB_RGB_COLORS, SRCCOPY);
+    }
 
     static std::wstring Widen(const std::string& s) {  // 16-bit strings are ANSI
         if (s.empty()) return {};
@@ -172,6 +203,13 @@ private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         auto* self = reinterpret_cast<Win32WindowHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
         Entry* e = self ? self->Find(hwnd) : nullptr;
+        if (e && msg == WM_PAINT) {  // uncovered: show the last frame again (bars stay black)
+            PAINTSTRUCT ps;
+            HDC dc = BeginPaint(hwnd, &ps);
+            Draw(*e, dc);
+            EndPaint(hwnd, &ps);
+            return 0;
+        }
         if (!e || !self->deliver_) return DefWindowProcW(hwnd, msg, wp, lp);
         const Deliver& deliver = *self->deliver_;
 
@@ -218,6 +256,7 @@ int RunWin16Program(const std::filesystem::path& exe, const std::string& command
     Win32WindowHost host(options.hidden);
     win16::Runtime runtime;
     runtime.SetWindowHost(&host);
+    runtime.SetFrameCap(options.fpsCap);
     runtime.SetOutput([](const std::string& line) {
         std::printf("[win16] %s\n", line.c_str());
         std::fflush(stdout);

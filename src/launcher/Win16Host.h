@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <filesystem>
 #include <string>
 
@@ -12,6 +13,8 @@ inline constexpr int kWin16Stopped = 6;
 struct Win16Options {
     // Create the host windows but never show them (automated tests).
     bool hidden = false;
+    // Presented frames per second at most (0 = unpaced), as for 32-bit games.
+    uint32_t fpsCap = 60;
 };
 
 // Runs a 16-bit NE program in-process on the Win16 engine, with its top-level

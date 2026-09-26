@@ -239,7 +239,9 @@ int wmain(int argc, wchar_t** argv) {
         break;
     case retro::LaunchPath::Win16Engine:
         // 16-bit Windows: run in-process on the Win16 engine (no shim needed).
-        return retro::RunWin16Program(exe, ToUtf8(opt.arguments), {opt.hidden});
+        return retro::RunWin16Program(
+            exe, ToUtf8(opt.arguments),
+            {opt.hidden, (opt.features & retro::ShimFeature_FrameLimiter) ? opt.fpsCap : 0});
     case retro::LaunchPath::Unsupported:
     default:
         std::fprintf(stderr, "error: cannot launch: %s\n", reason.c_str());

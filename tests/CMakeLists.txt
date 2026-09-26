@@ -125,7 +125,7 @@ set_tests_properties(Win16HelloViaLauncher PROPERTIES
 set_tests_properties(Win16FatalExitViaLauncher PROPERTIES
     PASS_REGULAR_EXPRESSION "fatal exit, code 7 - FatalExit\\(7\\)")
 set_tests_properties(Win16UnimplementedViaLauncher PROPERTIES
-    PASS_REGULAR_EXPRESSION "USER\\.39 is not implemented yet")
+    PASS_REGULAR_EXPRESSION "USER\\.10 is not implemented yet")
 
 # Windowing through the real Win32 host (windows created but never shown).
 add_test(NAME Win16WindowViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_window.exe)
@@ -136,3 +136,10 @@ set_tests_properties(Win16WindowViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
     "host window for HWND16 [0-9A-F]+ \"Win16 Window\": 320x200 -> [0-9]+x[0-9]+ \\(x[0-9]+\\), windowed, hidden.*Win16 exit  : exited, code 0")
 set_tests_properties(Win16FullscreenViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
     "host window for HWND16 [0-9A-F]+ \"Win16 Window\": 640x480 -> [0-9]+x[0-9]+ \\(x[0-9]+\\), borderless fullscreen, hidden.*Win16 exit  : exited, code 0")
+
+# GDI: the paint program checks its own pixels (exit 0 = all correct); the
+# animation's 30 frames are presented through the real Win32 host at 60 fps.
+add_test(NAME Win16PaintViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_paint.exe)
+add_test(NAME Win16AnimationViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_anim.exe)
+set_tests_properties(Win16PaintViaLauncher Win16AnimationViaLauncher PROPERTIES
+    FIXTURES_REQUIRED win16_samples)

@@ -90,6 +90,7 @@ Runtime::Runtime()
     : cpu_(memory_),
       globals_(memory_),
       user_(std::make_unique<User>(*this)),
+      gdi_(std::make_unique<Gdi>(*this)),
       builtins_(MakeBuiltins()) {
     scratchSel_ = memory_.Allocate(kScratchBytes, SegmentKind::Data);
 }

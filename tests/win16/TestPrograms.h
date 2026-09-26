@@ -368,6 +368,304 @@ inline NeProgram WindowProgram(bool hostCloses, bool fullscreen = false, bool fa
     return p;
 }
 
+// Readable emission of Pascal calls into KERNEL/USER/GDI.
+struct Emit {
+    Asm16& a;
+    NeSeg& code;
+    static constexpr uint16_t KERNEL = 1, USER = 2, GDI = 3;
+
+    void Call(uint16_t module, uint16_t ordinal) {
+        code.relocs.push_back(ImportOrdinal(a.CallFar(), module, ordinal));
+    }
+    void Imm(uint16_t v) { a.db({0x68}).dw(v); }                     // push imm16
+    void Long(uint32_t v) { Imm(uint16_t(v >> 16)); Imm(uint16_t(v)); }  // push a DWORD (hi, lo)
+    void Mem(uint8_t off) { a.db({0xFF, 0x36, off, 0x00}); }         // push word [off]
+    void Arg(uint8_t bpOff) { a.db({0xFF, 0x76, bpOff}); }           // push word [bp+off]
+    void Far(uint8_t off) { a.db({0x1E}); Imm(off); }                // push ds / push off
+    void StoreAx(uint8_t off) { a.db({0xA3, off, 0x00}); }           // mov [off], ax
+    void Set(uint8_t off, uint16_t v) { a.db({0xC7, 0x06, off, 0x00}).dw(v); }  // mov word [off], v
+
+    // Registers a class (lpfnWndProc = CS:<wndProc label>) with a stock background brush.
+    void RegisterClass(uint8_t wndClass, uint8_t className, uint8_t hinst, const std::string& wndProc,
+                       uint16_t stockBrush) {
+        Set(wndClass, 0);
+        a.db({0xC7, 0x06, wndClass + 2, 0x00}).Abs16(wndProc);
+        a.db({0x8C, 0x0E, wndClass + 4, 0x00});                    // selector = CS
+        Set(uint8_t(wndClass + 6), 0);
+        Set(uint8_t(wndClass + 8), 0);
+        a.db({0xA1, hinst, 0x00});
+        StoreAx(uint8_t(wndClass + 10));
+        Set(uint8_t(wndClass + 12), 0);
+        Set(uint8_t(wndClass + 14), 0);
+        Imm(stockBrush);
+        Call(GDI, 87);                                             // GetStockObject
+        StoreAx(uint8_t(wndClass + 16));
+        Set(uint8_t(wndClass + 18), 0);
+        Set(uint8_t(wndClass + 20), 0);
+        Set(uint8_t(wndClass + 22), className);
+        a.db({0x8C, 0x1E, wndClass + 24, 0x00});                   // selector = DS
+        Far(wndClass);
+        Call(USER, 57);                                            // RegisterClass
+    }
+    // CreateWindow(class, title, WS_POPUP | WS_VISIBLE, x, y, w, h, 0, 0, hInst, NULL)
+    void CreatePopup(uint8_t className, uint8_t title, int16_t x, int16_t y, int16_t w, int16_t h,
+                     uint8_t hinst) {
+        Far(className);
+        Far(title);
+        Long(0x90000000);
+        Imm(uint16_t(x));
+        Imm(uint16_t(y));
+        Imm(uint16_t(w));
+        Imm(uint16_t(h));
+        Imm(0);
+        Imm(0);
+        Mem(hinst);
+        Long(0);
+        Call(USER, 41);
+    }
+    // GetPixel(hdc, x, y) == expected, or exit with `failCode`.
+    void CheckPixel(uint8_t hdcVar, int16_t x, int16_t y, uint32_t expected, int failCode) {
+        Mem(hdcVar);
+        Imm(uint16_t(x));
+        Imm(uint16_t(y));
+        Call(GDI, 83);
+        a.db({0x3D}).dw(uint16_t(expected));         // cmp ax, lo
+        FailUnless(a, JZ, failCode);
+        a.db({0x81, 0xFA}).dw(uint16_t(expected >> 16));  // cmp dx, hi
+        FailUnless(a, JZ, failCode);
+    }
+    void Exit0() { a.db({0xB8, 0x00, 0x4C, 0xCD, 0x21}); }
+    void FailStubs(int count) {
+        for (int n = 1; n <= count; ++n) {
+            a.Label("fail" + std::to_string(n));
+            a.db({0xB0, n, 0xB4, 0x4C, 0xCD, 0x21});
+        }
+    }
+};
+
+constexpr uint32_t RGB16(uint8_t r, uint8_t g, uint8_t b) {
+    return uint32_t(r) | (uint32_t(g) << 8) | (uint32_t(b) << 16);
+}
+constexpr uint32_t kSrcCopy = 0x00CC0020, kPatCopy = 0x00F00021, kBlackness = 0x00000042,
+                   kWhiteness = 0x00FF0062;
+
+// Paints a 64x48 window in WM_PAINT with every primitive, off-screen
+// composition included, then reads pixels back with GetPixel:
+//   FillRect red        (0,0)-(32,24)      Rectangle blue brush (32,0)-(64,24)
+//   PatBlt green        (0,24)-(32,48)     SetPixel yellow      (40,30)
+//   memory DC + compatible 8x8 bitmap: a 4x4 checkerboard (PatBlt WHITENESS
+//   and BLACKNESS), BitBlt to (48,32) and StretchBlt 2x wide to (32,40).
+// Background brush: BLACK_BRUSH. Exit 0 if every check passes.
+inline NeProgram PaintProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI"};
+    constexpr uint8_t kHinst = 0x00, kHwnd = 0x02, kPainted = 0x06, kRed = 0x08, kBlue = 0x0A,
+                      kGreen = 0x0C, kMemDc = 0x0E, kBmp = 0x10, kOldBmp = 0x12, kHdc = 0x14,
+                      kCheckDc = 0x16, kClass = 0x20, kTitle = 0x30, kWndClass = 0x40, kMsg = 0x60,
+                      kPs = 0x80, kRedRect = 0xA0;
+    std::vector<uint8_t> data(0xB0, 0);
+    const std::string cls = "PaintWin", title = "Paint";
+    std::copy(cls.begin(), cls.end(), data.begin() + kClass);
+    std::copy(title.begin(), title.end(), data.begin() + kTitle);
+    data[kRedRect + 4] = 32;  // RECT {0, 0, 32, 24}
+    data[kRedRect + 6] = 24;
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+
+    e.Call(Emit::KERNEL, 91);  // InitTask
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    for (const auto& [var, color] : {std::pair{kRed, RGB16(255, 0, 0)}, std::pair{kBlue, RGB16(0, 0, 255)},
+                                     std::pair{kGreen, RGB16(0, 255, 0)}}) {
+        e.Long(color);
+        e.Call(Emit::GDI, 66);  // CreateSolidBrush
+        e.StoreAx(var);
+    }
+    e.RegisterClass(kWndClass, kClass, kHinst, "WndProc", 4 /* BLACK_BRUSH */);
+    e.CreatePopup(kClass, kTitle, 0, 0, 64, 48, kHinst);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 1);
+    e.StoreAx(kHwnd);
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 124);  // UpdateWindow: WM_PAINT now
+    a.db({0x83, 0x3E, kPainted, 0x00, 0x01});
+    FailUnless(a, JZ, 2);
+
+    // Read the picture back through a fresh window DC.
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);  // GetDC
+    e.StoreAx(kCheckDc);
+    e.CheckPixel(kCheckDc, 5, 5, RGB16(255, 0, 0), 3);        // FillRect
+    e.CheckPixel(kCheckDc, 48, 12, RGB16(0, 0, 255), 4);      // Rectangle interior
+    e.CheckPixel(kCheckDc, 32, 12, RGB16(0, 0, 0), 5);        // Rectangle border (black pen)
+    e.CheckPixel(kCheckDc, 5, 30, RGB16(0, 255, 0), 6);       // PatBlt
+    e.CheckPixel(kCheckDc, 40, 30, RGB16(255, 255, 0), 7);    // SetPixel
+    e.CheckPixel(kCheckDc, 49, 33, RGB16(0, 0, 0), 8);        // BitBlt: black square
+    e.CheckPixel(kCheckDc, 53, 33, RGB16(255, 255, 255), 9);  //         white square
+    e.CheckPixel(kCheckDc, 41, 41, RGB16(255, 255, 255), 10); // StretchBlt: src x 4 -> dst 41
+    e.CheckPixel(kCheckDc, 60, 44, RGB16(0, 0, 0), 11);       // untouched: background brush
+    e.Mem(kHwnd);
+    e.Mem(kCheckDc);
+    e.Call(Emit::USER, 68);  // ReleaseDC
+    // The blue brush was selected into the paint DC; EndPaint restored the
+    // DC, so it's no longer selected and can be deleted.
+    e.Mem(kBlue);
+    e.Call(Emit::GDI, 69);  // DeleteObject
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 12);
+
+    // Close, and pump until WM_QUIT (the pump presents what was painted).
+    e.Mem(kHwnd);
+    e.Imm(0x10);  // WM_CLOSE
+    e.Imm(0);
+    e.Long(0);
+    e.Call(Emit::USER, 110);
+    a.Label("loop");
+    e.Far(kMsg);
+    e.Imm(0);
+    e.Imm(0);
+    e.Imm(0);
+    e.Call(Emit::USER, 108);  // GetMessage
+    a.db({0x85, 0xC0});
+    a.Short(JZ, "done");
+    e.Far(kMsg);
+    e.Call(Emit::USER, 114);  // DispatchMessage
+    a.Short(0xEB, "loop");
+    a.Label("done");
+    e.Exit0();
+    e.FailStubs(12);
+
+    // WndProc: [bp+14] hwnd, [bp+12] msg, [bp+10] wParam, [bp+8]:[bp+6] lParam
+    a.Label("WndProc");
+    a.db({0x55, 0x89, 0xE5, 0x8B, 0x46, 0x0C});  // push bp / mov bp,sp / mov ax,[bp+12]
+    a.db({0x3D, 0x0F, 0x00});                    // WM_PAINT?
+    a.Short(JZ, "wp_paint");
+    a.db({0x3D, 0x02, 0x00});                    // WM_DESTROY?
+    a.Short(JZ, "wp_destroy");
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);                     // DefWindowProc
+    a.Near(0xE9, "wp_done");
+    a.Label("wp_destroy");
+    e.Imm(0);
+    e.Call(Emit::USER, 6);                       // PostQuitMessage(0)
+    a.Near(0xE9, "wp_zero");
+
+    a.Label("wp_paint");
+    e.Arg(14); e.Far(kPs);
+    e.Call(Emit::USER, 39);                      // BeginPaint
+    e.StoreAx(kHdc);
+    e.Mem(kHdc); e.Far(kRedRect); e.Mem(kRed);
+    e.Call(Emit::USER, 81);                      // FillRect
+    e.Mem(kHdc); e.Mem(kBlue);
+    e.Call(Emit::GDI, 45);                       // SelectObject(blue brush)
+    e.Mem(kHdc); e.Imm(32); e.Imm(0); e.Imm(64); e.Imm(24);
+    e.Call(Emit::GDI, 27);                       // Rectangle
+    e.Mem(kHdc); e.Mem(kGreen);
+    e.Call(Emit::GDI, 45);                       // SelectObject(green brush)
+    e.Mem(kHdc); e.Imm(0); e.Imm(24); e.Imm(32); e.Imm(24); e.Long(kPatCopy);
+    e.Call(Emit::GDI, 29);                       // PatBlt
+    e.Mem(kHdc); e.Imm(40); e.Imm(30); e.Long(RGB16(255, 255, 0));
+    e.Call(Emit::GDI, 31);                       // SetPixel
+    // Off-screen: memory DC + compatible bitmap, checkerboard, then blit.
+    e.Mem(kHdc);
+    e.Call(Emit::GDI, 52);                       // CreateCompatibleDC
+    e.StoreAx(kMemDc);
+    e.Mem(kHdc); e.Imm(8); e.Imm(8);
+    e.Call(Emit::GDI, 51);                       // CreateCompatibleBitmap
+    e.StoreAx(kBmp);
+    e.Mem(kMemDc); e.Mem(kBmp);
+    e.Call(Emit::GDI, 45);                       // SelectObject -> old (default 1x1) bitmap
+    e.StoreAx(kOldBmp);
+    e.Mem(kMemDc); e.Imm(0); e.Imm(0); e.Imm(8); e.Imm(8); e.Long(kWhiteness);
+    e.Call(Emit::GDI, 29);
+    e.Mem(kMemDc); e.Imm(0); e.Imm(0); e.Imm(4); e.Imm(4); e.Long(kBlackness);
+    e.Call(Emit::GDI, 29);
+    e.Mem(kMemDc); e.Imm(4); e.Imm(4); e.Imm(4); e.Imm(4); e.Long(kBlackness);
+    e.Call(Emit::GDI, 29);
+    e.Mem(kHdc); e.Imm(48); e.Imm(32); e.Imm(8); e.Imm(8); e.Mem(kMemDc); e.Imm(0); e.Imm(0);
+    e.Long(kSrcCopy);
+    e.Call(Emit::GDI, 34);                       // BitBlt
+    e.Mem(kHdc); e.Imm(32); e.Imm(40); e.Imm(16); e.Imm(8); e.Mem(kMemDc); e.Imm(0); e.Imm(0);
+    e.Imm(8); e.Imm(8); e.Long(kSrcCopy);
+    e.Call(Emit::GDI, 35);                       // StretchBlt
+    e.Mem(kMemDc); e.Mem(kOldBmp);
+    e.Call(Emit::GDI, 45);                       // restore the default bitmap
+    e.Mem(kBmp);
+    e.Call(Emit::GDI, 69);                       // DeleteObject(bitmap)
+    e.Mem(kMemDc);
+    e.Call(Emit::GDI, 68);                       // DeleteDC
+    e.Arg(14); e.Far(kPs);
+    e.Call(Emit::USER, 40);                      // EndPaint
+    e.Set(kPainted, 1);
+    a.Label("wp_zero");
+    a.db({0x31, 0xC0, 0x31, 0xD2});
+    a.Label("wp_done");
+    a.db({0x5D, 0xCA, 0x0A, 0x00});              // pop bp / retf 10
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x200)};
+    return p;
+}
+
+// A PeekMessage game loop: `frames` times, dispatch pending messages, then
+// redraw through GetDC / PatBlt / ReleaseDC. Every pass through the pump is
+// a presentation, so the loop runs at the frame cap. Exit 0.
+inline NeProgram AnimationProgram(uint16_t frames) {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI"};
+    constexpr uint8_t kHinst = 0x00, kHwnd = 0x02, kCount = 0x04, kHdc = 0x06, kClass = 0x20,
+                      kTitle = 0x30, kWndClass = 0x40, kMsg = 0x60;
+    std::vector<uint8_t> data(0x80, 0);
+    const std::string cls = "AnimWin", title = "Anim";
+    std::copy(cls.begin(), cls.end(), data.begin() + kClass);
+    std::copy(title.begin(), title.end(), data.begin() + kTitle);
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    e.RegisterClass(kWndClass, kClass, kHinst, "WndProc", 4);
+    e.CreatePopup(kClass, kTitle, 0, 0, 32, 32, kHinst);
+    e.StoreAx(kHwnd);
+    e.Set(kCount, 0);
+
+    a.Label("frame");
+    a.Label("pump");
+    e.Far(kMsg); e.Imm(0); e.Imm(0); e.Imm(0); e.Imm(1);  // PM_REMOVE
+    e.Call(Emit::USER, 109);                              // PeekMessage
+    a.db({0x85, 0xC0});
+    a.Short(JZ, "draw");
+    e.Far(kMsg);
+    e.Call(Emit::USER, 114);                              // DispatchMessage
+    a.Short(0xEB, "pump");
+    a.Label("draw");
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);                               // GetDC
+    e.StoreAx(kHdc);
+    e.Mem(kHdc); e.Imm(0); e.Imm(0); e.Imm(32); e.Imm(32); e.Long(kWhiteness);
+    e.Call(Emit::GDI, 29);                                // PatBlt
+    e.Mem(kHwnd); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);                               // ReleaseDC
+    a.db({0xFF, 0x06, kCount, 0x00});                     // inc word [count]
+    a.db({0x81, 0x3E, kCount, 0x00}).dw(frames);         // cmp word [count], frames
+    a.Short(0x73, "done");                                // jae done
+    a.Near(0xE9, "frame");
+    a.Label("done");
+    e.Exit0();
+
+    a.Label("WndProc");  // everything to DefWindowProc
+    a.db({0x55, 0x89, 0xE5});
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);
+    a.db({0x5D, 0xCA, 0x0A, 0x00});
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x200)};
+    return p;
+}
+
 // Calls KERNEL.FatalExit(code).
 inline NeProgram FatalExitProgram(uint16_t exitCode) {
     NeProgram p = BaseProgram();
@@ -402,12 +700,12 @@ inline NeProgram HelloProgram() {
     return p;
 }
 
-// Calls an API the engine doesn't have yet (USER.39 = BeginPaint).
+// Calls an API the engine doesn't have yet (USER.10 = SetTimer).
 inline NeProgram UnimplementedApiProgram() {
     NeProgram p = BaseProgram();
     NeSeg code;
     Asm16 a;
-    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 39));
+    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 10));
     code.bytes = a.Finish();
     p.segments = {code, DataSegment({}, 0x100)};
     return p;

@@ -5,6 +5,7 @@
 #include <string>
 
 #include "../Check.h"
+#include "retro/FramePacing.h"
 #include "TestPrograms.h"
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
@@ -186,7 +187,7 @@ void TestImportsByName() {
 void TestUnimplementedApiStopsCleanly() {
     const RunOutcome o = RunProgram(UnimplementedApiProgram());
     CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
-    CHECK(o.exit.message == "USER.39 is not implemented yet");
+    CHECK(o.exit.message == "USER.10 is not implemented yet");
 }
 
 void TestFaultsAreReported() {
@@ -329,6 +330,105 @@ void TestFreedMemoryIsReused() {
     CHECK(mem.ArenaUsed() < 0x30000);
 }
 
+// --- GDI, painting, presentation ------------------------------------------------------------
+
+void TestPaintProgramRendersAndReadsBack() {
+    // The program checks its own pixels with GetPixel (exit code = failed check).
+    HeadlessHost host;
+    Runtime rt;
+    rt.SetFrameCap(0);
+    const TaskExit e = RunWithHost(PaintProgram(), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);
+
+    // What reached the host: the same picture, presented as a whole frame.
+    CHECK(host.presents >= 1);
+    const HeadlessHost::Frame& f = host.lastFrame;
+    CHECK(f.width == 64 && f.height == 48 && f.pixels.size() == 64u * 48u);
+    if (f.pixels.size() != 64u * 48u) return;
+    CHECK(f.At(5, 5) == 0xFF0000);     // red (BGRA in memory, 00RRGGBB as a dword)
+    CHECK(f.At(48, 12) == 0x0000FF);   // blue
+    CHECK(f.At(32, 12) == 0x000000);   // rectangle border
+    CHECK(f.At(5, 30) == 0x00FF00);    // green
+    CHECK(f.At(40, 30) == 0xFFFF00);   // yellow pixel
+    CHECK(f.At(49, 33) == 0x000000 && f.At(53, 33) == 0xFFFFFF);  // BitBlt checkerboard
+    CHECK(f.At(41, 41) == 0xFFFFFF && f.At(33, 41) == 0x000000);  // StretchBlt, 2x wide
+    CHECK(f.At(60, 44) == 0x000000);   // background (BLACK_BRUSH)
+}
+
+void TestGdiHandleMapping() {
+    Runtime rt;
+    Gdi& g = rt.Graphics();
+    const uint16_t dc = g.CreateCompatibleDc(0);
+    const uint16_t bmp = g.CreateCompatibleBitmap(dc, 4, 4);
+    CHECK(dc && bmp && g.HostDc(dc) && g.HostObject(bmp, Gdi::Kind::Bitmap));
+    CHECK(!g.HostObject(bmp, Gdi::Kind::Brush));  // handles are typed
+
+    // Selecting returns the DC's default bitmap, which the host created: it
+    // gets a 16-bit handle of its own; selecting it back returns ours.
+    const uint16_t original = g.Select(dc, bmp);
+    CHECK(original != 0 && original != bmp);
+    CHECK(g.HandleForHost(g.HostObject(original, Gdi::Kind::Bitmap)) == original);
+    CHECK(!g.Delete(bmp));                       // still selected: refused, like Windows
+    CHECK(g.Select(dc, original) == bmp);        // bidirectional
+    CHECK(g.Delete(bmp));
+    CHECK(!g.HostObject(bmp, Gdi::Kind::Bitmap));
+
+    // Stock objects keep one handle, and deleting them is a harmless no-op.
+    const uint16_t white = g.StockObject(0);
+    CHECK(white && g.StockObject(0) == white && g.Delete(white) && g.StockObject(0) == white);
+    CHECK(g.HostBrush(6) != nullptr);            // COLOR_WINDOW + 1 system brush
+    CHECK(g.DeleteDc(dc) && !g.HostDc(dc));
+}
+
+void TestPaintLifecycle() {
+    // WM_PAINT only while something is invalid; BeginPaint validates it.
+    HeadlessHost host;
+    Runtime rt;
+    rt.SetFrameCap(0);
+    std::string error;
+    rt.SetWindowHost(&host);
+    CHECK(rt.Load(BuildNe(WindowProgram(true)), "", error));
+    rt.Run(1'000'000);  // blocks in GetMessage with its window alive (headless)
+    User& u = rt.Windows();
+    const uint16_t hwnd = u.HwndForHost(1);
+    CHECK(hwnd && u.Find(hwnd)->update.Empty());  // the WM_PAINT was handled (by DefWindowProc)
+    const Rect16 r{2, 3, 10, 12};
+    u.Invalidate(hwnd, &r, true);
+    const Rect16 r2{50, 50, 400, 400};            // clipped to the 320x200 client
+    u.Invalidate(hwnd, &r2, false);
+    const Rect16& upd = u.Find(hwnd)->update;
+    CHECK(upd.left == 2 && upd.top == 3 && upd.right == 320 && upd.bottom == 200);
+    Msg16 m;
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Message && m.message == wm::Paint);
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Message);  // still invalid: again
+    u.Validate(hwnd, nullptr);
+    CHECK(u.Next(m, 0, 0, 0, true, false) == User::Fetch::Empty);
+}
+
+double RunTimed(const NeProgram& program, uint32_t fps, HeadlessHost& host) {
+    Runtime rt;
+    rt.SetFrameCap(fps);
+    const int64_t start = retro::QpcNow();
+    const TaskExit e = RunWithHost(program, host, rt);
+    const double seconds = double(retro::QpcNow() - start) / double(retro::QpcFrequency());
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);
+    return seconds;
+}
+
+void TestAnimationIsPaced() {
+    constexpr uint16_t kFrames = 20;
+    HeadlessHost paced;
+    const double t60 = RunTimed(AnimationProgram(kFrames), 60, paced);
+    std::printf("  %u frames at 60 fps: %.1f ms, %u presents\n", kFrames, t60 * 1000, paced.presents);
+    CHECK(paced.presents >= kFrames - 1);
+    CHECK(t60 >= (kFrames - 2) / 60.0 * 0.99 && t60 < (kFrames + 1) / 60.0 * 1.5);
+
+    HeadlessHost unpaced;
+    const double t0 = RunTimed(AnimationProgram(kFrames), 0, unpaced);
+    std::printf("  %u frames unpaced: %.1f ms, %u presents\n", kFrames, t0 * 1000, unpaced.presents);
+    CHECK(unpaced.presents >= kFrames - 1 && t0 < 0.15);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -362,6 +462,10 @@ int main() {
         {"FaultInsideCallbackIsReported", TestFaultInsideCallbackIsReported},
         {"GlobalHeap", TestGlobalHeap},
         {"FreedMemoryIsReused", TestFreedMemoryIsReused},
+        {"PaintProgramRendersAndReadsBack", TestPaintProgramRendersAndReadsBack},
+        {"GdiHandleMapping", TestGdiHandleMapping},
+        {"PaintLifecycle", TestPaintLifecycle},
+        {"AnimationIsPaced", TestAnimationIsPaced},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

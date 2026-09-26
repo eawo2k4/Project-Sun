@@ -22,6 +22,7 @@
 
 #include "win16/Api.h"
 #include "win16/Cpu.h"
+#include "win16/Gdi.h"
 #include "win16/Kernel.h"
 #include "win16/Memory.h"
 #include "win16/NeImage.h"
@@ -59,6 +60,8 @@ public:
     void SetOutput(Output output) { output_ = std::move(output); }
     // Where top-level windows appear (default: headless, no real windows).
     void SetWindowHost(WindowHost* host) { user_->SetHost(host); }
+    // Frames presented per second at most (0 = unpaced). Default 60.
+    void SetFrameCap(uint32_t fps) { gdi_->SetFrameCap(fps); }
 
     bool Load(const std::vector<uint8_t>& file, const std::string& commandLine, std::string& error);
     TaskExit Run(uint64_t budget = std::numeric_limits<uint64_t>::max());
@@ -69,6 +72,7 @@ public:
     const LoadedModule& Module() const { return module_; }
     GlobalHeap& Globals() { return globals_; }
     User& Windows() { return *user_; }
+    Gdi& Graphics() { return *gdi_; }
 
     // Used by the built-in API implementations.
     void Exit(TaskExit::Kind kind, uint16_t code, const std::string& message);
@@ -111,6 +115,7 @@ private:
     Cpu cpu_;
     GlobalHeap globals_;
     std::unique_ptr<User> user_;
+    std::unique_ptr<Gdi> gdi_;  // after user_: destroyed first
     NeImage image_;
     LoadedModule module_;
     std::vector<BuiltinModule> builtins_;

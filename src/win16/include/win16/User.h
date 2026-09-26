@@ -25,8 +25,9 @@ namespace retro::win16 {
 class Runtime;
 
 namespace wm {
-constexpr uint16_t Create = 0x0001, Destroy = 0x0002, Move = 0x0003, Size = 0x0005, Close = 0x0010,
-                   Quit = 0x0012, ShowWindow = 0x0018, NcCreate = 0x0081, NcDestroy = 0x0082,
+constexpr uint16_t Create = 0x0001, Destroy = 0x0002, Move = 0x0003, Size = 0x0005, Paint = 0x000F,
+                   Close = 0x0010, Quit = 0x0012, EraseBkgnd = 0x0014, ShowWindow = 0x0018,
+                   NcCreate = 0x0081, NcDestroy = 0x0082,
                    KeyDown = 0x0100, KeyUp = 0x0101, Char = 0x0102, MouseMove = 0x0200,
                    LButtonDown = 0x0201, LButtonUp = 0x0202, RButtonDown = 0x0204,
                    RButtonUp = 0x0205, User = 0x0400;
@@ -39,6 +40,11 @@ constexpr uint32_t Popup = 0x80000000, Child = 0x40000000, Visible = 0x10000000;
 constexpr int16_t kScreenWidth = 640;  // the 16-bit desktop (VGA)
 constexpr int16_t kScreenHeight = 480;
 constexpr int16_t kUseDefault = -32768;  // CW_USEDEFAULT (8000h)
+
+struct Rect16 {
+    int16_t left = 0, top = 0, right = 0, bottom = 0;
+    bool Empty() const { return right <= left || bottom <= top; }
+};
 
 struct Msg16 {
     uint16_t hwnd = 0;
@@ -66,6 +72,9 @@ public:
     virtual uint64_t Create(const WindowInfo& info) = 0;  // 0 = failed
     virtual void Show(uint64_t window, bool show) = 0;
     virtual void Destroy(uint64_t window) = 0;
+    // A new frame of the window's content: 32-bit BGRA, top-down, width x
+    // height (the 16-bit window size). The host scales it onto the screen.
+    virtual void Present(uint64_t window, const uint32_t* pixels, int width, int height) = 0;
     // Delivers pending host input as 16-bit messages. With `wait`, blocks until
     // something arrives; returns false if nothing ever can (so waiting would
     // hang the task).
@@ -88,13 +97,23 @@ public:
         uint32_t lParam;
     };
 
+    struct Frame {
+        uint64_t window = 0;
+        int width = 0, height = 0;
+        std::vector<uint32_t> pixels;
+        uint32_t At(int x, int y) const { return pixels[size_t(y) * width + x] & 0x00FFFFFF; }
+    };
+
     uint64_t Create(const WindowInfo& info) override;
     void Show(uint64_t window, bool show) override;
     void Destroy(uint64_t window) override;
+    void Present(uint64_t window, const uint32_t* pixels, int width, int height) override;
     bool Pump(const Deliver& deliver, bool wait) override;
 
     std::vector<Record> windows;
     std::deque<Event> events;  // delivered on the next Pump
+    Frame lastFrame;           // the most recent Present
+    uint32_t presents = 0;
 };
 
 class User {
@@ -118,6 +137,8 @@ public:
         bool visible = false;
         bool destroying = false;
         uint64_t host = 0;  // host window (top-level windows only)
+        Rect16 update;      // invalid area (bounding box); empty = nothing to paint
+        bool erase = false; // WM_ERASEBKGND due at the next BeginPaint
     };
     struct CreateParams {
         uint32_t exStyle = 0;
@@ -149,6 +170,15 @@ public:
     void PostQuit(uint16_t exitCode);
     Fetch Next(Msg16& out, uint16_t hwndFilter, uint16_t minMsg, uint16_t maxMsg, bool remove,
                bool wait);
+
+    // Painting. `rect` null = the whole client area.
+    void Invalidate(uint16_t hwnd, const Rect16* rect, bool erase);
+    void Validate(uint16_t hwnd, const Rect16* rect);
+    bool Update(uint16_t hwnd);  // UpdateWindow: WM_PAINT now if anything is invalid
+    // BeginPaint fills the PAINTSTRUCT at sel:off and returns the window DC.
+    uint16_t BeginPaint(uint16_t hwnd, uint16_t sel, uint16_t off);
+    bool EndPaint(uint16_t hwnd, uint16_t sel, uint16_t off);
+    Rect16 ClientRect(uint16_t hwnd) const;
 
     const Window* Find(uint16_t hwnd) const;
     const WindowClass* FindClass(const std::string& name) const;

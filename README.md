@@ -32,7 +32,7 @@ Project Sun/
 │  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
 │  │  ├─ Kernel.cpp                KERNEL: task start/exit, version, DOS3Call, global heap
 │  │  ├─ User.cpp                  USER: classes, windows, message queue, WndProc callbacks
-│  │  ├─ Gdi.cpp                   GDI: stock objects (drawing comes with painting)
+│  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, back buffers, presentation
 │  │  └─ Runtime.cpp               Win16 task: builtin DLL dispatch, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
@@ -104,7 +104,11 @@ Project Sun/
     `PostQuitMessage`, `GetSystemMetrics` (a 640×480 screen), `GetTickCount`,
     `LoadIcon`/`LoadCursor` (placeholder handles), `InitApp`, `MessageBox`
     (printed to the console).
-  - GDI: `GetStockObject` (placeholder handles).
+  - USER painting: `BeginPaint`/`EndPaint` (real `PAINTSTRUCT`), `GetDC`/`ReleaseDC`,
+    `InvalidateRect`/`ValidateRect`, `GetClientRect`, `FillRect`.
+  - GDI: `CreateCompatibleDC`, `DeleteDC`, `CreateBitmap`, `CreateCompatibleBitmap`,
+    `CreateSolidBrush`, `CreatePen`, `SelectObject`, `DeleteObject`, `GetStockObject`,
+    `BitBlt`, `StretchBlt`, `PatBlt`, `Rectangle`, `SetPixel`, `GetPixel`.
 - **Global heap:** each `GlobalAlloc` block is its own LDT segment. As in protected-mode
   Windows 3.x, a fixed block's handle is its selector, and a moveable block's handle is
   the selector with bit 0 cleared.
@@ -124,6 +128,24 @@ Project Sun/
   the trap, then restores the caller's registers and returns `DX:AX`. Callbacks nest
   (a WndProc can send messages, create or destroy windows). A fault, exit or budget
   stop inside one unwinds cleanly.
+- **GDI and painting:**
+  - Every 16-bit GDI handle wraps a host (Win32) GDI object, through a bidirectional map.
+    That lets `SelectObject` return a proper 16-bit handle even for objects the host made,
+    such as a new DC's default bitmap. Win16 and Win32 share ROP codes, COLORREFs and
+    bitmap row padding.
+  - Win16 rules that modern GDI relaxes are enforced by the engine, for example "an object
+    selected into a DC can't be deleted".
+  - Each top-level window has a 32-bit back buffer at its 16-bit size. `GetDC` and
+    `BeginPaint` draw into it; each call saves the DC state, and `ReleaseDC`/`EndPaint`
+    restore it.
+  - Windows keep an update region. `WM_PAINT` is generated when nothing else is queued
+    and stays pending until validated. `BeginPaint` clips to the region and sends
+    `WM_ERASEBKGND`, which `DefWindowProc` answers with the class brush.
+- **Presentation:** the message pump is the frame boundary. Back buffers drawn since the
+  last call are paced with the same `FrameScheduler` as the display sandbox (`--fps-cap`,
+  default 60), then handed to the host. The host scales each one onto the screen with a
+  single nearest-neighbour blit into the integer-scaled viewport, so there's no tearing.
+  A `PeekMessage` game loop therefore runs at the cap.
 - **Interrupts:** INT 21h (exit, version, console output, drive, PSP), INT 20h, and
   INT 31h DPMI queries (segment base, version).
 
@@ -132,8 +154,9 @@ the program exits with it), or 6 if the task stopped on a fault, an unimplemente
 while waiting for input that can never arrive. `--hidden` creates a 16-bit program's host
 windows without showing them; the tests use it.
 
-Not yet: painting (`BeginPaint`, drawing through GDI; windows show black), non-client
-areas (a 16-bit window is all client area), child controls and system classes
+Not yet: text and fonts (`TextOut`), lines and other shapes, regions, palettes (8-bit
+games), mapping modes, non-client areas (a 16-bit window is all client area), child
+windows (they get no back buffer), child controls and system classes
 (`BUTTON`, `EDIT`, …), timers, other NE DLLs, resources, huge (> 64 KB) global blocks,
 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), x87 / WIN87EM,
 and iterated segments.
