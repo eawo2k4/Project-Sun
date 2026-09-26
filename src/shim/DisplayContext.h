@@ -60,7 +60,17 @@ struct ManagedView {
     DPI_AWARENESS_CONTEXT dpi = nullptr;
 
     ViewportMap Map() const { return {viewport, virt}; }
+
+    // The viewport relative to the client area (for drawing into a client DC).
+    Rect ClientViewport() const {
+        return {viewport.left - client.left, viewport.top - client.top,
+                viewport.right - client.left, viewport.bottom - client.top};
+    }
 };
+
+// Paints the client area outside the viewport (letterbox/pillarbox bars) black.
+// For presenters that draw only the viewport (DirectDraw, Direct3D).
+void FillLetterbox(HDC hdc, const ManagedView& view);
 
 void Configure(const ShimConfig& config);
 bool Windowed();

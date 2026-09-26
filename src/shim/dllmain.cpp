@@ -13,7 +13,9 @@
 #include <cstring>
 
 #include "Log.h"
+#include "Pacing.h"
 #include "ShimState.h"
+#include "gfx/Graphics.h"
 #include "hooks/Hooks.h"
 #include "retro/PathUtil.h"
 #include "retro/ShimProtocol.h"
@@ -39,6 +41,8 @@ HookModule g_modules[] = {
     {"display", ShimFeature_DisplaySandbox, AttachDisplayHooks, DetachDisplayHooks, false},
     {"render", ShimFeature_DisplaySandbox | ShimFeature_FrameLimiter, AttachRenderHooks,
      DetachRenderHooks, false},
+    {"graphics", ShimFeature_DisplaySandbox | ShimFeature_FrameLimiter, AttachGraphicsHooks,
+     DetachGraphicsHooks, false},
 };
 
 void LoadConfig() {
@@ -110,12 +114,20 @@ HMODULE Module() { return g_module; }
 // Diagnostic export (by name, see RetroShim.def): lets tools and the test
 // probe check a module really is active before relying on it, e.g. before
 // calling ChangeDisplaySettings on a real desktop.
+// "ddraw" and "d3d9" report whether that DLL's entry points are hooked.
 extern "C" BOOL WINAPI RetroShimIsModuleActive(const char* name) {
     if (!name) return FALSE;
     for (const auto& m : retro::shim::g_modules) {
         if (strcmp(m.name, name) == 0) return m.installed ? TRUE : FALSE;
     }
-    return FALSE;
+    return retro::shim::gfx::IsApiHooked(name) ? TRUE : FALSE;
+}
+
+// Diagnostic export: what the DirectDraw presenter last put on screen.
+extern "C" BOOL WINAPI RetroShimGetPresentStats(retro::PresentStats* stats) {
+    if (!stats || stats->cbSize < sizeof(retro::PresentStats)) return FALSE;
+    retro::shim::gfx::GetPresentStats(*stats);
+    return TRUE;
 }
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
@@ -135,6 +147,9 @@ BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
         LoadConfig();
         retro::log::Open(g_config.logPath);
         LogStartup();
+        // One pacer for every presentation path (GDI, DirectDraw, Direct3D).
+        pacing::Configure((g_config.features & retro::ShimFeature_FrameLimiter) ? g_config.fpsCap
+                                                                                 : 0);
         InstallHooks();
         break;
 

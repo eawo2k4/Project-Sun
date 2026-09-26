@@ -17,13 +17,19 @@ int64_t FrameScheduler::NextPresentTime(int64_t now) {
         // slow scene): present immediately and restart the cadence from here.
         started_ = true;
         next_ = now + period_;
+        lastPresent_ = now;
         return now;
     }
     // On time or early: wait for the slot. Up to one frame late: present now but
     // keep the original cadence, so the average rate stays exact.
     const int64_t presentAt = std::max(now, next_);
     next_ += period_;
+    lastPresent_ = presentAt;
     return presentAt;
+}
+
+bool FrameScheduler::PresentedRecently(int64_t now) const {
+    return period_ > 0 && started_ && now - lastPresent_ < period_ / 2;
 }
 
 bool IsFramePresent(int32_t blitW, int32_t blitH, int32_t targetW, int32_t targetH) {

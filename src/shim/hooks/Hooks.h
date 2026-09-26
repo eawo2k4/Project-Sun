@@ -25,6 +25,9 @@ LONG DetachDisplayHooks();
 LONG AttachRenderHooks();   // DC scaling + presentation frame pacing
 LONG DetachRenderHooks();
 
+LONG AttachGraphicsHooks(); // DirectDraw / Direct3D 9 (gfx/), hooked as their DLLs load
+LONG DetachGraphicsHooks();
+
 // Type-checked wrappers: `hook` must have exactly the signature (including
 // calling convention) of the function `real` points at.
 template <class Fn>
