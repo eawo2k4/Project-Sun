@@ -23,6 +23,8 @@ int main(int argc, char** argv) {
         {"win16_hello.exe", win16test::HelloProgram()},
         {"win16_fatalexit.exe", win16test::FatalExitProgram(7)},
         {"win16_unimplemented.exe", win16test::UnimplementedApiProgram()},
+        {"win16_window.exe", win16test::WindowProgram(false)},
+        {"win16_fullscreen.exe", win16test::WindowProgram(false, true)},
     };
     for (const auto& s : samples) {
         const std::vector<uint8_t> bytes = win16test::BuildNe(s.program);

@@ -43,6 +43,12 @@ public:
         fixups_.push_back({Here() - 2u, label, 2});
         return *this;
     }
+    // A 16-bit immediate holding the offset of `label` (e.g. a callback's address).
+    Asm16& Abs16(const std::string& label) {
+        db({0, 0});
+        fixups_.push_back({Here() - 2u, label, 0});
+        return *this;
+    }
     // CALL FAR ptr16:16 with an empty relocation chain (offset FFFF ends it).
     // Returns the offset of the pointer, for the relocation record.
     uint16_t CallFar() {
@@ -57,6 +63,11 @@ public:
         for (const Fixup& f : fixups_) {
             const auto it = labels_.find(f.label);
             if (it == labels_.end()) throw std::runtime_error("undefined label " + f.label);
+            if (f.size == 0) {  // absolute offset
+                out[f.at] = static_cast<uint8_t>(it->second);
+                out[f.at + 1] = static_cast<uint8_t>(it->second >> 8);
+                continue;
+            }
             const int rel = int(it->second) - int(f.at + f.size);
             if (f.size == 1) {
                 if (rel < -128 || rel > 127) throw std::runtime_error("short jump out of range: " + f.label);

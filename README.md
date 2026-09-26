@@ -30,11 +30,14 @@ Project Sun/
 │  │  ├─ NeLoader.cpp              selectors per segment, fixup chains, PSP, initial registers
 │  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset
 │  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
-│  │  └─ Runtime.cpp               Win16 task: built-in KERNEL/USER/GDI, INT 21h / 31h
+│  │  ├─ Kernel.cpp                KERNEL: task start/exit, version, DOS3Call, global heap
+│  │  ├─ User.cpp                  USER: classes, windows, message queue, WndProc callbacks
+│  │  ├─ Gdi.cpp                   GDI: stock objects (drawing comes with painting)
+│  │  └─ Runtime.cpp               Win16 task: builtin DLL dispatch, INT 21h / 31h
 │  ├─ launcher/            RetroLaunch.exe
 │  │  ├─ main.cpp                  CLI, inspection, launch-path routing
 │  │  ├─ ProcessLauncher.{h,cpp}   Detours create-suspended + inject + payload + resume
-│  │  └─ Win16Host.{h,cpp}         runs NE programs on the Win16 engine
+│  │  └─ Win16Host.{h,cpp}         runs NE programs on the Win16 engine, real host windows
 │  └─ shim/                RetroShim.dll (injected)
 │     ├─ dllmain.cpp               attach/detach, config load, per-module transactions
 │     ├─ ShimState.h               config + module handle for hook modules
@@ -88,21 +91,52 @@ Project Sun/
 - **CPU:** a 286-class interpreter covering the 8086/80186 integer instruction set
   with protected-mode segment loads. Faults stop the task with the exact `CS:IP`
   and cause.
-- **System DLLs:** KERNEL, USER and GDI are built in. Imports are resolved to
-  `module-selector:ordinal` on a *host* segment, so a far call runs the C++
-  implementation. Calling an API that isn't implemented yet stops the task with
-  e.g. `USER.41 is not implemented yet`, rather than crashing. Implemented so far:
-  KERNEL `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `WaitEvent`,
-  `DOS3Call`; USER `InitApp`, `MessageBox` (printed to the console).
+- **System DLLs:** KERNEL, USER and GDI are built in (`Kernel.cpp`, `User.cpp`,
+  `Gdi.cpp`). Imports are resolved to `module-selector:ordinal` on a *host* segment,
+  so a far call runs the C++ implementation. Calling an API that isn't implemented
+  yet stops the task with e.g. `USER.39 is not implemented yet`, rather than
+  crashing. Implemented so far:
+  - KERNEL: `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `WaitEvent`,
+    `DOS3Call`, `GlobalAlloc`, `GlobalLock`, `GlobalUnlock`, `GlobalFree`, `GlobalSize`.
+  - USER: `RegisterClass`, `CreateWindow`/`CreateWindowEx`, `ShowWindow`,
+    `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `GetMessage`, `PeekMessage`,
+    `PostMessage`, `SendMessage`, `TranslateMessage`, `DispatchMessage`,
+    `PostQuitMessage`, `GetSystemMetrics` (a 640×480 screen), `GetTickCount`,
+    `LoadIcon`/`LoadCursor` (placeholder handles), `InitApp`, `MessageBox`
+    (printed to the console).
+  - GDI: `GetStockObject` (placeholder handles).
+- **Global heap:** each `GlobalAlloc` block is its own LDT segment. As in protected-mode
+  Windows 3.x, a fixed block's handle is its selector, and a moveable block's handle is
+  the selector with bit 0 cleared.
+- **Windows and messages:** window classes, `HWND16` handles and a posted-message queue
+  live in the engine. Every top-level window gets a real host window, with a
+  bidirectional `HWND16` ↔ host map. `RetroLaunch` lays these out with the same
+  `DisplayMath` as the display sandbox: a window covering the 640×480 16-bit screen
+  becomes borderless fullscreen with the screen integer-scaled; others become captioned
+  windows scaled by a whole number. Closing, keys and mouse come back as 16-bit
+  messages, in the 16-bit window's coordinates. `WM_QUIT` is retrieved only after
+  everything else, as in Windows.
+- **Callbacks:** `SendMessage`, `DispatchMessage` and `CreateWindow` (`WM_NCCREATE`/
+  `WM_CREATE` with a real `CREATESTRUCT`, then `WM_SIZE`/`WM_MOVE`) call the 16-bit
+  window procedure on the interpreter. `Cpu::CallFar` pushes the Pascal arguments and
+  a return address into a private trap segment, sets DS = AX = the instance's DGROUP
+  (what exported-callback prologues expect), runs until the procedure's `RETF` hits
+  the trap, then restores the caller's registers and returns `DX:AX`. Callbacks nest
+  (a WndProc can send messages, create or destroy windows). A fault, exit or budget
+  stop inside one unwinds cleanly.
 - **Interrupts:** INT 21h (exit, version, console output, drive, PSP), INT 20h, and
   INT 31h DPMI queries (segment base, version).
 
-Launcher exit code: the program's own (INT 21h/4Ch, `FatalExit`), or 6 if the task
-stopped on a fault or an unimplemented API.
+Launcher exit code: the program's own (INT 21h/4Ch, `FatalExit`, the `WM_QUIT` code if
+the program exits with it), or 6 if the task stopped on a fault, an unimplemented API, or
+while waiting for input that can never arrive. `--hidden` creates a 16-bit program's host
+windows without showing them; the tests use it.
 
-Not yet: windows and message loops (most of USER/GDI), other NE DLLs, resources,
-386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), x87 /
-WIN87EM, `GlobalAlloc` and friends, and iterated segments.
+Not yet: painting (`BeginPaint`, drawing through GDI; windows show black), non-client
+areas (a 16-bit window is all client area), child controls and system classes
+(`BUTTON`, `EDIT`, …), timers, other NE DLLs, resources, huge (> 64 KB) global blocks,
+386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), x87 / WIN87EM,
+and iterated segments.
 
 ## Shim modules
 
@@ -199,6 +233,7 @@ side by side, with shim logs in `logs/`.
 RetroLaunch [options] <program.exe> [program arguments...]
   --inspect        Print executable header info and exit
   --wait           Wait for exit and return the program's exit code
+  --hidden         16-bit programs: create their windows but never show them
   --no-shim        Launch without injection (baseline comparison)
   --shim <path>    Shim DLL (default: RetroShim.dll beside RetroLaunch)
   --cwd <dir>      Working directory (default: the program's folder)
@@ -224,5 +259,5 @@ RetroLaunch [options] <program.exe> [program arguments...]
   Its licence is in [third_party/d3d8to9/LICENSE.md](third_party/d3d8to9/LICENSE.md).
 
 Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure,
-6 Win16 task stopped (fault or unimplemented API). With `--wait`, and always for
+6 Win16 task stopped (fault, unimplemented API, or blocked waiting for input). With `--wait`, and always for
 16-bit programs, the launcher returns the program's own exit code.

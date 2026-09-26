@@ -27,6 +27,10 @@ std::string Hex(unsigned v, int digits) {
 
 }  // namespace
 
+Cpu::Cpu(Memory& memory) : mem_(memory) {
+    returnTrap_ = mem_.Allocate(0x10000, SegmentKind::Host);
+}
+
 void Cpu::MapHostSegment(uint16_t selector, HostHandler handler) {
     host_.push_back({selector, std::move(handler)});
 }
@@ -50,45 +54,86 @@ void Cpu::LoadSegment(SegReg reg, uint16_t selector) {
 
 RunResult Cpu::Run(uint64_t budget) {
     stop_ = false;
-    for (uint64_t n = 0; n < budget; ++n) {
-        if (stop_) return RunResult::Stopped;
-
-        // Control arrived in a host segment: run the C++ routine for it.
-        const auto host = std::find_if(host_.begin(), host_.end(),
-                                       [&](const HostSegment& h) { return h.selector == regs_.s[CS]; });
-        if (host != host_.end()) {
-            const uint16_t cs = regs_.s[CS], ip = regs_.ip;
-            try {
-                host->handler(*this, ip);
-            } catch (const CpuException& e) {
-                fault_ = {e.kind, cs, ip, e.detail};
-                return RunResult::Faulted;
-            } catch (const ProtectionFault& e) {
-                fault_ = {FaultKind::GeneralProtection, cs, ip, e.what()};
-                return RunResult::Faulted;
-            }
-            if (!stop_ && regs_.s[CS] == cs && regs_.ip == ip) {
-                fault_ = {FaultKind::HostError, cs, ip, "host routine did not return"};
-                return RunResult::Faulted;
-            }
-            continue;
+    budget_ = budget;
+    try {
+        while (!stop_) {
+            if (budget_ == 0) return RunResult::BudgetExhausted;
+            Tick();
         }
-
-        startIp_ = regs_.ip;
-        try {
-            Step();
-        } catch (const ProtectionFault& e) {
-            regs_.ip = startIp_;
-            fault_ = {FaultKind::GeneralProtection, regs_.s[CS], startIp_, e.what()};
-            return RunResult::Faulted;
-        } catch (const CpuException& e) {
-            regs_.ip = startIp_;
-            fault_ = {e.kind, regs_.s[CS], startIp_, e.detail};
-            return RunResult::Faulted;
-        }
-        ++instructions_;
+    } catch (const Unwind& u) {
+        callDepth_ = 0;
+        returnedDepth_ = 0;
+        return u.result;
     }
-    return stop_ ? RunResult::Stopped : RunResult::BudgetExhausted;
+    return RunResult::Stopped;
+}
+
+void Cpu::Tick() {
+    // A callback returned to CallFar's trap: nothing to execute here.
+    if (regs_.s[CS] == returnTrap_) {
+        returnedDepth_ = regs_.ip;
+        return;
+    }
+
+    // Control arrived in a host segment: run the C++ routine for it.
+    const auto host = std::find_if(host_.begin(), host_.end(),
+                                   [&](const HostSegment& h) { return h.selector == regs_.s[CS]; });
+    if (host != host_.end()) {
+        const uint16_t cs = regs_.s[CS], ip = regs_.ip;
+        try {
+            host->handler(*this, ip);
+        } catch (const CpuException& e) {
+            fault_ = {e.kind, cs, ip, e.detail};
+            throw Unwind{RunResult::Faulted};
+        } catch (const ProtectionFault& e) {
+            fault_ = {FaultKind::GeneralProtection, cs, ip, e.what()};
+            throw Unwind{RunResult::Faulted};
+        }
+        if (!stop_ && regs_.s[CS] == cs && regs_.ip == ip) {
+            fault_ = {FaultKind::HostError, cs, ip, "host routine did not return"};
+            throw Unwind{RunResult::Faulted};
+        }
+        return;
+    }
+
+    startIp_ = regs_.ip;
+    try {
+        Step();
+    } catch (const ProtectionFault& e) {
+        regs_.ip = startIp_;
+        fault_ = {FaultKind::GeneralProtection, regs_.s[CS], startIp_, e.what()};
+        throw Unwind{RunResult::Faulted};
+    } catch (const CpuException& e) {
+        regs_.ip = startIp_;
+        fault_ = {e.kind, regs_.s[CS], startIp_, e.detail};
+        throw Unwind{RunResult::Faulted};
+    }
+    ++instructions_;
+    --budget_;
+}
+
+uint32_t Cpu::CallFar(uint16_t selector, uint16_t offset, std::initializer_list<uint16_t> args,
+                      uint16_t ds) {
+    const Registers saved = regs_;
+    for (uint16_t w : args) Push(w);
+    const int depth = ++callDepth_;
+    Push(returnTrap_);
+    Push(uint16_t(depth));  // the trap reads the depth back from IP
+    LoadSegment(DS, ds);
+    regs_.r[AX] = ds;
+    FarJump(selector, offset);
+
+    while (returnedDepth_ != depth) {
+        if (stop_) throw Unwind{RunResult::Stopped};  // task exited inside the callback
+        if (budget_ == 0) throw Unwind{RunResult::BudgetExhausted};
+        Tick();
+    }
+    returnedDepth_ = 0;
+    --callDepth_;
+
+    const uint32_t result = regs_.r[AX] | (uint32_t(regs_.r[DX]) << 16);
+    regs_ = saved;
+    return result;
 }
 
 void Cpu::Throw(FaultKind kind, const std::string& detail) { throw CpuException{kind, detail}; }

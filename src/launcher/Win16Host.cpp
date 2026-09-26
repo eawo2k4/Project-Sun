@@ -1,23 +1,223 @@
 #include "Win16Host.h"
 
+#include <windows.h>
+
 #include <cstdio>
 #include <fstream>
 #include <iterator>
+#include <string>
 #include <vector>
 
+#include "retro/DisplayMath.h"
+#include "retro/PathUtil.h"
 #include "win16/Runtime.h"
 
 namespace retro {
+namespace {
 
-int RunWin16Program(const std::filesystem::path& exe, const std::string& commandLine) {
+// Real windows for a Win16 task's top-level windows, laid out with the same
+// DisplayMath the display sandbox uses: a window covering the 16-bit screen
+// becomes borderless fullscreen with the 640x480 screen integer-scaled in the
+// middle of the monitor; any other window becomes a captioned window whose
+// client area is the 16-bit window integer-scaled. Input comes back in the
+// 16-bit window's coordinates.
+class Win32WindowHost : public win16::WindowHost {
+public:
+    explicit Win32WindowHost(bool hidden) : hidden_(hidden) {}
+
+    ~Win32WindowHost() override {
+        for (const Entry& e : windows_) DestroyWindow(e.hwnd);
+    }
+
+    uint64_t Create(const WindowInfo& info) override {
+        RegisterClassOnce();
+        const DPI_AWARENESS_CONTEXT previous =
+            SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        MONITORINFO mi{};
+        mi.cbSize = sizeof(mi);
+        GetMonitorInfoW(MonitorFromPoint({0, 0}, MONITOR_DEFAULTTOPRIMARY), &mi);
+        const Rect monitor{mi.rcMonitor.left, mi.rcMonitor.top, mi.rcMonitor.right, mi.rcMonitor.bottom};
+        const Rect work{mi.rcWork.left, mi.rcWork.top, mi.rcWork.right, mi.rcWork.bottom};
+
+        const Size virt = info.fullscreen ? Size{win16::kScreenWidth, win16::kScreenHeight}
+                                          : Size{info.width, info.height};
+        DWORD style;
+        WindowLayout layout;
+        if (info.fullscreen) {
+            style = WS_POPUP;
+            layout = PlanFullscreenLayout(virt, monitor, {});
+        } else {
+            style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+            RECT frame{0, 0, 0, 0};
+            AdjustWindowRectExForDpi(&frame, style, FALSE, 0, GetDpiForSystem());
+            layout = PlanWindowedLayout(virt, work, {-frame.left, -frame.top, frame.right, frame.bottom}, {});
+        }
+
+        const std::wstring title = Widen(info.title);
+        HWND hwnd = CreateWindowExW(0, kClassName, title.c_str(), style, layout.window.left,
+                                    layout.window.top, layout.window.Width(), layout.window.Height(),
+                                    nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+        SetThreadDpiAwarenessContext(previous);
+        if (!hwnd) return 0;
+
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        const Rect vp{layout.viewport.left - layout.client.left, layout.viewport.top - layout.client.top,
+                      layout.viewport.right - layout.client.left,
+                      layout.viewport.bottom - layout.client.top};
+        windows_.push_back({hwnd, info.hwnd16, ViewportMap(vp, virt), info.fullscreen});
+
+        const std::string scale = layout.integerScale ? "x" + std::to_string(layout.integerScale)
+                                                      : std::string("fractional");
+        std::printf("[win16] host window for HWND16 %04X \"%s\": %dx%d -> %dx%d (%s), %s%s\n",
+                    info.hwnd16, info.title.c_str(), virt.w, virt.h, layout.viewport.Width(),
+                    layout.viewport.Height(), scale.c_str(),
+                    info.fullscreen ? "borderless fullscreen" : "windowed", hidden_ ? ", hidden" : "");
+        std::fflush(stdout);
+        return reinterpret_cast<uint64_t>(hwnd);
+    }
+
+    void Show(uint64_t window, bool show) override {
+        Entry* e = Find(reinterpret_cast<HWND>(window));
+        if (!e || e->visible == show) return;
+        e->visible = show;
+        if (!hidden_) ShowWindow(e->hwnd, show ? SW_SHOW : SW_HIDE);
+    }
+
+    void Destroy(uint64_t window) override {
+        const HWND hwnd = reinterpret_cast<HWND>(window);
+        for (auto it = windows_.begin(); it != windows_.end(); ++it) {
+            if (it->hwnd == hwnd) {
+                windows_.erase(it);
+                break;
+            }
+        }
+        DestroyWindow(hwnd);
+    }
+
+    bool Pump(const Deliver& deliver, bool wait) override {
+        deliver_ = &deliver;
+        MSG msg;
+        bool delivered = false;
+        if (wait && !PeekMessageW(&msg, nullptr, 0, 0, PM_NOREMOVE)) {
+            // Only a user can produce input: with no visible window (or hidden
+            // mode) waiting would hang forever.
+            if (hidden_ || !AnyVisible()) {
+                deliver_ = nullptr;
+                return false;
+            }
+            if (GetMessageW(&msg, nullptr, 0, 0) > 0) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+                delivered = true;
+            }
+        }
+        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+            delivered = true;
+        }
+        deliver_ = nullptr;
+        (void)delivered;
+        return true;
+    }
+
+private:
+    static constexpr const wchar_t* kClassName = L"RetroWin16Window";
+
+    struct Entry {
+        HWND hwnd;
+        uint16_t hwnd16;
+        ViewportMap map;  // client coordinates <-> 16-bit window coordinates
+        bool fullscreen;
+        bool visible = false;
+    };
+
+    static std::wstring Widen(const std::string& s) {  // 16-bit strings are ANSI
+        if (s.empty()) return {};
+        const int n = MultiByteToWideChar(CP_ACP, 0, s.data(), int(s.size()), nullptr, 0);
+        std::wstring w(size_t(n), L'\0');
+        MultiByteToWideChar(CP_ACP, 0, s.data(), int(s.size()), w.data(), n);
+        return w;
+    }
+
+    static void RegisterClassOnce() {
+        static const ATOM atom = [] {
+            WNDCLASSEXW wc{};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = WndProc;
+            wc.hInstance = GetModuleHandleW(nullptr);
+            wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+            wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+            wc.lpszClassName = kClassName;
+            return RegisterClassExW(&wc);
+        }();
+        (void)atom;
+    }
+
+    Entry* Find(HWND hwnd) {
+        for (Entry& e : windows_) {
+            if (e.hwnd == hwnd) return &e;
+        }
+        return nullptr;
+    }
+
+    bool AnyVisible() const {
+        for (const Entry& e : windows_) {
+            if (e.visible) return true;
+        }
+        return false;
+    }
+
+    static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+        auto* self = reinterpret_cast<Win32WindowHost*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+        Entry* e = self ? self->Find(hwnd) : nullptr;
+        if (!e || !self->deliver_) return DefWindowProcW(hwnd, msg, wp, lp);
+        const Deliver& deliver = *self->deliver_;
+
+        switch (msg) {
+        case WM_CLOSE:  // the user closed it: the 16-bit program decides what happens
+            deliver(e->hwnd16, win16::wm::Close, 0, 0);
+            return 0;
+        case WM_KEYDOWN:
+        case WM_KEYUP:
+        case WM_CHAR:
+            deliver(e->hwnd16, uint16_t(msg), uint16_t(wp), uint32_t(lp));
+            return 0;
+        case WM_MOUSEMOVE:
+        case WM_LBUTTONDOWN:
+        case WM_LBUTTONUP:
+        case WM_RBUTTONDOWN:
+        case WM_RBUTTONUP: {
+            const Point p = e->map.ToVirtual({short(LOWORD(lp)), short(HIWORD(lp))});
+            deliver(e->hwnd16, uint16_t(msg), uint16_t(wp),
+                    uint32_t(uint16_t(p.x)) | (uint32_t(uint16_t(p.y)) << 16));
+            return 0;
+        }
+        default:
+            return DefWindowProcW(hwnd, msg, wp, lp);
+        }
+    }
+
+    bool hidden_;
+    const Deliver* deliver_ = nullptr;
+    std::vector<Entry> windows_;
+};
+
+}  // namespace
+
+int RunWin16Program(const std::filesystem::path& exe, const std::string& commandLine,
+                    const Win16Options& options) {
     std::ifstream in(exe, std::ios::binary);
     const std::vector<uint8_t> file{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
-    if (!in.good() && !in.eof()) {
+    if (file.empty()) {
         std::fputs("error: cannot read the program\n", stderr);
         return kWin16Stopped;
     }
 
+    Win32WindowHost host(options.hidden);
     win16::Runtime runtime;
+    runtime.SetWindowHost(&host);
     runtime.SetOutput([](const std::string& line) {
         std::printf("[win16] %s\n", line.c_str());
         std::fflush(stdout);

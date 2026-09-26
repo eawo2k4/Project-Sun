@@ -186,7 +186,7 @@ void TestImportsByName() {
 void TestUnimplementedApiStopsCleanly() {
     const RunOutcome o = RunProgram(UnimplementedApiProgram());
     CHECK(o.exit.kind == TaskExit::Kind::Unimplemented);
-    CHECK(o.exit.message == "USER.41 is not implemented yet");
+    CHECK(o.exit.message == "USER.39 is not implemented yet");
 }
 
 void TestFaultsAreReported() {
@@ -204,6 +204,111 @@ void TestMissingModuleFailsToLoad() {
     const RunOutcome o = RunProgram(MissingModuleProgram());
     CHECK(!o.loaded);
     CHECK(o.loadError.find("SHELL") != std::string::npos);
+}
+
+// --- Windowing, messages, callbacks, global heap ----------------------------------------------
+
+TaskExit RunWithHost(const NeProgram& program, HeadlessHost& host, Runtime& rt) {
+    rt.SetWindowHost(&host);
+    rt.SetOutput([](const std::string& line) { std::printf("  [win16] %s\n", line.c_str()); });
+    std::string error;
+    if (!rt.Load(BuildNe(program), "", error)) {
+        std::printf("  load failed: %s\n", error.c_str());
+        return {};
+    }
+    const TaskExit e = rt.Run(1'000'000);
+    std::printf("  -> %s code %u: %s (%llu instructions)\n", ToString(e.kind), e.code,
+                e.message.c_str(), static_cast<unsigned long long>(e.instructions));
+    return e;
+}
+
+void TestWindowProgramRunsToQuit() {
+    HeadlessHost host;
+    Runtime rt;
+    const TaskExit e = RunWithHost(WindowProgram(false), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);  // else: number of the failed check
+
+    // One top-level window reached the host, was shown, then destroyed.
+    CHECK(host.windows.size() == 1);
+    const HeadlessHost::Record& w = host.windows[0];
+    CHECK(w.info.title == "Win16 Window" && w.info.width == 320 && w.info.height == 200);
+    CHECK(!w.info.fullscreen && w.visible && w.destroyed);
+    CHECK(rt.Windows().WindowCount() == 0 && rt.Windows().HwndForHost(w.id) == 0);
+    CHECK(rt.Globals().Count() == 0);  // the block was freed
+}
+
+void TestHostCloseReachesWndProc() {
+    // The program doesn't close its window: the host does (user clicked X).
+    HeadlessHost host;
+    host.events.push_back({1, wm::Close, 0, 0});
+    Runtime rt;
+    const TaskExit e = RunWithHost(WindowProgram(true), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);
+    CHECK(host.windows.size() == 1 && host.windows[0].destroyed);
+}
+
+void TestHandleMappingWhileRunning() {
+    // No close event: the task blocks in GetMessage with its window alive.
+    HeadlessHost host;
+    Runtime rt;
+    const TaskExit e = RunWithHost(WindowProgram(true), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Blocked);
+    CHECK(e.message.find("GetMessage") != std::string::npos);
+
+    CHECK(host.windows.size() == 1);
+    const uint64_t hostId = host.windows[0].id;
+    const uint16_t hwnd = rt.Windows().HwndForHost(hostId);
+    CHECK(hwnd != 0 && rt.Windows().HostForHwnd(hwnd) == hostId);  // both directions
+    const User::Window* w = rt.Windows().Find(hwnd);
+    CHECK(w && w->className == "RETROWIN" && w->visible && w->cx == 320);
+    CHECK(rt.Windows().FindClass("RETROWIN") != nullptr);
+    CHECK(host.windows[0].info.hwnd16 == hwnd);
+}
+
+void TestFullscreenWindowIsFlagged() {
+    HeadlessHost host;
+    Runtime rt;
+    const TaskExit e = RunWithHost(WindowProgram(false, true), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Exited && e.code == 0);
+    CHECK(host.windows.size() == 1);
+    const HeadlessHost::Record& w = host.windows[0];
+    CHECK(w.info.fullscreen && w.info.width == 640 && w.info.height == 480 && w.visible);
+}
+
+void TestFaultInsideCallbackIsReported() {
+    // Divide by zero in the WndProc, during CreateWindow's WM_CREATE: the
+    // fault unwinds through the nested callback and is reported where it hit.
+    HeadlessHost host;
+    Runtime rt;
+    const TaskExit e = RunWithHost(WindowProgram(false, false, true), host, rt);
+    CHECK(e.kind == TaskExit::Kind::Fault);
+    CHECK(e.message.find("divide error") != std::string::npos);
+    CHECK(host.windows.empty());  // never got as far as the host window
+    CHECK(rt.Processor().CallbackDepth() == 0);
+}
+
+void TestGlobalHeap() {
+    Memory mem(1 << 20);
+    GlobalHeap heap(mem);
+    const uint16_t fixed = heap.Alloc(gmem::Fixed, 100);
+    const uint16_t moveable = heap.Alloc(gmem::Moveable | gmem::ZeroInit, 0x10000);
+    CHECK(fixed && (fixed & 1));                    // fixed: the selector itself
+    CHECK(moveable && !(moveable & 1));             // moveable: selector with bit 0 clear
+    CHECK(heap.Size(fixed) == 100 && heap.Size(moveable) == 0x10000);
+    CHECK(heap.Alloc(gmem::Fixed, 0x10001) == 0);   // huge blocks: not yet
+
+    const uint32_t far = heap.Lock(moveable);
+    const uint16_t sel = uint16_t(far >> 16);
+    CHECK((far & 0xFFFF) == 0 && sel == (moveable | 1) && mem.SegmentSize(sel) == 0x10000);
+    CHECK(heap.Lock(sel) == far);                   // the selector works as a handle too
+    CHECK(heap.LockCount(moveable) == 2);
+    CHECK(heap.Unlock(moveable) && !heap.Unlock(moveable));
+    CHECK(!heap.Unlock(moveable));                  // not locked any more
+
+    CHECK(heap.Free(moveable) == 0 && heap.Free(moveable) == moveable);  // second free fails
+    CHECK(mem.Lookup(sel) == nullptr);              // the selector is gone
+    CHECK(heap.Lock(0x1234) == 0);
+    CHECK(heap.Count() == 1);
 }
 
 void TestBudget() {
@@ -232,6 +337,12 @@ int main() {
         {"UnimplementedApiStopsCleanly", TestUnimplementedApiStopsCleanly},
         {"FaultsAreReported", TestFaultsAreReported},
         {"MissingModuleFailsToLoad", TestMissingModuleFailsToLoad},
+        {"WindowProgramRunsToQuit", TestWindowProgramRunsToQuit},
+        {"HostCloseReachesWndProc", TestHostCloseReachesWndProc},
+        {"HandleMappingWhileRunning", TestHandleMappingWhileRunning},
+        {"FullscreenWindowIsFlagged", TestFullscreenWindowIsFlagged},
+        {"FaultInsideCallbackIsReported", TestFaultInsideCallbackIsReported},
+        {"GlobalHeap", TestGlobalHeap},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

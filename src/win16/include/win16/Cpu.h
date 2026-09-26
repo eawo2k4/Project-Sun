@@ -18,6 +18,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <initializer_list>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,7 @@ public:
     using InterruptHandler = std::function<bool(Cpu&, uint8_t vector)>;
     using HostHandler = std::function<void(Cpu&, uint16_t ip)>;
 
-    explicit Cpu(Memory& memory) : mem_(memory) {}
+    explicit Cpu(Memory& memory);
 
     Registers& Regs() { return regs_; }
     const Registers& Regs() const { return regs_; }
@@ -100,7 +101,26 @@ public:
     // Raises a fault from a host routine (unimplemented API, bad argument...).
     [[noreturn]] void HostFault(const std::string& detail);
 
+    // Calls 16-bit code from a host routine (a window procedure from
+    // DispatchMessage, say) and returns its DX:AX. `args` are pushed in order,
+    // Pascal style (so the first is deepest); the callee removes them with
+    // RETF n. DS and AX are set to `ds` first, which is what the prologue of
+    // an exported Win16 callback expects. The caller's registers are restored
+    // afterwards. Faults, task exits and the budget inside the callback unwind
+    // out of the enclosing Run().
+    uint32_t CallFar(uint16_t selector, uint16_t offset, std::initializer_list<uint16_t> args,
+                     uint16_t ds);
+    int CallbackDepth() const { return callDepth_; }
+
 private:
+    // Thrown through host routines to end Run() from inside a nested CallFar.
+    struct Unwind {
+        RunResult result;
+    };
+
+    // One unit of work: a host dispatch or one instruction. Records fault_ and
+    // throws Unwind on a fault.
+    void Tick();
     struct ModRM {
         uint8_t mod = 0, reg = 0, rm = 0;
         uint8_t seg = DS;
@@ -155,7 +175,12 @@ private:
     uint16_t startIp_ = 0;
     bool stop_ = false;
     uint64_t instructions_ = 0;
+    uint64_t budget_ = 0;
     CpuFault fault_;
+
+    uint16_t returnTrap_ = 0;     // host selector CallFar returns through
+    int callDepth_ = 0;
+    int returnedDepth_ = 0;       // set when a RETF lands on the trap
 };
 
 }  // namespace retro::win16

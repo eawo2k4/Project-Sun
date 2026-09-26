@@ -35,6 +35,7 @@ struct Options {
     bool inspectOnly = false;
     bool noShim = false;
     bool wait = false;
+    bool hidden = false;
     uint32_t fpsCap = retro::kDefaultFpsCap;
     uint32_t diskCapMiB = retro::kDefaultDiskCapMiB;
     uint32_t memoryCapMiB = retro::kDefaultMemoryCapMiB;
@@ -51,6 +52,7 @@ void PrintUsage() {
         "Options:\n"
         "  --inspect         Print executable header info and exit\n"
         "  --wait            Wait for the program to exit and return its exit code\n"
+        "  --hidden          16-bit programs: create their windows but never show them\n"
         "  --no-shim         Launch without injecting RetroShim.dll (baseline)\n"
         "  --shim <path>     Shim DLL to inject (default: RetroShim.dll beside RetroLaunch)\n"
         "  --cwd <dir>       Working directory (default: the program's folder)\n"
@@ -104,6 +106,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
 
         if (a == L"--inspect") {
             opt.inspectOnly = true;
+        } else if (a == L"--hidden") {
+            opt.hidden = true;
         } else if (a == L"--wait") {
             opt.wait = true;
         } else if (a == L"--no-shim") {
@@ -235,7 +239,7 @@ int wmain(int argc, wchar_t** argv) {
         break;
     case retro::LaunchPath::Win16Engine:
         // 16-bit Windows: run in-process on the Win16 engine (no shim needed).
-        return retro::RunWin16Program(exe, ToUtf8(opt.arguments));
+        return retro::RunWin16Program(exe, ToUtf8(opt.arguments), {opt.hidden});
     case retro::LaunchPath::Unsupported:
     default:
         std::fprintf(stderr, "error: cannot launch: %s\n", reason.c_str());

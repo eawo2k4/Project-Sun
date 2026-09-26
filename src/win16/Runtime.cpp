@@ -28,79 +28,15 @@ const char* FaultName(FaultKind k) {
     }
 }
 
-// --- KERNEL ---------------------------------------------------------------------------------
-
-void FatalExit(Runtime& rt, Cpu& cpu) {
-    const uint16_t code = cpu.StackArg(0);
-    rt.Exit(TaskExit::Kind::FatalExit, code, "FatalExit(" + std::to_string(code) + ")");
-}
-
-void GetVersion(Runtime&, Cpu& cpu) {
-    cpu.Regs().r[AX] = 0x0A03;  // Windows 3.10 (major in AL, minor in AH)
-    cpu.Regs().r[DX] = 0x0500;  // MS-DOS 5.00
-    cpu.ReturnFar(0);
-}
-
-void WaitEvent(Runtime&, Cpu& cpu) {
-    cpu.Regs().r[AX] = 0;
-    cpu.ReturnFar(2);
-}
-
-// Register-based: the first call of every Win16 program's startup code.
-void InitTask(Runtime& rt, Cpu& cpu) {
-    Registers& r = cpu.Regs();
-    r.r[AX] = 1;  // success
-    r.r[BX] = 0x81;  // command line (in the PSP)
-    r.r[CX] = rt.Image().stackSize;
-    r.r[DX] = 1;  // nCmdShow = SW_SHOWNORMAL
-    r.r[SI] = 0;  // hPrevInstance
-    r.r[DI] = rt.Module().dgroup;  // hInstance
-    cpu.LoadSegment(ES, rt.Module().psp);
-    cpu.ReturnFar(0);
-}
-
-void Dos3Call(Runtime& rt, Cpu& cpu);  // below: INT 21h through a far call
-
-void FatalAppExit(Runtime& rt, Cpu& cpu) {
-    const std::string msg = rt.Mem().ReadString(cpu.StackArg(2), cpu.StackArg(0));
-    rt.Exit(TaskExit::Kind::FatalExit, 0, "FatalAppExit: " + msg);
-}
-
-// --- USER -----------------------------------------------------------------------------------
-
-void InitApp(Runtime&, Cpu& cpu) {
-    cpu.Regs().r[AX] = 1;
-    cpu.ReturnFar(2);
-}
-
-void MessageBox(Runtime& rt, Cpu& cpu) {
-    // Pascal: hwnd, text, caption, type -> type is nearest the return address.
-    const std::string caption = rt.Mem().ReadString(cpu.StackArg(4), cpu.StackArg(2));
-    const std::string text = rt.Mem().ReadString(cpu.StackArg(8), cpu.StackArg(6));
-    rt.Print("MessageBox [" + caption + "]: " + text);
-    cpu.Regs().r[AX] = 1;  // IDOK
-    cpu.ReturnFar(12);
-}
-
 std::vector<Runtime::BuiltinModule> MakeBuiltins() {
     return {
-        {"KERNEL",
-         {
-             {1, "FATALEXIT", FatalExit},
-             {3, "GETVERSION", GetVersion},
-             {30, "WAITEVENT", WaitEvent},
-             {91, "INITTASK", InitTask},
-             {102, "DOS3CALL", Dos3Call},
-             {137, "FATALAPPEXIT", FatalAppExit},
-         }},
-        {"USER",
-         {
-             {1, "MESSAGEBOX", MessageBox},
-             {5, "INITAPP", InitApp},
-         }},
-        {"GDI", {}},
+        {"KERNEL", KernelApi()},
+        {"USER", UserApi()},
+        {"GDI", GdiApi()},
     };
 }
+
+constexpr uint16_t kScratchBytes = 0x1000;
 
 }  // namespace
 
@@ -109,6 +45,7 @@ const char* ToString(TaskExit::Kind kind) {
     case TaskExit::Kind::Exited: return "exited";
     case TaskExit::Kind::FatalExit: return "fatal exit";
     case TaskExit::Kind::Unimplemented: return "stopped at an unimplemented API";
+    case TaskExit::Kind::Blocked: return "blocked waiting for input";
     case TaskExit::Kind::Fault: return "CPU fault";
     default: return "instruction budget exhausted";
     }
@@ -149,13 +86,33 @@ private:
     Runtime& rt_;
 };
 
-Runtime::Runtime() : cpu_(memory_), builtins_(MakeBuiltins()) {}
+Runtime::Runtime()
+    : cpu_(memory_),
+      globals_(memory_),
+      user_(std::make_unique<User>(*this)),
+      builtins_(MakeBuiltins()) {
+    scratchSel_ = memory_.Allocate(kScratchBytes, SegmentKind::Data);
+}
 
 Runtime::~Runtime() = default;
 
 void Runtime::Print(const std::string& line) const {
     if (output_) output_(line);
 }
+
+uint32_t Runtime::TickCount() const {
+    return uint32_t(std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - start_)
+                        .count());
+}
+
+Runtime::Scratch::Scratch(Runtime& rt, uint16_t bytes) : rt_(rt), offset_(rt.scratchTop_) {
+    const uint32_t end = uint32_t(offset_) + ((bytes + 15u) & ~15u);
+    if (end > kScratchBytes) rt.cpu_.HostFault("scratch memory exhausted (callbacks nested too deeply)");
+    rt.scratchTop_ = uint16_t(end);
+}
+
+Runtime::Scratch::~Scratch() { rt_.scratchTop_ = offset_; }
 
 void Runtime::Exit(TaskExit::Kind kind, uint16_t code, const std::string& message) {
     if (exited_) return;

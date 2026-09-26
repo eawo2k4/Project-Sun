@@ -152,6 +152,222 @@ inline NeProgram SelfTestProgram() {
     return p;
 }
 
+// A classic Win16 application skeleton, checking itself as it goes:
+//   GlobalAlloc/Lock/Size/Unlock/Free on a 1000-byte block,
+//   RegisterClass (with LoadIcon, LoadCursor, GetStockObject),
+//   CreateWindow + ShowWindow + UpdateWindow (WM_CREATE seen by the WndProc),
+//   SendMessage straight into the WndProc, PeekMessage on an empty queue,
+//   a GetMessage/TranslateMessage/DispatchMessage loop until WM_QUIT.
+// The window is closed either by the program (PostMessage WM_CLOSE) or, with
+// hostCloses, by the host (as if the user clicked X). WM_CLOSE reaches
+// DefWindowProc -> DestroyWindow -> WM_DESTROY -> PostQuitMessage(0).
+// Exit code 0 = all checks passed; otherwise the number of the failed check.
+//
+// fullscreen: a visible WS_POPUP covering the 640x480 16-bit screen, which a
+// host presents borderless; otherwise a 320x200 overlapped window.
+// faultInCreate: the WndProc divides by zero on WM_CREATE (a fault inside a
+// callback nested in CreateWindow).
+inline NeProgram WindowProgram(bool hostCloses, bool fullscreen = false, bool faultInCreate = false) {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI"};
+    constexpr uint16_t KERNEL = 1, USER = 2, GDI = 3;
+
+    // DGROUP layout.
+    constexpr uint8_t kCreated = 0x00, kGot = 0x02, kHmem = 0x04, kHwnd = 0x06, kHinst = 0x08,
+                      kDestroyed = 0x0A, kClassName = 0x10, kTitle = 0x20, kWndClass = 0x40,
+                      kMsg = 0x60;
+    std::vector<uint8_t> data(0x80, 0);
+    const std::string cls = "RetroWin", title = "Win16 Window";
+    std::copy(cls.begin(), cls.end(), data.begin() + kClassName);
+    std::copy(title.begin(), title.end(), data.begin() + kTitle);
+
+    NeSeg code;
+    Asm16 a;
+    auto call = [&](uint16_t module, uint16_t ordinal) {
+        code.relocs.push_back(ImportOrdinal(a.CallFar(), module, ordinal));
+    };
+    auto pushMsgPtr = [&] { a.db({0x1E, 0x68, kMsg, 0x00}); };  // push ds / push offset MSG
+
+    // 1. InitTask; keep hInstance.
+    call(KERNEL, 91);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 1);
+    a.db({0x89, 0x3E, kHinst, 0x00});  // mov [hInst], di
+
+    // 2-8. Global heap: GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT, 1000L).
+    a.db({0x68, 0x42, 0x00, 0x6A, 0x00, 0x68, 0xE8, 0x03});  // push 42h / push 0 / push 1000
+    call(KERNEL, 15);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 2);
+    a.db({0xA3, kHmem, 0x00});  // mov [hmem], ax
+    a.db({0x50});               // push ax
+    call(KERNEL, 18);           // GlobalLock -> DX:AX
+    a.db({0x85, 0xD2});
+    FailUnless(a, JNZ, 3);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 3);
+    a.db({0x8E, 0xC2, 0x89, 0xC7});  // mov es, dx / mov di, ax
+    a.db({0x26, 0x80, 0x3D, 0x00});  // cmp byte es:[di], 0      (zero-initialised)
+    FailUnless(a, JZ, 4);
+    a.db({0x26, 0x80, 0xBD, 0xE7, 0x03, 0x00});  // cmp byte es:[di+999], 0
+    FailUnless(a, JZ, 4);
+    a.db({0xFC, 0xB9, 0xE8, 0x03, 0xB0, 0xA5, 0xF3, 0xAA});  // cld / mov cx,1000 / mov al,A5h / rep stosb
+    a.db({0x31, 0xFF, 0xB9, 0xE8, 0x03, 0xF3, 0xAE});        // xor di,di / mov cx,1000 / repe scasb
+    FailUnless(a, JZ, 5);
+    a.db({0xFF, 0x36, kHmem, 0x00});  // push [hmem]
+    call(KERNEL, 20);                 // GlobalSize
+    a.db({0x3D, 0xE8, 0x03});
+    FailUnless(a, JZ, 6);
+    a.db({0xFF, 0x36, kHmem, 0x00});
+    call(KERNEL, 19);  // GlobalUnlock -> 0 (no longer locked)
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 7);
+    a.db({0xFF, 0x36, kHmem, 0x00});
+    call(KERNEL, 17);  // GlobalFree -> 0 (success)
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 8);
+    a.db({0x1E, 0x07});  // push ds / pop es
+
+    // 9. WNDCLASS: style, lpfnWndProc = CS:WndProc, extra, hInstance, hIcon,
+    //    hCursor, hbrBackground, lpszMenuName, lpszClassName.
+    a.db({0xC7, 0x06, kWndClass, 0x00, 0x00, 0x00});             // style = 0
+    a.db({0xC7, 0x06, kWndClass + 2, 0x00}).Abs16("WndProc");    // lpfnWndProc offset
+    a.db({0x8C, 0x0E, kWndClass + 4, 0x00});                     // lpfnWndProc selector = CS
+    a.db({0xC7, 0x06, kWndClass + 6, 0x00, 0x00, 0x00});         // cbClsExtra
+    a.db({0xC7, 0x06, kWndClass + 8, 0x00, 0x00, 0x00});         // cbWndExtra
+    a.db({0xA1, kHinst, 0x00, 0xA3, kWndClass + 10, 0x00});      // hInstance
+    a.db({0x6A, 0x00, 0x6A, 0x00, 0x68, 0x00, 0x7F});            // LoadIcon(NULL, IDI_APPLICATION)
+    call(USER, 174);
+    a.db({0xA3, kWndClass + 12, 0x00});
+    a.db({0x6A, 0x00, 0x6A, 0x00, 0x68, 0x00, 0x7F});            // LoadCursor(NULL, IDC_ARROW)
+    call(USER, 173);
+    a.db({0xA3, kWndClass + 14, 0x00});
+    a.db({0x6A, 0x00});                                          // GetStockObject(WHITE_BRUSH)
+    call(GDI, 87);
+    a.db({0xA3, kWndClass + 16, 0x00});
+    a.db({0xC7, 0x06, kWndClass + 18, 0x00, 0x00, 0x00});        // no menu
+    a.db({0xC7, 0x06, kWndClass + 20, 0x00, 0x00, 0x00});
+    a.db({0xC7, 0x06, kWndClass + 22, 0x00, kClassName, 0x00});  // lpszClassName = DS:10h
+    a.db({0x8C, 0x1E, kWndClass + 24, 0x00});
+    a.db({0x1E, 0x68, kWndClass, 0x00});  // push ds / push offset WNDCLASS
+    call(USER, 57);                       // RegisterClass -> atom
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 9);
+
+    // 10. CreateWindow(class, title, style, x, y, cx, cy, NULL, NULL, hInst, NULL)
+    a.db({0x1E, 0x68, kClassName, 0x00, 0x1E, 0x68, kTitle, 0x00});
+    if (fullscreen) {
+        a.db({0x68, 0x00, 0x90, 0x6A, 0x00});                    // WS_POPUP | WS_VISIBLE
+        a.db({0x6A, 0x00, 0x6A, 0x00, 0x68, 0x80, 0x02, 0x68, 0xE0, 0x01});  // 0, 0, 640, 480
+    } else {
+        a.db({0x68, 0xCF, 0x00, 0x6A, 0x00});                    // WS_OVERLAPPEDWINDOW
+        a.db({0x68, 0x00, 0x80, 0x68, 0x00, 0x80, 0x68, 0x40, 0x01, 0x68, 0xC8, 0x00});
+        // CW_USEDEFAULT, CW_USEDEFAULT, 320, 200
+    }
+    a.db({0x6A, 0x00, 0x6A, 0x00, 0xFF, 0x36, kHinst, 0x00, 0x6A, 0x00, 0x6A, 0x00});
+    call(USER, 41);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JNZ, 10);
+    a.db({0xA3, kHwnd, 0x00});
+    // 11. The WndProc saw WM_CREATE.
+    a.db({0x83, 0x3E, kCreated, 0x00, 0x01});
+    FailUnless(a, JZ, 11);
+    // 12. ShowWindow returns the previous visibility.
+    a.db({0x50, 0x6A, 0x01});  // push hwnd / push SW_SHOWNORMAL
+    call(USER, 42);
+    a.db({0x85, 0xC0});
+    FailUnless(a, fullscreen ? JNZ : JZ, 12);
+    a.db({0xFF, 0x36, kHwnd, 0x00});
+    call(USER, 124);  // UpdateWindow
+
+    // 13. SendMessage(hwnd, WM_USER+1, 7, 0L) runs the WndProc now: 55h back.
+    a.db({0xFF, 0x36, kHwnd, 0x00, 0x68, 0x01, 0x04, 0x6A, 0x07, 0x6A, 0x00, 0x6A, 0x00});
+    call(USER, 111);
+    a.db({0x3D, 0x55, 0x00});
+    FailUnless(a, JZ, 13);
+    a.db({0x83, 0x3E, kGot, 0x00, 0x07});
+    FailUnless(a, JZ, 13);
+
+    // 14. PeekMessage(PM_REMOVE) on the empty queue returns FALSE.
+    pushMsgPtr();
+    a.db({0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x01});
+    call(USER, 109);
+    a.db({0x85, 0xC0});
+    FailUnless(a, JZ, 14);
+
+    // Post WM_USER+1 (wParam 9) and, unless the host does it, WM_CLOSE.
+    a.db({0xFF, 0x36, kHwnd, 0x00, 0x68, 0x01, 0x04, 0x6A, 0x09, 0x6A, 0x00, 0x6A, 0x00});
+    call(USER, 110);
+    if (!hostCloses) {
+        a.db({0xFF, 0x36, kHwnd, 0x00, 0x6A, 0x10, 0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00});
+        call(USER, 110);
+    }
+
+    // The message loop.
+    a.Label("loop");
+    pushMsgPtr();
+    a.db({0x6A, 0x00, 0x6A, 0x00, 0x6A, 0x00});
+    call(USER, 108);  // GetMessage
+    a.db({0x85, 0xC0});
+    a.Short(JZ, "done");
+    pushMsgPtr();
+    call(USER, 113);  // TranslateMessage
+    pushMsgPtr();
+    call(USER, 114);  // DispatchMessage
+    a.Short(0xEB, "loop");
+    a.Label("done");
+    // 15. The posted message was dispatched; 16. WM_DESTROY arrived;
+    // 17. the loop ended on WM_QUIT.
+    a.db({0x83, 0x3E, kGot, 0x00, 0x09});
+    FailUnless(a, JZ, 15);
+    a.db({0x83, 0x3E, kDestroyed, 0x00, 0x01});
+    FailUnless(a, JZ, 16);
+    a.db({0xA1, kMsg + 2, 0x00, 0x3D, 0x12, 0x00});  // cmp msg.message, WM_QUIT
+    FailUnless(a, JZ, 17);
+    a.db({0xA0, kMsg + 4, 0x00, 0xB4, 0x4C, 0xCD, 0x21});  // exit(msg.wParam)
+
+    for (int n = 1; n <= 17; ++n) {
+        a.Label("fail" + std::to_string(n));
+        a.db({0xB0, n, 0xB4, 0x4C, 0xCD, 0x21});
+    }
+
+    // LRESULT FAR PASCAL WndProc(HWND, UINT msg, WPARAM, LPARAM)
+    //   [bp+14] hwnd  [bp+12] msg  [bp+10] wParam  [bp+8]:[bp+6] lParam
+    a.Label("WndProc");
+    a.db({0x55, 0x89, 0xE5});        // push bp / mov bp, sp
+    a.db({0x8B, 0x46, 0x0C});        // mov ax, [bp+12]
+    a.db({0x3D, 0x01, 0x00});        // WM_CREATE?
+    a.Short(JNZ, "wp_not_create");
+    if (faultInCreate) a.db({0x31, 0xDB, 0xF7, 0xF3});  // xor bx, bx / div bx
+    a.db({0xC7, 0x06, kCreated, 0x00, 0x01, 0x00});
+    a.Short(0xEB, "wp_zero");
+    a.Label("wp_not_create");
+    a.db({0x3D, 0x01, 0x04});        // WM_USER+1?
+    a.Short(JNZ, "wp_not_user");
+    a.db({0x8B, 0x46, 0x0A, 0xA3, kGot, 0x00});  // [got] = wParam
+    a.db({0xB8, 0x55, 0x00, 0x31, 0xD2});        // return 55h
+    a.Short(0xEB, "wp_done");
+    a.Label("wp_not_user");
+    a.db({0x3D, 0x02, 0x00});        // WM_DESTROY?
+    a.Short(JNZ, "wp_default");
+    a.db({0xC7, 0x06, kDestroyed, 0x00, 0x01, 0x00});
+    a.db({0x6A, 0x00});
+    call(USER, 6);                   // PostQuitMessage(0)
+    a.Short(0xEB, "wp_zero");
+    a.Label("wp_default");
+    a.db({0xFF, 0x76, 0x0E, 0xFF, 0x76, 0x0C, 0xFF, 0x76, 0x0A, 0xFF, 0x76, 0x08, 0xFF, 0x76, 0x06});
+    call(USER, 107);                 // DefWindowProc(hwnd, msg, wParam, lParam)
+    a.Short(0xEB, "wp_done");
+    a.Label("wp_zero");
+    a.db({0x31, 0xC0, 0x31, 0xD2});
+    a.Label("wp_done");
+    a.db({0x5D, 0xCA, 0x0A, 0x00});  // pop bp / retf 10
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x200)};
+    return p;
+}
+
 // Calls KERNEL.FatalExit(code).
 inline NeProgram FatalExitProgram(uint16_t exitCode) {
     NeProgram p = BaseProgram();
@@ -186,12 +402,12 @@ inline NeProgram HelloProgram() {
     return p;
 }
 
-// Calls an API the engine doesn't have (USER.41 = CreateWindow).
+// Calls an API the engine doesn't have yet (USER.39 = BeginPaint).
 inline NeProgram UnimplementedApiProgram() {
     NeProgram p = BaseProgram();
     NeSeg code;
     Asm16 a;
-    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 41));
+    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, 39));
     code.bytes = a.Finish();
     p.segments = {code, DataSegment({}, 0x100)};
     return p;

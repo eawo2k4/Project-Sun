@@ -125,4 +125,14 @@ set_tests_properties(Win16HelloViaLauncher PROPERTIES
 set_tests_properties(Win16FatalExitViaLauncher PROPERTIES
     PASS_REGULAR_EXPRESSION "fatal exit, code 7 - FatalExit\\(7\\)")
 set_tests_properties(Win16UnimplementedViaLauncher PROPERTIES
-    PASS_REGULAR_EXPRESSION "USER\\.41 is not implemented yet")
+    PASS_REGULAR_EXPRESSION "USER\\.39 is not implemented yet")
+
+# Windowing through the real Win32 host (windows created but never shown).
+add_test(NAME Win16WindowViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_window.exe)
+add_test(NAME Win16FullscreenViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_fullscreen.exe)
+set_tests_properties(Win16WindowViaLauncher Win16FullscreenViaLauncher PROPERTIES
+    FIXTURES_REQUIRED win16_samples)
+set_tests_properties(Win16WindowViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
+    "host window for HWND16 [0-9A-F]+ \"Win16 Window\": 320x200 -> [0-9]+x[0-9]+ \\(x[0-9]+\\), windowed, hidden.*Win16 exit  : exited, code 0")
+set_tests_properties(Win16FullscreenViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
+    "host window for HWND16 [0-9A-F]+ \"Win16 Window\": 640x480 -> [0-9]+x[0-9]+ \\(x[0-9]+\\), borderless fullscreen, hidden.*Win16 exit  : exited, code 0")
