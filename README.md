@@ -20,6 +20,7 @@ Project Sun/
 │  │  ├─ include/retro/ClampPolicy.h   pure disk/memory clamping rules (unit-tested)
 │  │  ├─ include/retro/DisplayMath.h   modes, 4:3 viewport planning, coordinate mapping
 │  │  ├─ include/retro/FramePacing.h   frame scheduler + high-resolution waiter
+│  │  ├─ include/retro/PixelConvert.h  8/16/24/32-bit surfaces → 32-bit BGRA, CRC-32
 │  │  ├─ include/retro/PathUtil.h      ANSI/UTF-8 path helpers
 │  │  ├─ include/retro/ShimProtocol.h  launcher → shim config payload (GUID + struct)
 │  │  └─ *.cpp
@@ -30,6 +31,13 @@ Project Sun/
 │     ├─ dllmain.cpp               attach/detach, config load, per-module transactions
 │     ├─ ShimState.h               config + module handle for hook modules
 │     ├─ DisplayContext.{h,cpp}    virtual mode, managed windows, cursor, caller filter
+│     ├─ Pacing.{h,cpp}            the one frame pacer shared by GDI, DirectDraw and D3D9
+│     ├─ gfx/
+│     │  ├─ VtableHook.{h,cpp}     lazy COM vtable patching, per interface version
+│     │  ├─ ModuleWatch.{h,cpp}    hooks DLLs when they load (static import or LoadLibrary)
+│     │  ├─ DDraw.cpp              DirectDraw exclusive-mode containment + virtual primary
+│     │  ├─ D3D9.cpp               Direct3D 9 fullscreen containment, Present pacing, 9On12
+│     │  └─ Graphics.{h,cpp}       module entry points, diagnostics
 │     ├─ Log.{h,cpp}               DllMain-safe logger
 │     ├─ RetroShim.def             exports ordinal #1 (required by Detours)
 │     └─ hooks/
@@ -45,12 +53,12 @@ Project Sun/
    ├─ ClampPolicyTests.cpp clamping rules: known values, property sweeps, idempotence
    ├─ DisplayMathTests.cpp viewports, aspect, mapping round-trips, window classification
    ├─ FramePacingTests.cpp scheduler with a fake clock + one real-time measurement
-   └─ ShimProbe.cpp, ProbeDisplay.cpp
+   ├─ PixelConvertTests.cpp format conversion, channel expansion, CRC
+   └─ ShimProbe.cpp, ProbeDisplay.cpp, ProbeGraphics.cpp
                            x86 target driven by the end-to-end tests (see tests/CMakeLists.txt)
 ```
 
-Planned modules: `src/gfx/` (DirectDraw/D3D bridge), `src/win16/` (NE loader +
-CPU engine + thunks).
+Planned modules: `src/win16/` (NE loader + CPU engine + thunks).
 
 ## Shim modules
 
@@ -68,14 +76,28 @@ CPU engine + thunks).
 | render | `GetDC`, `GetDCEx`, `GetWindowDC`, `BeginPaint`, `InvalidateRect` | DCs for a managed window get a GDI world transform (virtual → viewport, nearest-neighbour) and a viewport clip, so all GDI drawing is scaled. Integer scale factors are used when they fit, e.g. 640×480 → 4× on 4K. `SetDIBitsToDevice`, which GDI never scales, is rewritten as `StretchDIBits`. |
 | | `BitBlt`, `StretchBlt`, `StretchDIBits`, `SetDIBitsToDevice`, `SwapBuffers`, `wglSwapBuffers` | Frame pacing at presentation. A blit covering ≥ 75% of the window, or a buffer swap, waits for the next slot of the `--fps-cap` cadence, using a high-resolution waitable timer plus a sub-millisecond QPC spin. Late frames never trigger a catch-up burst, and a frame through `SwapBuffers` → `wglSwapBuffers` is paced once. |
 
+| graphics: DirectDraw | `DirectDrawCreate(Ex)`, then `IDirectDraw`/`2`/`4`/`7` and `IDirectDrawSurface`…`7` methods | `DDSCL_EXCLUSIVE \| DDSCL_FULLSCREEN` becomes `DDSCL_NORMAL`, and `SetDisplayMode` sets the virtual mode, so the real desktop never changes. The primary and back buffer are system-memory surfaces in the virtual format (8-bit palettized included), reported to the game as a flipping primary chain. Surfaces created without a pixel format get the virtual depth, not the desktop's. `EnumDisplayModes` and `GetDisplayMode` report classic and virtual modes. |
+| | `Flip`, `Blt`/`BltFast` to the primary, `Unlock`, `ReleaseDC`, `IDirectDrawPalette::SetEntries`, `WaitForVerticalBlank` | Presenting converts the primary to 32-bit BGRA (palette lookup for 8-bit) and draws it into the managed window's integer-scaled viewport. `Flip` and whole-frame blits are paced; partial updates are coalesced to one per frame period and flushed from the message pump. Palette changes (fades) re-present immediately. `WaitForVerticalBlank` is paced to the cap instead of the real 144/165 Hz refresh, and a `Flip` right after it counts as the same frame. |
+| graphics: Direct3D 9 | `Direct3DCreate9`, `IDirect3D9::CreateDevice`, `IDirect3DDevice9::Reset`/`Present`/`GetDisplayMode` | A fullscreen device is created windowed in the managed window, and its back buffer becomes the virtual mode. `Present` is paced and aimed at the viewport, with black bars. `--d3d9on12` routes `Direct3DCreate9` through `Direct3DCreate9On12`, so D3D9 runs on D3D12 queues. |
+
 The display and render hooks only virtualize for **game code**. Calls coming from
-DLLs under the Windows directory (DirectDraw, Direct3D, user32 internals) see the
-real system. As a result, DirectDraw/Direct3D *exclusive-mode* games still change the
-real display mode until the graphics wrapper exists. `RetroShimIsModuleActive("display")`
-is exported for diagnostics.
+DLLs under the Windows directory (user32 internals, DirectDraw's own GDI use) see
+the real system. DirectDraw and Direct3D 9 are handled by vtable hooks on the
+objects the game creates. `ddraw.dll` and `d3d9.dll` are hooked whenever they
+load, including a `LoadLibrary` long after startup. Diagnostics exports:
+`RetroShimIsModuleActive("display" | "ddraw" | "d3d9" | …)` and
+`RetroShimGetPresentStats` (frames presented and a CRC of the last one).
 
 Known limits:
-- 8-bit palettized modes are reported but not yet emulated (colours may be wrong).
+- A DirectDraw primary created with `DDSCAPS_3DDEVICE` (Direct3D 3–7 rendering straight
+  to the primary) can't live in system memory. That game gets the real exclusive mode
+  it asked for, and the log says so. Direct3D 8 and Direct3D 9Ex aren't intercepted yet.
+- DirectDraw presents through GDI (`StretchDIBits`) on the CPU: fine for 640×480-class
+  games, but a GPU presenter would be cheaper at 4K.
+- Direct3D 9 windowed `Present` stretches with the driver's filter, so the image is
+  integer sized but may be slightly soft.
+- 8-bit palettized *GDI* games are reported the mode but not palette-emulated (DirectDraw
+  8-bit is).
 - A window created before the mode change and not DPI aware is scaled by DWM on top of
   the integer scale when the desktop is above 100% scaling (slightly soft).
 - `MapWindowPoints` and `SystemParametersInfo(SPI_GETWORKAREA)` are not yet virtualized.
@@ -141,6 +163,7 @@ RetroLaunch [options] <program.exe> [program arguments...]
   --windowed       Show fullscreen games in a captioned window, not borderless fullscreen
   --no-integer-scaling    Fill the screen with fractional (still 4:3) scaling
   --no-display-sandbox    Let the game change the real display mode (pacing still applies)
+  --d3d9on12       Run Direct3D 9 games on Direct3D 12 (Direct3DCreate9On12)
 ```
 
 Exit codes: 2 usage, 3 unreadable image, 4 unsupported format, 5 launch failure.

@@ -31,6 +31,7 @@
 #include "Hooks.h"
 #include "Log.h"
 #include "ShimState.h"
+#include "gfx/Graphics.h"
 
 namespace retro::shim {
 namespace {
@@ -450,24 +451,28 @@ void TranslateInput(MSG& msg) {
 BOOL WINAPI Hook_GetMessageA(LPMSG msg, HWND hwnd, UINT min, UINT max) {
     const BOOL r = Real_GetMessageA(msg, hwnd, min, max);
     if (r > 0 && AnyManaged() && IsGame(_ReturnAddress())) TranslateInput(*msg);
+    gfx::PresentPendingFrames();  // flush DirectDraw primary updates
     return r;
 }
 
 BOOL WINAPI Hook_GetMessageW(LPMSG msg, HWND hwnd, UINT min, UINT max) {
     const BOOL r = Real_GetMessageW(msg, hwnd, min, max);
     if (r > 0 && AnyManaged() && IsGame(_ReturnAddress())) TranslateInput(*msg);
+    gfx::PresentPendingFrames();  // flush DirectDraw primary updates
     return r;
 }
 
 BOOL WINAPI Hook_PeekMessageA(LPMSG msg, HWND hwnd, UINT min, UINT max, UINT remove) {
     const BOOL r = Real_PeekMessageA(msg, hwnd, min, max, remove);
     if (r && AnyManaged() && IsGame(_ReturnAddress())) TranslateInput(*msg);
+    gfx::PresentPendingFrames();  // flush DirectDraw primary updates
     return r;
 }
 
 BOOL WINAPI Hook_PeekMessageW(LPMSG msg, HWND hwnd, UINT min, UINT max, UINT remove) {
     const BOOL r = Real_PeekMessageW(msg, hwnd, min, max, remove);
     if (r && AnyManaged() && IsGame(_ReturnAddress())) TranslateInput(*msg);
+    gfx::PresentPendingFrames();  // flush DirectDraw primary updates
     return r;
 }
 

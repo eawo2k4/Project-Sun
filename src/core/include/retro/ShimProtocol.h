@@ -41,6 +41,18 @@ enum ShimFeature : uint32_t {
 enum DisplayFlag : uint32_t {
     DisplayFlag_Windowed         = 1u << 0,  // captioned window instead of borderless fullscreen
     DisplayFlag_NoIntegerScaling = 1u << 1,  // fill the screen with fractional scaling
+    DisplayFlag_D3D9On12         = 1u << 2,  // run Direct3D 9 over D3D12 (Direct3DCreate9On12)
+};
+
+// Filled by the diagnostic export RetroShimGetPresentStats: what the
+// DirectDraw presenter last put on screen.
+struct PresentStats {
+    uint32_t cbSize = sizeof(PresentStats);
+    uint32_t frames = 0;         // frames presented from virtualized primaries
+    uint32_t width = 0;          // size and depth of the last presented frame
+    uint32_t height = 0;
+    uint32_t bitsPerPixel = 0;
+    uint32_t crc32 = 0;          // CRC-32 of the last frame as 32-bit BGRA (top-down)
 };
 
 struct ShimConfig {

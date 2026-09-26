@@ -285,6 +285,19 @@ LRESULT CALLBACK SubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 RealApi& Real() { return g_real; }
 
+void FillLetterbox(HDC hdc, const ManagedView& v) {
+    const Rect vp = v.ClientViewport();
+    const int32_t w = v.client.Width(), h = v.client.Height();
+    const HBRUSH black = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+    const RECT bars[] = {{0, 0, w, vp.top},
+                         {0, vp.bottom, w, h},
+                         {0, vp.top, vp.left, vp.bottom},
+                         {vp.right, vp.top, w, vp.bottom}};
+    for (const RECT& r : bars) {
+        if (r.right > r.left && r.bottom > r.top) FillRect(hdc, &r, black);
+    }
+}
+
 void Configure(const ShimConfig& config) {
     g_windowed = (config.displayFlags & DisplayFlag_Windowed) != 0;
     g_scaling.integerScaling = (config.displayFlags & DisplayFlag_NoIntegerScaling) == 0;

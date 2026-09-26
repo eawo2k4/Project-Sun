@@ -8,3 +8,5 @@ EXPORTS
 
     ; Diagnostics: BOOL WINAPI RetroShimIsModuleActive(const char* name)
     RetroShimIsModuleActive
+    ; Diagnostics: BOOL WINAPI RetroShimGetPresentStats(retro::PresentStats*)
+    RetroShimGetPresentStats

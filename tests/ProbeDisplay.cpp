@@ -380,6 +380,13 @@ int ProbeRender(uint32_t fps) {
     const int format = ChoosePixelFormat(dc, &pfd);
     HGLRC gl = format && SetPixelFormat(dc, format, &pfd) ? wglCreateContext(dc) : nullptr;
     if (gl && wglMakeCurrent(dc, gl)) {
+        // Turn the driver's own vsync off, so the timings measure the shim's
+        // pacer and not the monitor's refresh rate.
+        using SwapIntervalFn = BOOL(WINAPI*)(int);
+        if (const auto swapInterval =
+                reinterpret_cast<SwapIntervalFn>(wglGetProcAddress("wglSwapIntervalEXT"))) {
+            swapInterval(0);
+        }
         ExpectPaced(TimeFrames(kFrames, [&] { SwapBuffers(dc); }), kFrames, fps,
                     "SwapBuffers (OpenGL)");
         ExpectPaced(TimeFrames(kFrames, [&] { wglSwapBuffers(dc); }), kFrames, fps,

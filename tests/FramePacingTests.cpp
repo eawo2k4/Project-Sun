@@ -70,6 +70,20 @@ void TestSlightlyLateKeepsCadence() {
     CHECK(s.NextPresentTime(t0 + kPeriod60 + lateBy + 1) == t0 + 2 * kPeriod60);
 }
 
+void TestPresentedRecently() {
+    // WaitForVerticalBlank then Flip in the same frame: the second sync point
+    // lands well within half a period of the first.
+    FrameScheduler s(60, kFreq);
+    CHECK(!s.PresentedRecently(0));  // nothing presented yet
+    const int64_t t = s.NextPresentTime(1000);
+    CHECK(s.PresentedRecently(t + kPeriod60 / 4));
+    CHECK(!s.PresentedRecently(t + kPeriod60 / 2));
+    const int64_t t2 = s.NextPresentTime(t + 5);  // waits for the next slot
+    CHECK(t2 == t + kPeriod60);
+    CHECK(s.PresentedRecently(t2 + 10));
+    CHECK(!FrameScheduler(0, kFreq).PresentedRecently(0));
+}
+
 void TestFramePresentHeuristic() {
     CHECK(IsFramePresent(640, 480, 640, 480));    // full frame
     CHECK(IsFramePresent(640, 360, 640, 480));    // 75%: letterboxed video counts
@@ -121,6 +135,7 @@ int main() {
         {"SlowGameIsNotDelayed", TestSlowGameIsNotDelayed},
         {"HitchDoesNotBurst", TestHitchDoesNotBurst},
         {"SlightlyLateKeepsCadence", TestSlightlyLateKeepsCadence},
+        {"PresentedRecently", TestPresentedRecently},
         {"FramePresentHeuristic", TestFramePresentHeuristic},
         {"RealTimePacing", TestRealTimePacing},
     };

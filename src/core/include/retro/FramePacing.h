@@ -23,11 +23,17 @@ public:
     // stays out of the way of games slower than the cap.
     int64_t NextPresentTime(int64_t now);
 
+    // True if a frame was released less than half a period before `now`.
+    // Lets a second sync point in the same frame (WaitForVerticalBlank
+    // followed by Flip) count as the same frame instead of halving the rate.
+    bool PresentedRecently(int64_t now) const;
+
     int64_t Period() const { return period_; }
 
 private:
     int64_t period_ = 0;
     int64_t next_ = 0;
+    int64_t lastPresent_ = 0;
     bool started_ = false;
 };
 

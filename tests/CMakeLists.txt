@@ -16,10 +16,16 @@ add_executable(FramePacingTests FramePacingTests.cpp Check.h)
 target_link_libraries(FramePacingTests PRIVATE RetroCore)
 add_test(NAME FramePacing COMMAND FramePacingTests)
 
+add_executable(PixelConvertTests PixelConvertTests.cpp Check.h)
+target_link_libraries(PixelConvertTests PRIVATE RetroCore)
+add_test(NAME PixelConvert COMMAND PixelConvertTests)
+
 # --- End-to-end tests: RetroLaunch -> RetroShim -> ShimProbe ----------------------
 
-add_executable(ShimProbe ShimProbe.cpp ProbeDisplay.cpp ProbeCommon.h)
-target_link_libraries(ShimProbe PRIVATE RetroCore shell32 ole32 opengl32)
+# ddraw is linked (loaded at startup); d3d9 is loaded with LoadLibrary at run
+# time, to cover both ways games pull in DirectX.
+add_executable(ShimProbe ShimProbe.cpp ProbeDisplay.cpp ProbeGraphics.cpp ProbeCommon.h)
+target_link_libraries(ShimProbe PRIVATE RetroCore shell32 ole32 opengl32 ddraw dxguid)
 
 set(LAUNCH $<TARGET_FILE:RetroLaunch> --wait)
 set(PROBE $<TARGET_FILE:ShimProbe>)
@@ -64,3 +70,13 @@ add_test(NAME FramePacing60 COMMAND ${LAUNCH} ${PROBE} render 60)
 add_test(NAME FramePacing30 COMMAND ${LAUNCH} --fps-cap 30 ${PROBE} render 30)
 add_test(NAME FramePacingOff COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} render 0)
 add_test(NAME FramePacingWithoutSandbox COMMAND ${LAUNCH} --no-display-sandbox ${PROBE} render 60)
+
+# DirectDraw / Direct3D 9 containment. The probes refuse to go fullscreen
+# unless the shim reports both the API hooks and the display sandbox active.
+add_test(NAME DirectDraw8BitPalettized COMMAND ${LAUNCH} ${PROBE} ddraw 60)
+add_test(NAME DirectDraw7At16Bit COMMAND ${LAUNCH} ${PROBE} ddraw7 60)
+add_test(NAME DirectDrawPacing30 COMMAND ${LAUNCH} --fps-cap 30 ${PROBE} ddraw 30)
+add_test(NAME DirectDrawUnpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} ddraw 0)
+add_test(NAME Direct3D9Contained COMMAND ${LAUNCH} ${PROBE} d3d9 60)
+add_test(NAME Direct3D9On12 COMMAND ${LAUNCH} --d3d9on12 ${PROBE} d3d9 60 on12)
+add_test(NAME Direct3D9Unpaced COMMAND ${LAUNCH} --fps-cap 0 ${PROBE} d3d9 0)

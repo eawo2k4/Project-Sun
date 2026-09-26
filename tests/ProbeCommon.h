@@ -23,4 +23,8 @@ int ProbeWindow(bool windowed);
 int ProbeAdoption();
 int ProbeRender(uint32_t fps);
 
+// ProbeGraphics.cpp
+int ProbeDirectDraw(uint32_t fps, bool v7);
+int ProbeDirect3D9(uint32_t fps, bool on12);
+
 }  // namespace probe

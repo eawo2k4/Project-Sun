@@ -13,6 +13,9 @@
 //   ShimProbe window [windowed]   fullscreen window is sandboxed, scaled and input-mapped
 //   ShimProbe adopt               windows sized to the virtual screen get adopted
 //   ShimProbe render <fps>        whole-frame blits are paced at <fps> (0 = unpaced)
+//   ShimProbe ddraw <fps>         IDirectDraw exclusive 640x480x8: virtualized, palette, pacing
+//   ShimProbe ddraw7 <fps>        same through IDirectDraw7 at 640x480x16
+//   ShimProbe d3d9 <fps> [on12]   fullscreen D3D9 device contained, Present paced
 
 #include <windows.h>
 
@@ -242,6 +245,11 @@ int wmain(int argc, wchar_t** argv) {
     if (mode == L"window") return probe::ProbeWindow(argc > 2 && std::wstring(argv[2]) == L"windowed");
     if (mode == L"adopt") return probe::ProbeAdoption();
     if (mode == L"render") return probe::ProbeRender(ArgOr(argc, argv, 2, 60));
+    if (mode == L"ddraw") return probe::ProbeDirectDraw(ArgOr(argc, argv, 2, 60), false);
+    if (mode == L"ddraw7") return probe::ProbeDirectDraw(ArgOr(argc, argv, 2, 60), true);
+    if (mode == L"d3d9")
+        return probe::ProbeDirect3D9(ArgOr(argc, argv, 2, 60),
+                                     argc > 3 && std::wstring(argv[3]) == L"on12");
 
     std::printf("unknown mode\n");
     return 2;

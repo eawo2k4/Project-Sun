@@ -11,15 +11,14 @@
 // Pacing: whole-frame presents (a blit covering >= 75% of the target window,
 // or SwapBuffers) wait for the next frame slot of a FrameScheduler.
 // DirectDraw/Direct3D presents go through their own interfaces; the graphics
-// wrapper (next step) will call the same PaceFrame().
+// hooks (gfx/) share the same pacer, see Pacing.h.
 
 #include <intrin.h>
-
-#include <memory>
 
 #include "DisplayContext.h"
 #include "Hooks.h"
 #include "Log.h"
+#include "Pacing.h"
 #include "ShimState.h"
 #include "retro/FramePacing.h"
 
@@ -43,23 +42,10 @@ using WglSwapBuffersFn = BOOL WINAPI(HDC);
 WglSwapBuffersFn* Real_wglSwapBuffers = nullptr;  // only if opengl32 is loaded at attach
 
 bool g_scalingEnabled = false;
-bool g_pacingEnabled = false;
-std::unique_ptr<FrameScheduler> g_scheduler;
-SRWLOCK g_pacerLock = SRWLOCK_INIT;
 
 bool IsGame(void* returnAddress) { return !IsSystemCaller(returnAddress); }
 
-// --- Frame pacing ----------------------------------------------------------------------
-
-void PaceFrame() {
-    thread_local PreciseWaiter waiter;
-    const int64_t now = QpcNow();
-    int64_t presentAt;
-    AcquireSRWLockExclusive(&g_pacerLock);
-    presentAt = g_scheduler->NextPresentTime(now);
-    ReleaseSRWLockExclusive(&g_pacerLock);
-    if (presentAt > now) waiter.WaitUntil(presentAt);
-}
+using pacing::PaceFrame;
 
 // The managed window a DC draws to, if any (the screen DC counts in
 // fullscreen, where the game believes it owns the whole screen).
@@ -72,7 +58,7 @@ bool ManagedForDc(HDC hdc, ManagedView& v) {
 
 // Is a blit of w x h onto `hdc` a whole-frame present?
 bool IsPresentBlit(HDC hdc, int w, int h) {
-    if (!g_pacingEnabled || GetObjectType(hdc) != OBJ_DC) return false;  // memory DCs etc.
+    if (!pacing::Enabled() || GetObjectType(hdc) != OBJ_DC) return false;  // memory DCs etc.
 
     ManagedView v;
     if (ManagedForDc(hdc, v)) return IsFramePresent(w, h, v.virt.w, v.virt.h);
@@ -164,19 +150,19 @@ BOOL WINAPI Hook_InvalidateRect(HWND hwnd, const RECT* rect, BOOL erase) {
 // --- Presentation paths --------------------------------------------------------------------
 
 BOOL WINAPI Hook_BitBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, DWORD rop) {
-    if (g_pacingEnabled && IsGame(_ReturnAddress()) && IsPresentBlit(dst, w, h)) PaceFrame();
+    if (pacing::Enabled() && IsGame(_ReturnAddress()) && IsPresentBlit(dst, w, h)) PaceFrame();
     return Real_BitBlt(dst, x, y, w, h, src, sx, sy, rop);
 }
 
 BOOL WINAPI Hook_StretchBlt(HDC dst, int x, int y, int w, int h, HDC src, int sx, int sy, int sw,
                             int sh, DWORD rop) {
-    if (g_pacingEnabled && IsGame(_ReturnAddress()) && IsPresentBlit(dst, w, h)) PaceFrame();
+    if (pacing::Enabled() && IsGame(_ReturnAddress()) && IsPresentBlit(dst, w, h)) PaceFrame();
     return Real_StretchBlt(dst, x, y, w, h, src, sx, sy, sw, sh, rop);
 }
 
 int WINAPI Hook_StretchDIBits(HDC hdc, int x, int y, int w, int h, int sx, int sy, int sw, int sh,
                               const VOID* bits, const BITMAPINFO* bmi, UINT usage, DWORD rop) {
-    if (g_pacingEnabled && IsGame(_ReturnAddress()) && IsPresentBlit(hdc, w, h)) PaceFrame();
+    if (pacing::Enabled() && IsGame(_ReturnAddress()) && IsPresentBlit(hdc, w, h)) PaceFrame();
     return Real_StretchDIBits(hdc, x, y, w, h, sx, sy, sw, sh, bits, bmi, usage, rop);
 }
 
@@ -209,14 +195,14 @@ int WINAPI Hook_SetDIBitsToDevice(HDC hdc, int x, int y, DWORD w, DWORD h, int s
 }
 
 BOOL WINAPI Hook_SwapBuffers(HDC hdc) {
-    if (g_pacingEnabled && IsGame(_ReturnAddress())) PaceFrame();
+    if (pacing::Enabled() && IsGame(_ReturnAddress())) PaceFrame();
     return Real_SwapBuffers(hdc);
 }
 
 BOOL WINAPI Hook_wglSwapBuffers(HDC hdc) {
     // gdi32!SwapBuffers calling down into opengl32 is a system caller, so a
     // frame presented through SwapBuffers is only paced once.
-    if (g_pacingEnabled && IsGame(_ReturnAddress())) PaceFrame();
+    if (pacing::Enabled() && IsGame(_ReturnAddress())) PaceFrame();
     return Real_wglSwapBuffers(hdc);
 }
 
@@ -241,9 +227,7 @@ LONG ApplyHooks(bool attach) {
 LONG AttachRenderHooks() {
     const ShimConfig& config = Config();
     g_scalingEnabled = (config.features & ShimFeature_DisplaySandbox) != 0;
-    const uint32_t fps = (config.features & ShimFeature_FrameLimiter) ? config.fpsCap : 0;
-    g_pacingEnabled = fps > 0;
-    g_scheduler = std::make_unique<FrameScheduler>(fps, QpcFrequency());
+    const uint32_t fps = pacing::Enabled() ? config.fpsCap : 0;  // configured in dllmain
 
     if (HMODULE gl = GetModuleHandleW(L"opengl32.dll")) {
         Real_wglSwapBuffers =
@@ -252,7 +236,7 @@ LONG AttachRenderHooks() {
 
     const PreciseWaiter probe;
     log::Write("render: GDI scaling %s; pacing %s%u fps (%s timer)%s",
-               g_scalingEnabled ? "on" : "off", g_pacingEnabled ? "" : "off, cap ", fps,
+               g_scalingEnabled ? "on" : "off", pacing::Enabled() ? "" : "off, cap ", fps,
                probe.HighResolution() ? "high-resolution" : "legacy",
                Real_wglSwapBuffers ? ", wglSwapBuffers hooked" : "");
     return ApplyHooks(true);

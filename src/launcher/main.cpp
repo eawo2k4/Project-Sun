@@ -62,6 +62,7 @@ void PrintUsage() {
         "  --windowed        Show fullscreen games in a captioned window instead of\n"
         "                    borderless fullscreen\n"
         "  --no-integer-scaling  Fill the screen with fractional (still 4:3) scaling\n"
+        "  --d3d9on12        Run Direct3D 9 games on Direct3D 12 (Direct3DCreate9On12)\n"
         "  --no-display-sandbox  Let the game change the real display mode (no window\n"
         "                    sandbox or GDI scaling; frame pacing still applies)\n"
         "  --                End of options\n",
@@ -117,6 +118,8 @@ bool ParseArgs(int argc, wchar_t** argv, Options& opt) {
             if (!v || !ParseRange(v, 0, retro::kMaxFpsCap, "--fps-cap", opt.fpsCap)) return false;
         } else if (a == L"--windowed") {
             opt.displayFlags |= retro::DisplayFlag_Windowed;
+        } else if (a == L"--d3d9on12") {
+            opt.displayFlags |= retro::DisplayFlag_D3D9On12;
         } else if (a == L"--no-integer-scaling") {
             opt.displayFlags |= retro::DisplayFlag_NoIntegerScaling;
         } else if (a == L"--no-display-sandbox") {
