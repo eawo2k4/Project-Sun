@@ -174,6 +174,12 @@ set_tests_properties(Win16TraceViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
     "\\[trace\\] [0-9A-F]+:[0-9A-F]+ KERNEL\\.91 InitTask.*\\[trace\\] [0-9A-F]+:[0-9A-F]+ USER\\.1 MessageBox\\(0000, \"Hello from Win16\", \"Project Sun\", 0000\\) = 0001")
 set_tests_properties(Win16StubModuleViaLauncher PROPERTIES PASS_REGULAR_EXPRESSION
     "SHELL\\.22 \\(ShellAbout\\) is not implemented yet \\(returning to")
+# A program with its own DLLs: imported (initialized before it starts) and
+# loaded at run time.
+add_test(NAME Win16DllsViaLauncher COMMAND ${LAUNCH} --hidden ${WIN16_SAMPLES}/win16_dlls.exe)
+set_tests_properties(Win16DllsViaLauncher PROPERTIES FIXTURES_REQUIRED win16_samples
+    PASS_REGULAR_EXPRESSION "Win16 exit  : exited, code 0")
+
 # USER breadth, GDI drawing and sound through the real Win32 host: the window
 # is re-laid out as borderless fullscreen when the program resizes it to 640x480.
 add_test(NAME Win16UiViaLauncher COMMAND ${LAUNCH} --hidden --mute ${WIN16_SAMPLES}/win16_ui.exe)

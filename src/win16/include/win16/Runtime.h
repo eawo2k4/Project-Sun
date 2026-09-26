@@ -6,9 +6,18 @@
 // System DLLs are built in (Kernel.cpp, User.cpp, Gdi.cpp, WIN87EM). Each
 // one is a host segment; the loader resolves an import MODULE.ordinal to the
 // far address module-selector:ordinal, so a call lands in the matching C++
-// routine. Every other imported DLL (SHELL, MMSYSTEM, a game's own DLL, ...)
-// also gets a host segment, so the program loads; calling into it, or any
-// API that isn't implemented yet, stops the task cleanly with e.g.
+// routine.
+//
+// A program's own DLLs (NE libraries in its directory) are loaded like
+// Windows loads them: segments, relocations (their imports resolved the
+// same way, other DLLs included), then the entry point (LibEntry: DI =
+// hInstance, DS = its DGROUP, CX = heap size) - for DLLs the program imports,
+// before the program starts; for LoadLibrary, right away. Their exports,
+// resources and module handles work like the program's.
+//
+// Any other imported DLL (SHELL, a DLL that isn't there, ...) gets a host
+// segment, so the program loads; calling into it, or any API that isn't
+// implemented yet, stops the task cleanly with e.g.
 // "USER.216 (GetDlgItem) is not implemented yet (returning to 0127:04A2)".
 // Imports of constants (__AHINCR, __WINFLAGS, ...) resolve to their values.
 // Names, parameters and constants come from the API catalog (ApiCatalog.h).
@@ -132,8 +141,37 @@ public:
     // A built-in module (loaded as a stub if the catalog knows it); 0 if unknown.
     uint16_t LoadBuiltinModule(const std::string& name);
     // GetProcAddress: implemented functions of built-in modules, exported
-    // entries of the program (by ordinal). 0 if not available.
+    // entries of the program (by ordinal) and of loaded DLLs. 0 if not available.
     uint32_t ProcAddress(uint16_t module, uint16_t ordinal, const std::string& name);
+
+    // --- The program's DLLs ---
+    struct DllModule {
+        std::string name;      // module name, upper case
+        std::string fileName;  // as the task sees it (GetModuleFileName)
+        NeImage image;
+        LoadedModule loaded;
+        uint16_t hModule = 0;    // a copy of the NE header
+        uint16_t hInstance = 0;  // its DGROUP, or hModule if it has none
+        std::unique_ptr<Resources> resources;
+        int usage = 0;
+        bool initialized = false;
+        bool failed = false;  // its entry point returned 0
+    };
+    // LoadLibrary: a built-in module's handle, or a DLL's hInstance (loading and
+    // initializing it if needed); otherwise an error code below 32
+    // (2 not found, 11 not a valid DLL, 20 its initialization failed).
+    uint16_t LoadLibraryModule(const std::string& name);
+    bool FreeLibraryModule(uint16_t handle);
+    DllModule* FindDll(uint16_t handle);  // by hInstance or hModule
+    DllModule* FindDll(const std::string& name);  // by module or file name
+    size_t DllCount() const { return dlls_.size(); }
+    // The resources of the module an hInstance/hModule belongs to (the
+    // program's for its own handles, 0, and handles nobody owns).
+    Resources& ResourcesFor(uint16_t handle);
+    // FreeResource: whichever module loaded the block. 0 on success.
+    uint16_t FreeResourceAny(uint16_t hglobal);
+    // GetModuleFileName: the program's, a DLL's or a built-in module's path; "" if unknown.
+    std::string ModuleFileName(uint16_t handle);
 
     // Short-lived 16-bit memory for structures handed to a callback (the
     // CREATESTRUCT of WM_CREATE, ...). Nested scopes stack; released on scope exit.
@@ -167,6 +205,16 @@ private:
         std::string line;
         bool printed = false;
     };
+
+    // Loads a DLL from the program's directory (and the DLLs it imports),
+    // queueing its initialization. nullptr with `error` and a Win16 error code.
+    DllModule* LoadDll(const std::string& name, std::string& error, uint16_t& code);
+    bool ResolveExport(DllModule& dll, uint16_t ordinal, const std::string& name, uint16_t& selector,
+                       uint16_t& offset, std::string& error);
+    // Runs the entry points of loaded DLLs not yet initialized (on the
+    // interpreter: must be called while the task runs). False with `error`.
+    bool InitializePendingDlls(std::string& error);
+    void Bootstrap();  // before the program's entry point: initialize its DLLs
 
     size_t AddModule(const std::string& name, std::vector<ApiFunction> functions);
     BuiltinModule* FindModule(const std::string& name);
@@ -210,6 +258,10 @@ private:
     std::vector<uint8_t> playingSound_;
     std::vector<TraceFrame> traceStack_;
     std::set<std::string> notes_;
+    std::vector<std::unique_ptr<DllModule>> dlls_;
+    std::vector<DllModule*> pendingInit_;
+    std::set<std::string> loadingDlls_;  // cycle guard
+    uint16_t bootstrapSel_ = 0;
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
 };
 

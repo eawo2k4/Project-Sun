@@ -10,7 +10,8 @@ namespace {
 // NE header field offsets (relative to the "NE" signature).
 constexpr uint32_t kFlags = 0x0C, kAutoData = 0x0E, kHeap = 0x10, kStack = 0x12, kCsIp = 0x14,
                    kSsSp = 0x18, kSegCount = 0x1C, kModCount = 0x1E, kSegTable = 0x22, kResTable = 0x24,
-                   kResNames = 0x26, kModTable = 0x28, kImpNames = 0x2A, kEntryTable = 0x04,
+                   kResNames = 0x26, kModTable = 0x28, kImpNames = 0x2A, kNonResNames = 0x2C,
+                   kNonResSize = 0x20, kEntryTable = 0x04,
                    kEntryBytes = 0x06, kAlign = 0x32, kTargetOS = 0x36, kExpVer = 0x3E;
 constexpr uint32_t kHeaderSize = 0x40;
 
@@ -115,6 +116,27 @@ bool ParseEntries(const Reader& rd, uint32_t at, uint32_t size, NeImage& out, st
         }
     }
     return true;
+}
+
+// A names table: Pascal strings each followed by an ordinal, up to a zero
+// length. The first entry names the module (resident) or describes it
+// (non-resident), so it's skipped.
+void ParseNames(const Reader& rd, uint32_t at, uint32_t end, NeImage& out) {
+    bool first = true;
+    while (at < end && rd.Has(at, 1)) {
+        const uint8_t length = rd.U8(at);
+        if (length == 0 || !rd.Has(at, 1u + length + 2u)) break;
+        std::string name;
+        rd.PString(at, name);
+        const uint16_t ordinal = rd.U16(at + 1 + length);
+        at += 1u + length + 2u;
+        if (first) {
+            first = false;
+            continue;
+        }
+        for (char& c : name) c = char(std::toupper(static_cast<unsigned char>(c)));
+        out.exportNames.emplace(name, ordinal);
+    }
 }
 
 // A type or name field of the resource table: 8000h | id, or the offset of a
@@ -241,6 +263,11 @@ bool ParseNe(const std::vector<uint8_t>& file, NeImage& out, std::string& error)
     }
 
     rd.PString(resNames, out.moduleName);  // first resident name is the module name
+    ParseNames(rd, resNames, uint32_t(file.size()), out);
+    if (const uint16_t nonResSize = rd.U16(ne + kNonResSize)) {
+        const uint32_t nonRes = rd.U32(ne + kNonResNames);  // a file offset
+        ParseNames(rd, nonRes, nonRes + nonResSize, out);
+    }
 
     if (!rd.Has(segTable, uint64_t(segCount) * 8)) {
         error = "segment table outside the file";

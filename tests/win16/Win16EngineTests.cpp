@@ -1014,6 +1014,86 @@ void TestGdiDefaults() {
     g.DestroySurface(0x2100);
 }
 
+// --- The program's DLLs --------------------------------------------------------------------
+
+std::filesystem::path MakeDllDir(const std::string& name) {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / ("retro_win16_" + name);
+    std::filesystem::remove_all(dir);
+    std::filesystem::create_directories(dir);
+    for (const auto& [file, bytes] : DllProgramFiles()) {
+        std::ofstream out(dir / file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+    }
+    return dir;
+}
+
+void TestParseExports() {
+    NeImage img;
+    std::string error;
+    CHECK(ParseNe(BuildNe(LibraryProgram("TESTDLL", 1, true)), img, error));
+    CHECK(img.IsLibrary() && img.moduleName == "TESTDLL");
+    CHECK(img.exportNames.size() == 4 && img.exportNames.at("ADDTWO") == 1 && img.exportNames.at("GETHEAP") == 5);
+    CHECK(img.FindEntry(1) && img.FindEntry(1)->segment == 1 && img.FindEntry(1)->exported);
+    CHECK(img.FindEntry(5) && !img.FindEntry(4));  // the gap
+}
+
+void TestDllProgram() {
+    const std::filesystem::path dir = MakeDllDir("dlls");
+    const RunOutcome o = RunProgram(DllProgram(), 1'000'000, {false, false, dir / "DLLAPP.EXE"});
+    for (const std::string& line : o.output) std::printf("  | %s\n", line.c_str());
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 0);  // else the failed check
+    auto has = [&](const std::string& text) {
+        return std::any_of(o.output.begin(), o.output.end(),
+                           [&](const std::string& l) { return l.find(text) != std::string::npos; });
+    };
+    CHECK(has("BADINIT failed to initialize") && has("MISSING.DLL is not in the program's directory"));
+}
+
+void TestDllLoadFailures() {
+    const std::filesystem::path dir = MakeDllDir("dllfail");
+    // A DLL the program imports fails to initialize: the task stops before the program runs.
+    RunOutcome o = RunProgram(BadDllImportProgram("BADINIT", 2), 1'000'000, {false, false, dir / "APP.EXE"});
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::FatalExit);
+    CHECK(o.exit.message == "BADINIT failed to initialize (its entry point returned 0)");
+    // An import the DLL doesn't export: the program doesn't load.
+    o = RunProgram(BadDllImportProgram("TESTDLL", 9), 1'000'000, {false, false, dir / "APP.EXE"});
+    CHECK(!o.loaded && o.loadError.find("TESTDLL has no export 9") != std::string::npos);
+    // A DLL that isn't there is still a stub module.
+    o = RunProgram(BadDllImportProgram("NOTHERE", 1), 1'000'000, {false, false, dir / "APP.EXE"});
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Unimplemented);
+    // A program file where a DLL should be.
+    {
+        const std::vector<uint8_t> exe = BuildNe(HelloProgram());
+        std::ofstream(dir / "NOTADLL.DLL", std::ios::binary).write(reinterpret_cast<const char*>(exe.data()),
+                                                                   std::streamsize(exe.size()));
+    }
+    o = RunProgram(BadDllImportProgram("NOTADLL", 1), 1'000'000, {false, false, dir / "APP.EXE"});
+    CHECK(!o.loaded && o.loadError.find("is a program, not a DLL") != std::string::npos);
+}
+
+void TestDllModules() {
+    const std::filesystem::path dir = MakeDllDir("dllmods");
+    Runtime rt;
+    rt.SetProgram(dir / "DLLAPP.EXE");
+    std::string error;
+    CHECK(rt.Load(BuildNe(DllProgram()), "", error));
+    // TESTDLL was loaded with the program; its entry point runs when the task starts.
+    CHECK(rt.DllCount() == 1);
+    Runtime::DllModule* dll = rt.FindDll("testdll.dll");
+    CHECK(dll && !dll->initialized && dll->hInstance == dll->loaded.dgroup && dll->hModule);
+    if (!dll) return;
+    CHECK(rt.FindDll(dll->hInstance) == dll && rt.FindDll(dll->hModule) == dll);
+    CHECK(rt.FindModuleHandle("TESTDLL") == dll->hModule);
+    CHECK(rt.ModuleFileName(dll->hInstance).find("TESTDLL.DLL") != std::string::npos);
+    // Resources by module: the DLL's string, not the program's.
+    std::string s;
+    CHECK(rt.ResourcesFor(dll->hInstance).String(1, s) && s == "From the DLL");
+    CHECK(!rt.ResourcesFor(0).String(1, s));
+    CHECK(rt.ProcAddress(dll->hModule, 0, "GETINIT") == ((uint32_t(dll->loaded.selectors[0]) << 16) |
+                                                         dll->image.FindEntry(2)->offset));
+    CHECK(rt.ProcAddress(dll->hInstance, 4, "") == 0);  // no ordinal 4
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -1068,6 +1148,10 @@ int main() {
         {"MenuModel", TestMenuModel},
         {"InputState", TestInputState},
         {"GdiDefaults", TestGdiDefaults},
+        {"ParseExports", TestParseExports},
+        {"DllProgram", TestDllProgram},
+        {"DllLoadFailures", TestDllLoadFailures},
+        {"DllModules", TestDllModules},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

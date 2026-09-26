@@ -39,6 +39,8 @@ struct LoadedModule {
     Registers initial;                // register state at the entry point
 };
 
+// For a library (DLL) there's no PSP and no register state: the caller runs
+// its entry point.
 bool LoadNe(const NeImage& image, const std::vector<uint8_t>& file, Memory& memory,
             ImportResolver& imports, const std::string& commandLine, LoadedModule& out,
             std::string& error);

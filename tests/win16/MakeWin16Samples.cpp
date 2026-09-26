@@ -31,6 +31,7 @@ int main(int argc, char** argv) {
         {"win16_crt.exe", win16test::CrtProgram()},
         {"win16_shell.exe", win16test::MissingModuleProgram()},
         {"win16_ui.exe", win16test::UiProgram()},
+        {"win16_dlls.exe", win16test::DllProgram()},
     };
     for (const auto& s : samples) {
         const std::vector<uint8_t> bytes = win16test::BuildNe(s.program);
@@ -41,6 +42,15 @@ int main(int argc, char** argv) {
             return 1;
         }
         std::printf("wrote %s (%zu bytes)\n", s.file, bytes.size());
+    }
+    // win16_dlls.exe's DLLs.
+    for (const auto& [file, bytes] : win16test::DllProgramFiles()) {
+        std::ofstream out(dir + "/" + file, std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+        if (!out) {
+            std::fprintf(stderr, "cannot write %s\n", file.c_str());
+            return 1;
+        }
     }
     // win16_crt.exe reads these from its directory.
     for (const auto& [file, content] : win16test::CrtProgramFiles()) {

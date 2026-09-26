@@ -1737,6 +1737,208 @@ inline NeProgram UiProgram() {
     return p;
 }
 
+// A DLL (NE library) with DGROUP (word 6 = 100) and a string table (1 =
+// "From the DLL"). Its entry point stores `initValue` at DGROUP:0, DI
+// (hInstance) at 2 and CX (heap size) at 4, and returns `initSucceeds`.
+// Exports: 1 ADDTWO(a, b) = a + b + 100, 2 GETINIT, 3 GETINSTANCE, 5 GETHEAP
+// (no ordinal 4). Each export loads its own DGROUP into DS, as exported
+// functions do.
+inline NeProgram LibraryProgram(const std::string& moduleName, uint16_t initValue, bool initSucceeds) {
+    NeProgram p;
+    p.name = moduleName;
+    p.flags = 0x8301;  // library, single data
+    p.modules = {"KERNEL"};
+    p.autoData = 2;
+    p.heap = 0x100;
+    p.stack = 0;
+    p.entrySegment = 1;
+    p.entryIp = 0;
+    NeSeg code;
+    Asm16 a;
+    auto loadDs = [&] {  // push ds / mov ax, DGROUP / mov ds, ax
+        a.db({0x1E, 0xB8});
+        code.relocs.push_back({2, 0, a.Here(), 2, 0});  // selector of segment 2
+        a.db({0xFF, 0xFF, 0x8E, 0xD8});
+    };
+    // LibEntry
+    a.db({0xC7, 0x06, 0x00, 0x00}).dw(initValue);     // mov word [0], initValue
+    a.db({0x89, 0x3E, 0x02, 0x00});                   // mov [2], di
+    a.db({0x89, 0x0E, 0x04, 0x00});                   // mov [4], cx
+    a.db({0xB8, initSucceeds ? 1 : 0, 0x00, 0xCB});   // mov ax, 1 or 0 / retf
+    const uint16_t addTwo = a.Here();
+    a.db({0x55, 0x89, 0xE5});                         // push bp / mov bp, sp
+    loadDs();
+    a.db({0x8B, 0x46, 0x08, 0x03, 0x46, 0x06});       // mov ax, [bp+8] (a) / add ax, [bp+6] (b)
+    a.db({0x03, 0x06, 0x06, 0x00});                   // add ax, [6]
+    a.db({0x1F, 0x5D, 0xCA, 0x04, 0x00});             // pop ds / pop bp / retf 4
+    auto getter = [&](uint8_t offset) {
+        const uint16_t at = a.Here();
+        loadDs();
+        a.db({0xA1, offset, 0x00, 0x1F, 0xCB});       // mov ax, [offset] / pop ds / retf
+        return at;
+    };
+    const uint16_t getInit = getter(0), getInstance = getter(2), getHeap = getter(4);
+    code.bytes = a.Finish();
+    std::vector<uint8_t> data(16, 0);
+    data[6] = 100;
+    p.segments = {code, DataSegment(data, 0x40)};
+    p.exports = {{1, 1, addTwo, "ADDTWO"}, {2, 1, getInit, "GETINIT"}, {3, 1, getInstance, "GETINSTANCE"},
+                 {5, 1, getHeap, "GETHEAP"}};
+    p.resources = {{6, "", 1, "", StringBlock({"", "From the DLL"})}};
+    return p;
+}
+
+// The DLLs DllProgram uses, for its directory.
+inline std::vector<std::pair<std::string, std::vector<uint8_t>>> DllProgramFiles() {
+    return {{"TESTDLL.DLL", BuildNe(LibraryProgram("TESTDLL", 0x1234, true))},
+            {"LATEDLL.DLL", BuildNe(LibraryProgram("LATEDLL", 0x5678, true))},
+            {"BADINIT.DLL", BuildNe(LibraryProgram("BADINIT", 0, false))}};
+}
+
+// A program with DLLs. Exit 0, or the failed check:
+//   1 TESTDLL.ADDTWO(3, 4) = 107 (imported by ordinal)
+//   2 GETINIT (imported by name) = 1234h: the DLL was initialized first
+//   3 LoadLibrary of the loaded DLL = its hInstance = the DI its entry point
+//     got; CX was its heap size
+//   4 GetProcAddress(hInst, "ADDTWO")(10, 20) = 130, called through the pointer
+//   5 LoadString from the DLL's resources; the program has none
+//   6 GetModuleHandle("TESTDLL"), GetModuleFileName, GetProcAddress(hModule, #2)
+//   7 LoadLibrary("LATEDLL.DLL") initializes it now: its GETINIT = 5678h
+//   8 LoadLibrary: BADINIT.DLL (its entry point fails) = 20, MISSING.DLL = 2
+//   9 FindWindow by class (any case), by title, and a miss
+inline NeProgram DllProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI", "TESTDLL"};
+    p.importNames = {"GETINIT"};
+    constexpr uint16_t kHinst = 0x00, kDll = 0x02, kProc = 0x04, kLate = 0x08, kHwnd = 0x0A, kModule = 0x0C,
+                       kTestDll = 0x10, kLateDll = 0x20, kBadDll = 0x30, kMissing = 0x40, kAddTwo = 0x50,
+                       kModName = 0x58, kClass = 0x60, kTitle = 0x68, kNope = 0x70, kClassUpper = 0x78,
+                       kWndClass = 0x80, kBuf = 0xA0;
+    std::vector<uint8_t> data(0xE0, 0);
+    auto put = [&](uint16_t at, const std::string& s) { std::copy(s.begin(), s.end(), data.begin() + at); };
+    put(kTestDll, "TESTDLL.DLL");
+    put(kLateDll, "LATEDLL.DLL");
+    put(kBadDll, "BADINIT.DLL");
+    put(kMissing, "MISSING.DLL");
+    put(kAddTwo, "ADDTWO");
+    put(kModName, "TESTDLL");
+    put(kClass, "FindWin");
+    put(kTitle, "Finder");
+    put(kNope, "NOPE");
+    put(kClassUpper, "FINDWIN");
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    constexpr uint16_t TESTDLL = 4;
+    auto eq = [&](uint16_t v, int fail) { e.CmpAx(v); FailUnless(a, JZ, fail); };
+    auto callProc = [&] { a.db({0xFF, 0x1E}).dw(kProc); };  // call far [proc]
+    auto storeProc = [&] { e.StoreAx(kProc); a.db({0x89, 0x16}).dw(kProc + 2); };  // mov [proc], ax / mov [proc+2], dx
+
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    // 1-2
+    e.Imm(3); e.Imm(4);
+    e.Call(TESTDLL, 1);
+    eq(107, 1);
+    code.relocs.push_back(ImportName(a.CallFar(), TESTDLL, p.ImportNameOffset("GETINIT")));
+    eq(0x1234, 2);
+    // 3
+    e.Far(kTestDll);
+    e.Call(Emit::KERNEL, 95);  // LoadLibrary
+    e.CmpAx(32); FailUnless(a, 0x73 /* JAE */, 3);
+    e.StoreAx(kDll);
+    e.Call(TESTDLL, 3);  // GETINSTANCE
+    a.db({0x3B, 0x06}).dw(kDll); FailUnless(a, JZ, 3);
+    e.Call(TESTDLL, 5);  // GETHEAP
+    eq(0x100, 3);
+    // 4
+    e.Mem(kDll); e.Far(kAddTwo);
+    e.Call(Emit::KERNEL, 50);  // GetProcAddress
+    storeProc();
+    e.Imm(10); e.Imm(20);
+    callProc();
+    eq(130, 4);
+    // 5
+    e.Mem(kDll); e.Imm(1); e.Far(kBuf); e.Imm(32);
+    e.Call(Emit::USER, 176);  // LoadString
+    eq(12, 5);
+    e.Mem(kHinst); e.Imm(1); e.Far(kBuf); e.Imm(32);
+    e.Call(Emit::USER, 176);
+    eq(0, 5);
+    // 6
+    e.Far(kModName);
+    e.Call(Emit::KERNEL, 47);  // GetModuleHandle
+    e.CmpAx(0); FailUnless(a, JNZ, 6);
+    e.StoreAx(kModule);
+    e.Mem(kModule); e.Far(kBuf); e.Imm(64);
+    e.Call(Emit::KERNEL, 49);  // GetModuleFileName
+    e.CmpAx(0); FailUnless(a, JNZ, 6);
+    e.Mem(kModule); e.Long(2);
+    e.Call(Emit::KERNEL, 50);  // GetProcAddress(hModule, MAKEINTRESOURCE(2))
+    storeProc();
+    callProc();
+    eq(0x1234, 6);
+    // 7
+    e.Far(kLateDll);
+    e.Call(Emit::KERNEL, 95);
+    e.CmpAx(32); FailUnless(a, 0x73, 7);
+    e.StoreAx(kLate);
+    e.Mem(kLate); e.Long(2);
+    e.Call(Emit::KERNEL, 50);
+    storeProc();
+    callProc();
+    eq(0x5678, 7);
+    e.Mem(kLate);
+    e.Call(Emit::KERNEL, 96);  // FreeLibrary
+    // 8
+    e.Far(kBadDll);
+    e.Call(Emit::KERNEL, 95);
+    eq(20, 8);
+    e.Far(kMissing);
+    e.Call(Emit::KERNEL, 95);
+    eq(2, 8);
+    // 9
+    e.RegisterClass(uint8_t(kWndClass), uint8_t(kClass), uint8_t(kHinst), "WndProc", 4);
+    e.CreatePopup(uint8_t(kClass), uint8_t(kTitle), 0, 0, 32, 32, uint8_t(kHinst));
+    e.StoreAx(kHwnd);
+    e.Far(kClassUpper); e.Long(0);
+    e.Call(Emit::USER, 50);  // FindWindow("FINDWIN", NULL)
+    a.db({0x3B, 0x06}).dw(kHwnd); FailUnless(a, JZ, 9);
+    e.Long(0); e.Far(kTitle);
+    e.Call(Emit::USER, 50);  // FindWindow(NULL, "Finder")
+    a.db({0x3B, 0x06}).dw(kHwnd); FailUnless(a, JZ, 9);
+    e.Far(kNope); e.Long(0);
+    e.Call(Emit::USER, 50);
+    eq(0, 9);
+    e.Exit0();
+    e.FailStubs(9);
+
+    a.Label("WndProc");  // everything to DefWindowProc
+    a.db({0x55, 0x89, 0xE5});
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);
+    a.db({0x5D, 0xCA, 0x0A, 0x00});
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x100)};
+    return p;
+}
+
+// Imports from a DLL whose entry point fails (before the program starts) or
+// an export a DLL doesn't have.
+inline NeProgram BadDllImportProgram(const std::string& module, uint16_t ordinal) {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", module};
+    NeSeg code;
+    Asm16 a;
+    code.relocs.push_back(ImportOrdinal(a.CallFar(), 2, ordinal));
+    a.db({0xB8, 0x00, 0x4C, 0xCD, 0x21});
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment({}, 0x100)};
+    return p;
+}
+
 // CrtProgram's files: CRT.INI and CRTDATA.BIN, for the program's directory.
 inline std::vector<std::pair<std::string, std::string>> CrtProgramFiles() {
     return {{"CRT.INI", "; test settings\r\n[Game]\r\nLevel=7\r\nName = Sunny\r\n"}, {"CRTDATA.BIN", "RETRO16!"}};

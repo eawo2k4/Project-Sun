@@ -1041,7 +1041,7 @@ void LoadBitmap(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name) -> HBITMAP
         rt.Print("LoadBitmap: system bitmaps (OBM_xxx) are not available yet");
     } else {
         const ResourceId name = ResourceId::FromFarPtr(rt.Mem(), namePtr.sel, namePtr.off);
-        const NeResource* r = rt.Resource().Lookup(ResourceId{res::Bitmap, {}}, name);
+        const NeResource* r = rt.ResourcesFor(a.Word(0)).Lookup(ResourceId{res::Bitmap, {}}, name);
         if (!r) {
             rt.Print("LoadBitmap: no bitmap resource " + name.Describe());
         } else if (!(bitmap = rt.Graphics().CreateBitmapFromDib(r->data.data(), r->data.size()))) {
@@ -1059,7 +1059,7 @@ void LoadString(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, UINT id, LPSTR buffer, 
     std::string s;
     uint16_t copied = 0;
     if (max > 0 && !buffer.IsNull()) {
-        if (rt.Resource().String(a.Word(1), s)) {
+        if (rt.ResourcesFor(a.Word(0)).String(a.Word(1), s)) {
             copied = uint16_t(std::min<size_t>(s.size(), size_t(max - 1)));
             for (uint16_t i = 0; i < copied; ++i)
                 rt.Mem().Write8(buffer.sel, uint16_t(buffer.off + i), uint8_t(s[i]));

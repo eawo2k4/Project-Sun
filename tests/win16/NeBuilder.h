@@ -5,6 +5,7 @@
 // tables, entry table, segment data with relocation records, and resource
 // data, laid out on 16-byte sectors like a linker and resource compiler would.
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -29,6 +30,15 @@ struct NeSeg {
     std::vector<NeReloc> relocs;
 };
 
+// An exported entry point (ordinals from 1; gaps allowed), with its name in
+// the resident names table.
+struct NeExport {
+    uint16_t ordinal;
+    uint8_t segment;
+    uint16_t offset;
+    std::string name;
+};
+
 // A resource: integer type/name ids (non-zero) or strings.
 struct NeRes {
     uint16_t type = 0;
@@ -44,6 +54,7 @@ struct NeProgram {
     std::vector<std::string> modules;      // module reference table, in order
     std::vector<std::string> importNames;  // extra names for by-name imports
     std::vector<NeRes> resources;
+    std::vector<NeExport> exports;
     uint16_t entrySegment = 1;
     uint16_t entryIp = 0;
     uint16_t autoData = 0;
@@ -147,6 +158,10 @@ inline std::vector<uint8_t> BuildNe(const NeProgram& p) {
     const size_t resNames = f.size();
     AppendPString(f, p.name);
     Append16(f, 0);
+    for (const NeExport& e : p.exports) {
+        AppendPString(f, e.name);
+        Append16(f, e.ordinal);
+    }
     f.push_back(0);
 
     const size_t modTab = f.size();
@@ -157,8 +172,39 @@ inline std::vector<uint8_t> BuildNe(const NeProgram& p) {
     for (const std::string& m : p.modules) AppendPString(f, m);
     for (const std::string& n : p.importNames) AppendPString(f, n);
 
+    // Entry table: bundles of consecutive ordinals in one segment (fixed
+    // entries: flags, offset), empty bundles for gaps.
     const size_t entTab = f.size();
-    f.push_back(0);  // no exports
+    {
+        std::vector<NeExport> sorted = p.exports;
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const NeExport& x, const NeExport& y) { return x.ordinal < y.ordinal; });
+        uint16_t next = 1;
+        size_t i = 0;
+        while (i < sorted.size()) {
+            if (sorted[i].ordinal > next) {  // skip unused ordinals
+                const uint16_t gap = uint16_t(std::min(255, sorted[i].ordinal - next));
+                f.push_back(uint8_t(gap));
+                f.push_back(0);
+                next = uint16_t(next + gap);
+                continue;
+            }
+            size_t j = i;
+            while (j < sorted.size() && j - i < 255 && sorted[j].ordinal == next + (j - i) &&
+                   sorted[j].segment == sorted[i].segment)
+                ++j;
+            f.push_back(uint8_t(j - i));
+            f.push_back(sorted[i].segment);
+            for (size_t k = i; k < j; ++k) {
+                f.push_back(0x03);  // exported, shared data
+                Append16(f, sorted[k].offset);
+            }
+            next = uint16_t(next + (j - i));
+            i = j;
+        }
+        f.push_back(0);
+    }
+    const size_t entEnd = f.size();
 
     // Segment data (+ relocations), each on a 16-byte sector.
     for (size_t i = 0; i < p.segments.size(); ++i) {
@@ -198,7 +244,7 @@ inline std::vector<uint8_t> BuildNe(const NeProgram& p) {
     f[ne + 2] = 5;
     f[ne + 3] = 10;
     Put16(f, ne + 0x04, uint16_t(entTab - ne));
-    Put16(f, ne + 0x06, 1);
+    Put16(f, ne + 0x06, uint16_t(entEnd - entTab));
     Put16(f, ne + 0x0C, p.flags);
     Put16(f, ne + 0x0E, p.autoData);
     Put16(f, ne + 0x10, p.heap);
