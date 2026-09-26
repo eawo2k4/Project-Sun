@@ -171,7 +171,10 @@ public:
 
     // Windows 3.x timers tick with the PC timer (18.2 Hz): nothing fires more
     // often than every 55 ms, and programs written for it rely on that.
+    // SetExactTimers(true) honours shorter intervals (down to 1 ms) instead.
     static constexpr uint32_t kMinTimerMs = 55;
+    void SetExactTimers(bool exact) { minTimerMs_ = exact ? 1 : kMinTimerMs; }
+    uint32_t MinTimerMs() const { return minTimerMs_; }
 
     // (Method names avoid the Win32 API names: <windows.h> defines CreateWindow,
     // SendMessage, ... as macros, and hosts include both.)
@@ -233,6 +236,7 @@ private:
     std::deque<Msg16> queue_;
     std::vector<Timer> timers_;
     uint16_t nextTimerId_ = 1;  // for timers without a window
+    uint32_t minTimerMs_ = kMinTimerMs;
     bool quitPending_ = false;
     uint16_t quitCode_ = 0;
     uint16_t nextHwnd_ = 0x2004;

@@ -53,6 +53,8 @@ struct NeSegment {
     uint16_t flags = 0;
     uint32_t minAlloc = 0;    // bytes to allocate (>= fileLength)
     std::vector<NeRelocation> relocations;
+    // Iterated segments: the data after expanding the records. Empty otherwise.
+    std::vector<uint8_t> expanded;
 
     bool IsData() const { return (flags & kData) != 0; }
 };

@@ -55,6 +55,13 @@ public:
     // Marks the selector not present and returns its memory for reuse.
     void Free(uint16_t selector);
 
+    // Changes a segment's size (1..65536), keeping its selector and contents;
+    // new bytes are zero. The segment may move in the arena (its base changes,
+    // which programs never see). False if out of memory or not a data/code segment.
+    bool Resize(uint16_t selector, uint32_t size);
+    // Arena bytes not yet handed out (GetFreeSpace, GlobalCompact).
+    uint32_t FreeBytes() const;
+
     // Descriptor for a selector, or nullptr if the selector is null, not an
     // LDT selector, out of range or not present.
     const Descriptor* Lookup(uint16_t selector) const;
@@ -85,6 +92,8 @@ private:
         uint32_t base;
         uint32_t size;
     };
+    // Paragraph-aligned arena range of `span` bytes; UINT32_MAX if none.
+    uint32_t AllocRange(uint32_t span);
 
     std::vector<uint8_t> arena_;
     std::vector<Descriptor> ldt_;

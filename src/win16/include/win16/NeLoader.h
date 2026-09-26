@@ -5,7 +5,7 @@
 // fixups), PSP built, and the initial register state the Windows loader
 // hands a task:
 //
-//   CS:IP = entry point      SS:SP = stack (top of DGROUP if SP was 0)
+//   CS:IP = entry point      SS:SP = stack (after DGROUP's static data if SP was 0)
 //   DS = DGROUP (automatic data segment)   ES = PSP
 //   AX = 0  BX = stack size  CX = heap size  SI = hPrevInstance (0)
 //   DI = hInstance (the DGROUP selector)    BP = 0
@@ -32,6 +32,9 @@ public:
 struct LoadedModule {
     std::vector<uint16_t> selectors;  // selector of segment n is selectors[n - 1]
     uint16_t dgroup = 0;              // automatic data segment (0 if none)
+    // DGROUP is laid out like Windows does it: static data, stack, local heap.
+    // The heap runs from heapStart to the end of the segment (InitTask sets it up).
+    uint16_t heapStart = 0;
     uint16_t psp = 0;
     Registers initial;                // register state at the entry point
 };
