@@ -8,6 +8,11 @@
 //   ShimProbe spawn-a <mode...>   same via CreateProcessA
 //   ShimProbe spawn-shell <mode...> same via ShellExecuteExW
 //   ShimProbe spawn64             run 64-bit cmd.exe; it must still start and exit normally
+//   ShimProbe module <name> <0|1> RetroShimIsModuleActive(name) matches
+//   ShimProbe display             ChangeDisplaySettings/EnumDisplaySettings are sandboxed
+//   ShimProbe window [windowed]   fullscreen window is sandboxed, scaled and input-mapped
+//   ShimProbe adopt               windows sized to the virtual screen get adopted
+//   ShimProbe render <fps>        whole-frame blits are paced at <fps> (0 = unpaced)
 
 #include <windows.h>
 
@@ -19,17 +24,14 @@
 #include <cstdlib>
 #include <string>
 
+#include "ProbeCommon.h"
+
+using probe::Expect;
+
 namespace {
 
 constexpr uint64_t kMiB = 1024ull * 1024ull;
 constexpr uint64_t kInt32SafeBytes = 0x7FFF0000ull;
-
-int g_failures = 0;
-
-void Expect(bool ok, const char* what) {
-    std::printf("  %-58s %s\n", what, ok ? "ok" : "FAILED");
-    if (!ok) ++g_failures;
-}
 
 bool LowDwordSafe(uint64_t v) {
     return v <= kInt32SafeBytes || static_cast<int32_t>(static_cast<uint32_t>(v)) >= 0x40000000;
@@ -98,7 +100,7 @@ int ProbeDisk(uint32_t capMiB) {
     DWORD onlyTotal = 0;
     Expect(GetDiskFreeSpaceA(nullptr, nullptr, nullptr, nullptr, &onlyTotal) && onlyTotal > 0,
            "GetDiskFreeSpaceA(current dir, single output)");
-    return g_failures ? 1 : 0;
+    return probe::Result();
 }
 
 int ProbeMemory(uint32_t capMiB) {
@@ -131,7 +133,7 @@ int ProbeMemory(uint32_t capMiB) {
     MEMORYSTATUSEX bad{};
     bad.dwLength = 4;
     Expect(!GlobalMemoryStatusEx(&bad), "bad dwLength rejected");
-    return g_failures ? 1 : 0;
+    return probe::Result();
 }
 
 std::wstring JoinArgs(int argc, wchar_t** argv, int first) {
@@ -231,6 +233,15 @@ int wmain(int argc, wchar_t** argv) {
     if (mode == L"spawn-a") return SpawnSelfA(JoinArgs(argc, argv, 2));
     if (mode == L"spawn-shell") return SpawnSelfShell(JoinArgs(argc, argv, 2));
     if (mode == L"spawn64") return Spawn64();
+    if (mode == L"module" && argc > 3) {
+        char name[64];
+        WideCharToMultiByte(CP_ACP, 0, argv[2], -1, name, sizeof(name), nullptr, nullptr);
+        return probe::ProbeModule(name, argv[3][0] == L'1');
+    }
+    if (mode == L"display") return probe::ProbeDisplayModes();
+    if (mode == L"window") return probe::ProbeWindow(argc > 2 && std::wstring(argv[2]) == L"windowed");
+    if (mode == L"adopt") return probe::ProbeAdoption();
+    if (mode == L"render") return probe::ProbeRender(ArgOr(argc, argv, 2, 60));
 
     std::printf("unknown mode\n");
     return 2;

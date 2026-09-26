@@ -26,7 +26,7 @@ HMODULE g_module = nullptr;
 
 struct HookModule {
     const char* name;
-    uint32_t feature;
+    uint32_t features;  // installed if any of these feature bits is set
     LONG (*attach)();
     LONG (*detach)();
     bool installed;
@@ -36,6 +36,9 @@ HookModule g_modules[] = {
     {"storage", ShimFeature_ClampStorage, AttachStorageHooks, DetachStorageHooks, false},
     {"memory", ShimFeature_ClampMemory, AttachMemoryHooks, DetachMemoryHooks, false},
     {"child-process", ShimFeature_ChildProcesses, AttachProcessHooks, DetachProcessHooks, false},
+    {"display", ShimFeature_DisplaySandbox, AttachDisplayHooks, DetachDisplayHooks, false},
+    {"render", ShimFeature_DisplaySandbox | ShimFeature_FrameLimiter, AttachRenderHooks,
+     DetachRenderHooks, false},
 };
 
 void LoadConfig() {
@@ -64,7 +67,7 @@ LONG RunTransaction(LONG (*step)()) {
 
 void InstallHooks() {
     for (HookModule& m : g_modules) {
-        if (!(g_config.features & m.feature)) {
+        if (!(g_config.features & m.features)) {
             log::Write("%s: disabled", m.name);
             continue;
         }
@@ -103,6 +106,17 @@ const ShimConfig& Config() { return g_config; }
 HMODULE Module() { return g_module; }
 
 }  // namespace retro::shim
+
+// Diagnostic export (by name, see RetroShim.def): lets tools and the test
+// probe check a module really is active before relying on it, e.g. before
+// calling ChangeDisplaySettings on a real desktop.
+extern "C" BOOL WINAPI RetroShimIsModuleActive(const char* name) {
+    if (!name) return FALSE;
+    for (const auto& m : retro::shim::g_modules) {
+        if (strcmp(m.name, name) == 0) return m.installed ? TRUE : FALSE;
+    }
+    return FALSE;
+}
 
 BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved) {
     using namespace retro::shim;
