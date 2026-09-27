@@ -111,9 +111,20 @@ Project Sun/
     interface facts are used). The catalog covers KERNEL, USER, GDI, KEYBOARD, SOUND,
     MMSYSTEM, SHELL, COMMDLG, WIN87EM, LZEXPAND, VER, TOOLHELP, SYSTEM, DDEML, WINSOCK,
     DISPLAY, MOUSE, COMM and WING.
-  - **Other DLLs load as stubs:** a program importing a DLL that isn't built in
-    (SHELL, MMSYSTEM, or the game's own) still loads, and only a call into it stops
-    the task.
+  - **A program's own DLLs are loaded** from its directory, like Windows does it:
+    - Their segments and relocations are set up, with their own imports resolved,
+      including other DLLs.
+    - Their entry point (`LibEntry`: DI = hInstance, DS = its DGROUP, CX = heap size)
+      runs before the program starts, for DLLs it imports, or inside `LoadLibrary`.
+    - Exports work by ordinal and by name (resident and non-resident name tables).
+    - Each DLL has its own resources, `hInstance` and `hModule`, so
+      `LoadBitmap(hDll, …)`, `LoadString` and `GetProcAddress` use the right module.
+    - A DLL whose entry point fails stops the task before it starts (or
+      `LoadLibrary` returns 20), and so does an import it doesn't export.
+    - DLLs stay loaded until the program ends.
+  - **Other DLLs load as stubs:** a program importing a system DLL that isn't
+    implemented (SHELL, COMMDLG, …) or a DLL that isn't in its directory still loads,
+    and only a call into it stops the task.
   - **Missing APIs stop cleanly, by name:** calling an API that isn't implemented yet
     stops the task with e.g.
     `USER.216 (GetDlgItem) is not implemented yet (returning to 0127:04A2)`, rather
@@ -132,10 +143,10 @@ Project Sun/
       `GetFreeSpace`, `LockSegment`/`UnlockSegment`.
     - Local heap: `LocalInit`, `LocalAlloc`, `LocalReAlloc`, `LocalFree`, `LocalLock`,
       `LocalUnlock`, `LocalSize`, `LocalHandle`, `LocalFlags`, `LocalCompact`.
-    - Modules: `GetModuleHandle`, `GetModuleFileName`, `GetProcAddress`,
-      `MakeProcInstance`/`FreeProcInstance`, `LoadLibrary` (built-in modules only),
-      `FreeLibrary`, `GetInstanceData`, `GetCurrentTask`, `GetCurrentPDB`,
-      `GetDOSEnvironment`.
+    - Modules: `GetModuleHandle`, `GetModuleFileName`, `GetModuleUsage`,
+      `GetProcAddress`, `MakeProcInstance`/`FreeProcInstance`, `LoadLibrary` (the
+      program's DLLs and built-in modules), `FreeLibrary`, `GetInstanceData`,
+      `GetCurrentTask`, `GetCurrentPDB`, `GetDOSEnvironment`.
     - Strings: `lstrcpy`, `lstrcpyn`, `lstrcat`, `lstrlen`, `OutputDebugString`.
     - Files: `OpenFile`, `_lopen`, `_lread`, `_llseek`, `_lclose` (`_lcreat`/`_lwrite`
       are refused), plus `GetWindowsDirectory`, `GetSystemDirectory` and `SetErrorMode`.
@@ -154,7 +165,8 @@ Project Sun/
       `ClientToScreen`/`ScreenToClient`, `Get`/`SetWindowWord`, `Get`/`SetWindowLong`
       (including `GWL_WNDPROC` subclassing), `GetClassWord`/`SetClassWord`/`GetClassLong`,
       `SetWindowText`/`GetWindowText`/`GetWindowTextLength`, `EnableWindow`,
-      `IsWindow…`, `GetParent`, `GetWindow`, `GetDesktopWindow`, `BringWindowToTop`.
+      `IsWindow…`, `GetParent`, `GetWindow`, `FindWindow`, `GetDesktopWindow`,
+      `BringWindowToTop`.
     - Focus and input: `SetFocus`/`GetFocus`, `SetActiveWindow`/`GetActiveWindow`,
       `GetKeyState`/`GetAsyncKeyState`, `SetCapture`/`ReleaseCapture`/`GetCapture`,
       `SetCursor`, `ShowCursor`, `LoadCursor` (standard cursors), `GetCursorPos`.
@@ -350,8 +362,10 @@ Not yet:
   `LoadIcon` returns a placeholder and custom cursors show as the arrow).
 - Sound: wave and MIDI output (`waveOut`, `midiOut`) and MCI.
 - Timers: `SetSystemTimer`.
-- Files and memory: writing files, loading NE DLLs (a game's own DLLs load as stubs),
-  and huge (> 64 KB) global blocks.
+- Files and memory: writing files, and huge (> 64 KB) global blocks.
+- Modules: starting other programs (`WinExec`, `LoadModule`), unloading DLLs (their
+  `WEP` isn't called), and system DLLs shipped with a game (`COMMDLG.DLL`, …: the
+  engine's stub is used instead, since they need USER internals).
 - CPU: 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), and
   floating point. WIN87EM's emulation interrupts and x87 instructions stop the task
   with a clear message.

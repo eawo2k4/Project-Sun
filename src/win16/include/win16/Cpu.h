@@ -108,8 +108,10 @@ public:
     // an exported Win16 callback expects. The caller's registers are restored
     // afterwards. Faults, task exits and the budget inside the callback unwind
     // out of the enclosing Run().
+    // `setup`, if given, adjusts the registers just before the call (a DLL's
+    // entry point takes its arguments in registers).
     uint32_t CallFar(uint16_t selector, uint16_t offset, std::initializer_list<uint16_t> args,
-                     uint16_t ds);
+                     uint16_t ds, const std::function<void(Cpu&)>& setup = {});
     int CallbackDepth() const { return callDepth_; }
 
 private:

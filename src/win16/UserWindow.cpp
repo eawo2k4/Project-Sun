@@ -285,6 +285,34 @@ void GetWindow(Runtime& rt, Cpu& cpu) {  // (HWND, GW_xxx) -> HWND
     Return(cpu, a, result);
 }
 
+// (LPCSTR class or MAKEINTATOM or NULL, LPCSTR title or NULL) -> the first
+// top-level window matching both (case-insensitively), or NULL.
+void FindWindow(Runtime& rt, Cpu& cpu) {
+    const PascalArgs a(cpu, {4, 4});
+    const FarPtr cls = a.Ptr(0), title = a.Ptr(1);
+    auto upper = [](std::string s) {
+        for (char& c : s) c = char(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    };
+    const std::string wantClass = cls.sel ? upper(rt.Mem().ReadString(cls.sel, cls.off, 256)) : "";
+    const std::string wantTitle = title.IsNull() ? "" : upper(rt.Mem().ReadString(title.sel, title.off, 256));
+    const User& u = rt.Windows();
+    uint16_t found = 0;
+    for (uint16_t h : u.Handles()) {
+        const User::Window* w = u.Find(h);
+        if ((w->style & ws::Child) || w->destroying) continue;
+        if (cls.sel && w->className != wantClass) continue;
+        if (!cls.sel && cls.off) {  // an atom
+            const User::WindowClass* c = u.FindClass(w->className);
+            if (!c || c->atom != cls.off) continue;
+        }
+        if (!title.IsNull() && upper(w->title) != wantTitle) continue;
+        found = h;
+        break;
+    }
+    Return(cpu, a, found);
+}
+
 void GetFocus(Runtime& rt, Cpu& cpu) { SetResult(cpu, rt.Windows().Focus()); cpu.ReturnFar(0); }
 
 void SetFocus(Runtime& rt, Cpu& cpu) {  // (HWND) -> previous
@@ -634,6 +662,7 @@ std::vector<ApiFunction> UserWindowApi() {
         {46, "GETPARENT", GetParent},
         {47, "ISWINDOW", IsWindow},
         {49, "ISWINDOWVISIBLE", IsWindowVisible},
+        {50, "FINDWINDOW", FindWindow},
         {56, "MOVEWINDOW", MoveWindow},
         {59, "SETACTIVEWINDOW", SetActiveWindow},
         {60, "GETACTIVEWINDOW", GetActiveWindow},

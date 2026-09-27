@@ -5,6 +5,7 @@
 // with synthetic images.
 
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -105,6 +106,8 @@ struct NeImage {
     std::vector<std::string> moduleRefs;     // module n is moduleRefs[n - 1]
     std::vector<NeEntry> entries;
     std::vector<NeResource> resources;
+    // Exported names (resident and non-resident name tables), upper case -> ordinal.
+    std::map<std::string, uint16_t> exportNames;
 
     bool IsLibrary() const { return (flags & 0x8000) != 0; }
     const NeEntry* FindEntry(uint16_t ordinal) const;

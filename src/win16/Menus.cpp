@@ -190,8 +190,8 @@ std::string ItemText(Runtime& rt, uint16_t flags, FarPtr p) {
 void LoadMenu(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name) -> HMENU
     const PascalArgs a(cpu, {2, 4});
     const FarPtr name = a.Ptr(1);
-    const NeResource* r = rt.Resource().Lookup(ResourceId{res::Menu, {}},
-                                               ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
+    const NeResource* r = rt.ResourcesFor(a.Word(0)).Lookup(ResourceId{res::Menu, {}},
+                                                            ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
     Return(cpu, a, r ? rt.MenuTable().FromTemplate(r->data) : 0);
 }
 
@@ -342,8 +342,8 @@ void TrackPopupMenu(Runtime& rt, Cpu& cpu) {  // (HMENU, flags, x, y, reserved, 
 void LoadAccelerators(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name) -> HACCEL
     const PascalArgs a(cpu, {2, 4});
     const FarPtr name = a.Ptr(1);
-    const NeResource* r = rt.Resource().Lookup(ResourceId{res::Accelerator, {}},
-                                               ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
+    const NeResource* r = rt.ResourcesFor(a.Word(0)).Lookup(ResourceId{res::Accelerator, {}},
+                                                            ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
     Return(cpu, a, r ? rt.MenuTable().LoadAccelerators(r->data) : 0);
 }
 
@@ -389,7 +389,7 @@ void TranslateAccelerator(Runtime& rt, Cpu& cpu) {
 void DialogBoxCommon(Runtime& rt, Cpu& cpu, const PascalArgs& a) {
     const FarPtr name = a.Ptr(1);
     const ResourceId id = ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off);
-    const bool exists = rt.Resource().Lookup(ResourceId{res::Dialog, {}}, id) != nullptr;
+    const bool exists = rt.ResourcesFor(a.Word(0)).Lookup(ResourceId{res::Dialog, {}}, id) != nullptr;
     if (exists)
         rt.Note("dialog:" + id.Describe(), "dialog boxes aren't shown yet: DialogBox(" + id.Describe() +
                                                ") answers IDCANCEL");

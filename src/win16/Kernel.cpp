@@ -327,15 +327,7 @@ void GetModuleHandle(Runtime& rt, Cpu& cpu) {  // (LPCSTR name, or an instance h
 
 void GetModuleFileName(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPSTR buffer, int size) -> length
     const PascalArgs a(cpu, {2, 4, 2});
-    const uint16_t h = a.Word(0);
-    std::string path;
-    if (h == 0 || h == rt.Module().dgroup || h == rt.ModuleHandle()) {
-        path = rt.Files().ProgramPath();
-    } else {
-        for (const char* m : {"KERNEL", "USER", "GDI"}) {
-            if (rt.FindModuleHandle(m) == h) path = std::string("C:\\WINDOWS\\SYSTEM\\") + m + ".EXE";
-        }
-    }
+    const std::string path = rt.ModuleFileName(a.Word(0));
     const int size = a.Int(2);
     cpu.Regs().r[AX] = size > 0 ? CopyOut(rt, a.Ptr(1), path, uint16_t(size)) : 0;
     cpu.ReturnFar(a.Bytes());
@@ -364,18 +356,22 @@ void FreeProcInstance(Runtime&, Cpu& cpu) {  // (FARPROC)
 
 void LoadLibrary(Runtime& rt, Cpu& cpu) {  // (LPCSTR) -> HINSTANCE, or an error < 32
     const PascalArgs a(cpu, {4});
-    const std::string name = ReadArgString(rt, a.Ptr(0), nullptr, 128);
-    uint16_t h = rt.LoadBuiltinModule(name);
-    if (!h) {
-        rt.Note("loadlibrary:" + name, "LoadLibrary(\"" + name + "\"): loading NE DLLs isn't supported yet (file not found)");
-        h = 2;
-    }
+    const uint16_t h = rt.LoadLibraryModule(ReadArgString(rt, a.Ptr(0), nullptr, 128));
+    if (rt.HasExited()) return;  // the DLL's initialization ended the task
     cpu.Regs().r[AX] = h;
     cpu.ReturnFar(a.Bytes());
 }
 
-void FreeLibrary(Runtime&, Cpu& cpu) {  // (HINSTANCE)
+void FreeLibrary(Runtime& rt, Cpu& cpu) {  // (HINSTANCE)
     const PascalArgs a(cpu, {2});
+    rt.FreeLibraryModule(a.Word(0));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void GetModuleUsage(Runtime& rt, Cpu& cpu) {  // (HINSTANCE) -> reference count
+    const PascalArgs a(cpu, {2});
+    const Runtime::DllModule* dll = rt.FindDll(a.Word(0));
+    cpu.Regs().r[AX] = dll ? uint16_t(std::max(dll->usage, 1)) : 1;
     cpu.ReturnFar(a.Bytes());
 }
 
@@ -619,14 +615,14 @@ void OpenFile(Runtime& rt, Cpu& cpu) {  // (LPCSTR path, OFSTRUCT FAR*, UINT sty
 void FindResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR name, LPCSTR type) -> HRSRC
     const PascalArgs a(cpu, {2, 4, 4});
     const FarPtr name = a.Ptr(1), type = a.Ptr(2);
-    cpu.Regs().r[AX] = rt.Resource().Find(ResourceId::FromFarPtr(rt.Mem(), type.sel, type.off),
-                                          ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
+    cpu.Regs().r[AX] = rt.ResourcesFor(a.Word(0)).Find(ResourceId::FromFarPtr(rt.Mem(), type.sel, type.off),
+                                                       ResourceId::FromFarPtr(rt.Mem(), name.sel, name.off));
     cpu.ReturnFar(a.Bytes());
 }
 
 void LoadResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> HGLOBAL
     const PascalArgs a(cpu, {2, 2});
-    cpu.Regs().r[AX] = rt.Resource().Load(a.Word(1));
+    cpu.Regs().r[AX] = rt.ResourcesFor(a.Word(0)).Load(a.Word(1));
     cpu.ReturnFar(a.Bytes());
 }
 
@@ -638,13 +634,13 @@ void LockResource(Runtime& rt, Cpu& cpu) {  // (HGLOBAL) -> void FAR*
 
 void FreeResource(Runtime& rt, Cpu& cpu) {  // (HGLOBAL) -> 0 on success
     const PascalArgs a(cpu, {2});
-    cpu.Regs().r[AX] = rt.Resource().Free(a.Word(0));
+    cpu.Regs().r[AX] = rt.FreeResourceAny(a.Word(0));
     cpu.ReturnFar(a.Bytes());
 }
 
 void SizeofResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> DWORD
     const PascalArgs a(cpu, {2, 2});
-    const NeResource* r = rt.Resource().Get(a.Word(1));
+    const NeResource* r = rt.ResourcesFor(a.Word(0)).Get(a.Word(1));
     SetResult(cpu, r ? uint32_t(r->data.size()) : 0);
     cpu.ReturnFar(a.Bytes());
 }
@@ -681,6 +677,7 @@ std::vector<ApiFunction> KernelApi() {
         {36, "GETCURRENTTASK", GetCurrentTask},
         {37, "GETCURRENTPDB", GetCurrentPDB},
         {47, "GETMODULEHANDLE", GetModuleHandle},
+        {48, "GETMODULEUSAGE", GetModuleUsage},
         {49, "GETMODULEFILENAME", GetModuleFileName},
         {50, "GETPROCADDRESS", GetProcAddress},
         {51, "MAKEPROCINSTANCE", MakeProcInstance},

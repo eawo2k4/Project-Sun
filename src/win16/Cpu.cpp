@@ -113,7 +113,7 @@ void Cpu::Tick() {
 }
 
 uint32_t Cpu::CallFar(uint16_t selector, uint16_t offset, std::initializer_list<uint16_t> args,
-                      uint16_t ds) {
+                      uint16_t ds, const std::function<void(Cpu&)>& setup) {
     const Registers saved = regs_;
     for (uint16_t w : args) Push(w);
     const int depth = ++callDepth_;
@@ -121,6 +121,7 @@ uint32_t Cpu::CallFar(uint16_t selector, uint16_t offset, std::initializer_list<
     Push(uint16_t(depth));  // the trap reads the depth back from IP
     LoadSegment(DS, ds);
     regs_.r[AX] = ds;
+    if (setup) setup(*this);
     FarJump(selector, offset);
 
     while (returnedDepth_ != depth) {

@@ -147,6 +147,13 @@ bool LoadNe(const NeImage& image, const std::vector<uint8_t>& file, Memory& memo
     for (uint16_t i = 0; i < image.segments.size(); ++i) {
         if (!ApplyRelocations(image, i, memory, imports, out, error)) return false;
     }
+    if (image.IsLibrary()) {
+        if (out.dgroup) {  // the local heap is at the end of a DLL's DGROUP
+            const uint32_t size = memory.SegmentSize(out.dgroup);
+            out.heapStart = uint16_t(size - std::min<uint32_t>(size, image.heapSize));
+        }
+        return true;
+    }
 
     // PSP: INT 20h at 0, command tail at 80h.
     out.psp = memory.Allocate(0x100, SegmentKind::Data);

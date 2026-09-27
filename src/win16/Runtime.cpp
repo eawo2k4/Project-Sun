@@ -5,6 +5,8 @@
 #include <cstdio>
 #include <cstring>
 #include <ctime>
+#include <fstream>
+#include <iterator>
 
 namespace retro::win16 {
 namespace {
@@ -94,14 +96,24 @@ public:
     explicit Resolver(Runtime& rt) : rt_(rt) {}
 
     bool Resolve(const std::string& moduleName, uint16_t ordinal, const std::string& name,
-                 uint16_t& selector, uint16_t& offset, std::string&) override {
+                 uint16_t& selector, uint16_t& offset, std::string& error) override {
         BuiltinModule* m = rt_.FindModule(moduleName);
         if (!m) {
             const std::string upper = Upper(moduleName);
             if (!FindCatalogModule(upper)) {
-                rt_.Note("module:" + upper, "module " + upper +
-                                                " is not built in, and loading NE DLLs isn't supported yet: "
-                                                "calling into it will stop the task");
+                // The program's own DLL, from its directory.
+                DllModule* dll = rt_.FindDll(upper);
+                std::string loadError;
+                uint16_t code = 0;
+                if (!dll) dll = rt_.LoadDll(upper, loadError, code);
+                if (dll) return rt_.ResolveExport(*dll, ordinal, name, selector, offset, error);
+                if (code != 2) {  // it's there, but can't be loaded
+                    error = loadError;
+                    return false;
+                }
+                rt_.Note("module:" + upper, "module " + upper + " is not built in, and " + upper +
+                                                ".DLL isn't in the program's directory: calling into it will "
+                                                "stop the task");
             }
             m = &rt_.builtins_[rt_.AddModule(upper, OptionalModuleApi(upper))];
         }
@@ -205,6 +217,7 @@ Runtime::BuiltinModule* Runtime::FindModule(const std::string& name) {
 uint16_t Runtime::FindModuleHandle(const std::string& name) {
     const std::string base = ModuleBaseName(name);
     if (!base.empty() && base == Upper(image_.moduleName)) return moduleDb_;
+    if (DllModule* dll = FindDll(base)) return dll->hModule;
     const BuiltinModule* m = FindModule(base);
     return m ? m->selector : 0;
 }
@@ -217,6 +230,11 @@ uint16_t Runtime::LoadBuiltinModule(const std::string& name) {
 }
 
 uint32_t Runtime::ProcAddress(uint16_t module, uint16_t ordinal, const std::string& name) {
+    if (DllModule* dll = FindDll(module)) {
+        uint16_t sel = 0, off = 0;
+        std::string error;
+        return ResolveExport(*dll, ordinal, name, sel, off, error) ? (uint32_t(sel) << 16) | off : 0;
+    }
     if (module && (module == moduleDb_ || module == module_.dgroup)) {
         // The program's own exports, by ordinal (its name tables aren't kept).
         const NeEntry* e = name.empty() ? image_.FindEntry(ordinal) : nullptr;
@@ -268,6 +286,14 @@ bool Runtime::Load(const std::vector<uint8_t>& file, const std::string& commandL
     Resolver resolver(*this);
     if (!LoadNe(image_, file, memory_, resolver, commandLine, module_, error)) return false;
     cpu_.Regs() = module_.initial;
+    if (!pendingInit_.empty()) {
+        // The DLLs it imports are initialized first, on the interpreter: start
+        // at a host routine that runs their entry points, then the program's.
+        bootstrapSel_ = memory_.Allocate(0x10000, SegmentKind::Host);
+        cpu_.MapHostSegment(bootstrapSel_, [this](Cpu&, uint16_t) { Bootstrap(); });
+        cpu_.Regs().s[CS] = bootstrapSel_;
+        cpu_.Regs().ip = 0;
+    }
 
     // hModule: a copy of the NE header, which programs occasionally read.
     const uint32_t ne = uint32_t(file[0x3C]) | (uint32_t(file[0x3D]) << 8) |
@@ -306,6 +332,208 @@ TaskExit Runtime::Run(uint64_t budget) {
     out.registers = cpu_.Regs();
     out.instructions = cpu_.Instructions();
     return out;
+}
+
+// --- The program's DLLs --------------------------------------------------------------------
+
+Runtime::DllModule* Runtime::FindDll(uint16_t handle) {
+    if (!handle) return nullptr;
+    for (auto& d : dlls_) {
+        if (d->hInstance == handle || d->hModule == handle) return d.get();
+    }
+    return nullptr;
+}
+
+Runtime::DllModule* Runtime::FindDll(const std::string& name) {
+    const std::string base = ModuleBaseName(name);
+    for (auto& d : dlls_) {
+        if (d->name == base || ModuleBaseName(d->fileName) == base) return d.get();
+    }
+    return nullptr;
+}
+
+Runtime::DllModule* Runtime::LoadDll(const std::string& name, std::string& error, uint16_t& code) {
+    const std::string base = ModuleBaseName(name);
+    if (DllModule* loaded = FindDll(base)) return loaded;
+    // "GAME" -> GAME.DLL; paths and other extensions as given (in the program's directory).
+    const size_t slash = name.find_last_of("\\/:");
+    const bool hasExtension = name.find('.', slash == std::string::npos ? 0 : slash + 1) != std::string::npos;
+    const std::string fileName = hasExtension ? name : name + ".DLL";
+    std::filesystem::path host;
+    std::string why;
+    std::error_code ec;
+    if (!files_.Resolve(fileName, host, why) || !std::filesystem::is_regular_file(host, ec) ||
+        std::filesystem::file_size(host, ec) > (16u << 20)) {
+        code = 2;
+        error = fileName + " is not in the program's directory";
+        return nullptr;
+    }
+    if (loadingDlls_.count(base)) {
+        code = 11;
+        error = "DLLs that import each other in a circle (" + base + ") aren't supported";
+        return nullptr;
+    }
+    std::ifstream in(host, std::ios::binary);
+    const std::vector<uint8_t> file{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+
+    auto dll = std::make_unique<DllModule>();
+    std::string parseError;
+    if (!ParseNe(file, dll->image, parseError) || !dll->image.IsLibrary()) {
+        code = 11;
+        error = fileName + (parseError.empty() ? " is a program, not a DLL" : ": " + parseError);
+        return nullptr;
+    }
+    dll->name = dll->image.moduleName.empty() ? base : Upper(dll->image.moduleName);
+    try {
+        dll->fileName = Upper(host.string());
+    } catch (const std::exception&) {
+        dll->fileName = "C:\\WINDOWS\\" + base + ".DLL";
+    }
+
+    // Its segments, with its own imports resolved (loading the DLLs it needs first).
+    loadingDlls_.insert(base);
+    Resolver resolver(*this);
+    std::string loadError;
+    const bool ok = LoadNe(dll->image, file, memory_, resolver, "", dll->loaded, loadError);
+    loadingDlls_.erase(base);
+    if (!ok) {
+        code = 11;
+        error = fileName + ": " + loadError;
+        return nullptr;
+    }
+    const uint32_t ne = uint32_t(file[0x3C]) | (uint32_t(file[0x3D]) << 8) | (uint32_t(file[0x3E]) << 16) |
+                        (uint32_t(file[0x3F]) << 24);
+    dll->hModule = memory_.Allocate(0x40, SegmentKind::Data);
+    if (dll->hModule) std::memcpy(memory_.SegmentData(dll->hModule), &file[ne], 0x40);
+    dll->hInstance = dll->loaded.dgroup ? dll->loaded.dgroup : dll->hModule;
+    dll->resources = std::make_unique<Resources>(dll->image, globals_, memory_);
+    const uint16_t dg = dll->loaded.dgroup;
+    if (dg && dll->image.heapSize && dll->loaded.heapStart < memory_.SegmentSize(dg))
+        locals_.Init(dg, dll->loaded.heapStart, uint16_t(memory_.SegmentSize(dg) - 1));
+
+    DllModule* raw = dll.get();
+    dlls_.push_back(std::move(dll));
+    if (raw->image.entrySegment) {
+        pendingInit_.push_back(raw);  // its entry point runs before it's used
+    } else {
+        raw->initialized = true;  // resource-only DLLs have none
+    }
+    if (trace_) Print("[trace] loaded " + raw->fileName + " (module " + raw->name + ")");
+    return raw;
+}
+
+bool Runtime::ResolveExport(DllModule& dll, uint16_t ordinal, const std::string& name, uint16_t& selector,
+                            uint16_t& offset, std::string& error) {
+    uint16_t ord = ordinal;
+    if (!name.empty()) {
+        const auto it = dll.image.exportNames.find(Upper(name));
+        if (it == dll.image.exportNames.end()) {
+            error = dll.name + " has no export named " + name;
+            return false;
+        }
+        ord = it->second;
+    }
+    const NeEntry* e = dll.image.FindEntry(ord);
+    if (!e) {
+        error = dll.name + " has no export " + std::to_string(ord);
+        return false;
+    }
+    if (e->segment == 0xFE) {  // a constant
+        selector = offset = e->offset;
+        return true;
+    }
+    if (e->segment < 1 || e->segment > dll.loaded.selectors.size()) {
+        error = dll.name + " export " + std::to_string(ord) + " is in a segment that doesn't exist";
+        return false;
+    }
+    selector = dll.loaded.selectors[e->segment - 1];
+    offset = e->offset;
+    return true;
+}
+
+bool Runtime::InitializePendingDlls(std::string& error) {
+    while (!pendingInit_.empty()) {
+        DllModule* d = pendingInit_.front();
+        pendingInit_.erase(pendingInit_.begin());
+        d->initialized = true;
+        if (d->image.entrySegment < 1 || d->image.entrySegment > d->loaded.selectors.size()) continue;
+        // LibEntry: DI = hInstance, DS = DGROUP, CX = local heap size, ES:SI = command line (none).
+        const uint16_t hInstance = d->hInstance, heap = d->image.heapSize;
+        const uint32_t result = cpu_.CallFar(d->loaded.selectors[d->image.entrySegment - 1], d->image.entryIp, {},
+                                             d->loaded.dgroup, [&](Cpu& c) {
+                                                 c.Regs().r[DI] = hInstance;
+                                                 c.Regs().r[CX] = heap;
+                                                 c.Regs().r[SI] = 0;
+                                                 c.LoadSegment(ES, 0);
+                                             });
+        if (exited_) return false;
+        if ((result & 0xFFFF) == 0) {
+            d->failed = true;
+            error = d->name + " failed to initialize (its entry point returned 0)";
+            return false;
+        }
+    }
+    return true;
+}
+
+void Runtime::Bootstrap() {
+    std::string error;
+    if (!InitializePendingDlls(error)) {
+        if (!exited_) Exit(TaskExit::Kind::FatalExit, 0, error);
+        return;
+    }
+    cpu_.Regs() = module_.initial;  // now the program's own entry point
+}
+
+uint16_t Runtime::LoadLibraryModule(const std::string& name) {
+    const std::string base = ModuleBaseName(name);
+    if (FindModule(base) || FindCatalogModule(base)) return LoadBuiltinModule(base);
+    std::string error;
+    uint16_t code = 0;
+    DllModule* dll = LoadDll(name, error, code);
+    if (!dll) {
+        Note("loadlibrary:" + Upper(name), "LoadLibrary(\"" + name + "\"): " + error);
+        return code;
+    }
+    if (!pendingInit_.empty() && !InitializePendingDlls(error)) {
+        if (!exited_) Note("loadlibrary:" + Upper(name), "LoadLibrary(\"" + name + "\"): " + error);
+        return 20;
+    }
+    if (dll->failed) return 20;
+    ++dll->usage;
+    return dll->hInstance;
+}
+
+bool Runtime::FreeLibraryModule(uint16_t handle) {
+    DllModule* dll = FindDll(handle);
+    if (!dll) return false;
+    if (dll->usage > 0) --dll->usage;  // DLLs stay loaded until the program ends
+    return true;
+}
+
+Resources& Runtime::ResourcesFor(uint16_t handle) {
+    if (DllModule* dll = FindDll(handle)) return *dll->resources;
+    return resources_;
+}
+
+uint16_t Runtime::FreeResourceAny(uint16_t hglobal) {
+    if (resources_.Free(hglobal) == 0) return 0;
+    for (auto& d : dlls_) {
+        if (d->resources->Free(hglobal) == 0) return 0;
+    }
+    return hglobal;
+}
+
+std::string Runtime::ModuleFileName(uint16_t handle) {
+    if (handle == 0 || handle == module_.dgroup || handle == moduleDb_) return files_.ProgramPath();
+    if (DllModule* dll = FindDll(handle)) return dll->fileName;
+    for (const BuiltinModule& m : builtins_) {
+        if (m.selector == handle) {
+            const bool exe = m.name == "KERNEL" || m.name == "USER" || m.name == "GDI";
+            return "C:\\WINDOWS\\SYSTEM\\" + m.name + (exe ? ".EXE" : ".DLL");
+        }
+    }
+    return "";
 }
 
 // --- API dispatch and tracing ------------------------------------------------------------
@@ -469,7 +697,7 @@ void Runtime::CallApi(size_t moduleIndex, uint16_t ip) {
     }
     std::string message = name + " is not implemented yet (returning to " + from + ")";
     if (module.functions.empty() && !module.catalog)
-        message += "; " + module.name + " is not built in, and NE DLLs can't be loaded yet";
+        message += "; " + module.name + " is not built in, and " + module.name + ".DLL wasn't in the program's directory";
     if (trace_) frame.Finish("not implemented");
     Exit(TaskExit::Kind::Unimplemented, 0, message);
 }
