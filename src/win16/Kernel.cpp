@@ -145,6 +145,123 @@ void GlobalUnlock(Runtime& rt, Cpu& cpu) {
     cpu.ReturnFar(2);
 }
 
+// Catch / Throw: a non-local return, like setjmp/longjmp. The CATCHBUF (9
+// words) holds what Throw needs to resume as Catch returning: the return
+// CS:IP, SP after the return, BP, SI, DI, DS, SS, and the callback depth.
+void Catch(Runtime& rt, Cpu& cpu) {  // (LPCATCHBUF) -> 0
+    Registers& r = cpu.Regs();
+    const FarPtr buf = ArgPtr(cpu, 0);
+    const uint16_t words[9] = {rt.Mem().Read16(r.s[SS], r.r[SP]),
+                               rt.Mem().Read16(r.s[SS], uint16_t(r.r[SP] + 2)),
+                               uint16_t(r.r[SP] + 8),
+                               r.r[BP],
+                               r.r[SI],
+                               r.r[DI],
+                               r.s[DS],
+                               r.s[SS],
+                               uint16_t(cpu.CallbackDepth())};
+    for (uint16_t i = 0; i < 9; ++i) rt.Mem().Write16(buf.sel, uint16_t(buf.off + 2 * i), words[i]);
+    r.r[AX] = 0;
+    cpu.ReturnFar(4);
+}
+
+void Throw(Runtime& rt, Cpu& cpu) {  // (const CATCHBUF FAR*, int value): Catch returns value
+    Registers& r = cpu.Regs();
+    const uint16_t value = cpu.StackArg(0);
+    const FarPtr buf = ArgPtr(cpu, 2);
+    uint16_t w[9];
+    for (uint16_t i = 0; i < 9; ++i) w[i] = rt.Mem().Read16(buf.sel, uint16_t(buf.off + 2 * i));
+    if (w[8] != cpu.CallbackDepth()) {
+        cpu.HostFault("Throw out of a window procedure (or other callback) into the code that called "
+                      "Windows isn't supported yet");
+    }
+    cpu.LoadSegment(SS, w[7]);
+    r.r[SP] = w[2];
+    r.r[BP] = w[3];
+    r.r[SI] = w[4];
+    r.r[DI] = w[5];
+    cpu.LoadSegment(DS, w[6]);
+    r.r[AX] = value;
+    cpu.LoadSegment(CS, w[1]);
+    r.ip = w[0];
+}
+
+// Selectors. Run-time code generators (Delphi's window procedure thunks, say)
+// write code through a data selector and run it through a code alias.
+SegmentKind KindOf(Runtime& rt, uint16_t sel) {
+    const Descriptor* d = rt.Mem().Lookup(sel);
+    return d ? d->kind : SegmentKind::Data;
+}
+
+SegmentKind Toggled(SegmentKind k) { return k == SegmentKind::Code ? SegmentKind::Data : SegmentKind::Code; }
+
+void AllocSelector(Runtime& rt, Cpu& cpu) {  // (UINT sel: 0 = a new one, else a copy of it) -> selector
+    const uint16_t sel = cpu.StackArg(0);
+    cpu.Regs().r[AX] = sel ? rt.Mem().Alias(sel, KindOf(rt, sel)) : rt.Mem().AllocateDescriptor();
+    cpu.ReturnFar(2);
+}
+
+void FreeSelector(Runtime& rt, Cpu& cpu) {  // (UINT) -> 0, or the selector on failure
+    const uint16_t sel = cpu.StackArg(0);
+    const bool ok = (sel & 4) && rt.Mem().Lookup(sel);
+    if (ok) rt.Mem().Free(sel);
+    cpu.Regs().r[AX] = ok ? 0 : sel;
+    cpu.ReturnFar(2);
+}
+
+void PrestoChangoSelector(Runtime& rt, Cpu& cpu) {  // (UINT from, UINT to) -> to: from's segment, code <-> data
+    const PascalArgs a(cpu, {2, 2});
+    const uint16_t from = a.Word(0), to = a.Word(1);
+    cpu.Regs().r[AX] = rt.Mem().CopyDescriptor(from, to, Toggled(KindOf(rt, from))) ? to : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void AllocCStoDSAlias(Runtime& rt, Cpu& cpu) {  // (UINT code selector) -> data alias
+    cpu.Regs().r[AX] = rt.Mem().Alias(cpu.StackArg(0), SegmentKind::Data);
+    cpu.ReturnFar(2);
+}
+
+void AllocDStoCSAlias(Runtime& rt, Cpu& cpu) {  // (UINT data selector) -> code alias
+    cpu.Regs().r[AX] = rt.Mem().Alias(cpu.StackArg(0), SegmentKind::Code);
+    cpu.ReturnFar(2);
+}
+
+void GetSelectorBase(Runtime& rt, Cpu& cpu) {  // (UINT) -> DWORD linear base
+    const Descriptor* d = rt.Mem().Lookup(cpu.StackArg(0));
+    SetResult(cpu, d ? d->base : 0);
+    cpu.ReturnFar(2);
+}
+
+void SetSelectorBase(Runtime& rt, Cpu& cpu) {  // (UINT, DWORD base) -> the selector, 0 on failure
+    const PascalArgs a(cpu, {2, 4});
+    cpu.Regs().r[AX] = rt.Mem().SetBase(a.Word(0), a.Long(1)) ? a.Word(0) : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void GetSelectorLimit(Runtime& rt, Cpu& cpu) {  // (UINT) -> DWORD limit
+    const Descriptor* d = rt.Mem().Lookup(cpu.StackArg(0));
+    SetResult(cpu, d ? d->limit : 0);
+    cpu.ReturnFar(2);
+}
+
+void SetSelectorLimit(Runtime& rt, Cpu& cpu) {  // (UINT, DWORD limit) -> 0
+    const PascalArgs a(cpu, {2, 4});
+    rt.Mem().SetLimit(a.Word(0), a.Long(1));
+    cpu.Regs().r[AX] = 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+// SetHandleCount: file handles aren't a limited resource here.
+void SetHandleCount(Runtime&, Cpu& cpu) {  // (UINT wanted) -> handles available
+    cpu.Regs().r[AX] = std::min<uint16_t>(cpu.StackArg(0), 255);
+    cpu.ReturnFar(2);
+}
+
+// GlobalWire / GlobalUnWire: lock a block low in memory. Nothing moves here,
+// so they're GlobalLock and GlobalUnlock.
+void GlobalWire(Runtime& rt, Cpu& cpu) { GlobalLock(rt, cpu); }
+void GlobalUnWire(Runtime& rt, Cpu& cpu) { GlobalUnlock(rt, cpu); }
+
 void GlobalSize(Runtime& rt, Cpu& cpu) {
     SetResult(cpu, rt.Globals().Size(cpu.StackArg(0)));
     cpu.ReturnFar(2);
@@ -563,6 +680,48 @@ void _lwrite(Runtime& rt, Cpu& cpu) {  // (HFILE, const void FAR*, UINT) -> byte
     cpu.ReturnFar(a.Bytes());
 }
 
+// hmemcpy: memmove between huge pointers (overlap allowed). Blocks over 64 KB
+// don't exist here yet, so it copies within one segment each side.
+void hmemcpy(Runtime& rt, Cpu& cpu) {  // (void _huge* dst, const void _huge* src, LONG count)
+    const PascalArgs a(cpu, {4, 4, 4});
+    const FarPtr dst = a.Ptr(0), src = a.Ptr(1);
+    const uint32_t n = a.Long(2);
+    if (n > 0 && n <= 0x10000) {
+        rt.Mem().Translate(src.sel, src.off, n, Access::Read);  // #GP if either block is bad
+        rt.Mem().Translate(dst.sel, dst.off, n, Access::Write);
+        std::memmove(rt.Mem().SegmentData(dst.sel) + dst.off, rt.Mem().SegmentData(src.sel) + src.off, n);
+    } else if (n > 0x10000) {
+        cpu.HostFault("hmemcpy of more than 64 KB (huge blocks aren't supported yet)");
+    }
+    cpu.ReturnFar(a.Bytes());
+}
+
+// _hread / _hwrite: the same with a LONG count and a huge pointer. Blocks over
+// 64 KB don't exist here yet, so a read stops at the end of the segment.
+void _hread(Runtime& rt, Cpu& cpu) {  // (HFILE, void _huge*, LONG bytes) -> LONG read, or -1
+    const PascalArgs a(cpu, {2, 4, 4});
+    const FarPtr buf = a.Ptr(1);
+    uint32_t result = 0xFFFFFFFFu;
+    if (rt.Files().IsOpen(a.Word(0))) {
+        const uint32_t size = rt.Mem().SegmentSize(buf.sel);
+        const uint32_t n = std::min<uint32_t>(a.Long(2), size > buf.off ? size - buf.off : 0);
+        result = 0;
+        if (n > 0) {
+            rt.Mem().Translate(buf.sel, buf.off, n, Access::Write);  // #GP if the buffer is bad
+            result = uint32_t(rt.Files().Read(a.Word(0), rt.Mem().SegmentData(buf.sel) + buf.off, n));
+        }
+    }
+    SetResult(cpu, result);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void _hwrite(Runtime& rt, Cpu& cpu) {  // (HFILE, const void _huge*, LONG) -> LONG written
+    const PascalArgs a(cpu, {2, 4, 4});
+    rt.Note("lwrite", "the program tried to write a file: not supported yet (the write failed)");
+    SetResult(cpu, 0xFFFFFFFFu);
+    cpu.ReturnFar(a.Bytes());
+}
+
 void _llseek(Runtime& rt, Cpu& cpu) {  // (HFILE, LONG offset, int origin) -> new position
     const PascalArgs a(cpu, {2, 4, 2});
     const int32_t pos = rt.Files().Seek(a.Word(0), int32_t(a.Long(1)), a.Int(2));
@@ -638,6 +797,16 @@ void FreeResource(Runtime& rt, Cpu& cpu) {  // (HGLOBAL) -> 0 on success
     cpu.ReturnFar(a.Bytes());
 }
 
+// AccessResource: a file handle positioned at the resource, which the program
+// reads with _lread. Here the handle reads the resource's bytes from memory.
+void AccessResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> DOS handle, or -1
+    const PascalArgs a(cpu, {2, 2});
+    const NeResource* r = rt.ResourcesFor(a.Word(0)).Get(a.Word(1));
+    const int handle = r ? rt.Files().OpenMemory(std::string(r->data.begin(), r->data.end())) : -1;
+    cpu.Regs().r[AX] = uint16_t(int16_t(handle));
+    cpu.ReturnFar(a.Bytes());
+}
+
 void SizeofResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> DWORD
     const PascalArgs a(cpu, {2, 2});
     const NeResource* r = rt.ResourcesFor(a.Word(0)).Get(a.Word(1));
@@ -648,7 +817,7 @@ void SizeofResource(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, HRSRC) -> DWORD
 }  // namespace
 
 std::vector<ApiFunction> KernelApi() {
-    return {
+    std::vector<ApiFunction> api = {
         {1, "FATALEXIT", FatalExit},
         {3, "GETVERSION", GetVersion},
         {4, "LOCALINIT", LocalInit},
@@ -678,6 +847,8 @@ std::vector<ApiFunction> KernelApi() {
         {37, "GETCURRENTPDB", GetCurrentPDB},
         {47, "GETMODULEHANDLE", GetModuleHandle},
         {48, "GETMODULEUSAGE", GetModuleUsage},
+        {55, "CATCH", Catch},
+        {56, "THROW", Throw},
         {49, "GETMODULEFILENAME", GetModuleFileName},
         {50, "GETPROCADDRESS", GetProcAddress},
         {51, "MAKEPROCINSTANCE", MakeProcInstance},
@@ -706,6 +877,8 @@ std::vector<ApiFunction> KernelApi() {
         {96, "FREELIBRARY", FreeLibrary},
         {102, "DOS3CALL", Dos3Call},
         {107, "SETERRORMODE", SetErrorMode},
+        {111, "GLOBALWIRE", GlobalWire},
+        {112, "GLOBALUNWIRE", GlobalUnWire},
         {115, "OUTPUTDEBUGSTRING", OutputDebugString},
         {127, "GETPRIVATEPROFILEINT", GetPrivateProfileInt},
         {128, "GETPRIVATEPROFILESTRING", GetPrivateProfileString},
@@ -715,8 +888,53 @@ std::vector<ApiFunction> KernelApi() {
         {134, "GETWINDOWSDIRECTORY", GetWindowsDirectory},
         {135, "GETSYSTEMDIRECTORY", GetSystemDirectory},
         {137, "FATALAPPEXIT", FatalAppExit},
+        {64, "ACCESSRESOURCE", AccessResource},
         {169, "GETFREESPACE", GetFreeSpace},
+        {170, "ALLOCCSTODSALIAS", AllocCStoDSAlias},
+        {171, "ALLOCDSTOCSALIAS", AllocDStoCSAlias},
+        {175, "ALLOCSELECTOR", AllocSelector},
+        {176, "FREESELECTOR", FreeSelector},
+        {177, "PRESTOCHANGOSELECTOR", PrestoChangoSelector},
+        {186, "GETSELECTORBASE", GetSelectorBase},
+        {187, "SETSELECTORBASE", SetSelectorBase},
+        {188, "GETSELECTORLIMIT", GetSelectorLimit},
+        {189, "SETSELECTORLIMIT", SetSelectorLimit},
+        {199, "SETHANDLECOUNT", SetHandleCount},
+        {348, "HMEMCPY", hmemcpy},
+        {349, "_HREAD", _hread},
+        {350, "_HWRITE", _hwrite},
         {353, "LSTRCPYN", lstrcpyn},
+    };
+    const std::vector<ApiFunction> atoms = KernelAtomApi();
+    api.insert(api.end(), atoms.begin(), atoms.end());
+    return api;
+}
+
+// TOOLHELP: registering for fault interrupts and system notifications
+// succeeds, but the callbacks are never called.
+void InterruptRegister(Runtime& rt, Cpu& cpu) {  // (HTASK, FARPROC) -> BOOL
+    rt.Note("toolhelp:interrupts", "TOOLHELP interrupt callbacks are accepted but never called");
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(6);
+}
+
+void NotifyRegister(Runtime& rt, Cpu& cpu) {  // (HTASK, FARPROC, WORD flags) -> BOOL
+    rt.Note("toolhelp:notify", "TOOLHELP notification callbacks are accepted but never called");
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(8);
+}
+
+void ToolhelpUnregister(Runtime&, Cpu& cpu) {  // (HTASK) -> BOOL
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(2);
+}
+
+std::vector<ApiFunction> ToolhelpApi() {
+    return {
+        {73, "NOTIFYREGISTER", NotifyRegister},
+        {74, "NOTIFYUNREGISTER", ToolhelpUnregister},
+        {75, "INTERRUPTREGISTER", InterruptRegister},
+        {76, "INTERRUPTUNREGISTER", ToolhelpUnregister},
     };
 }
 

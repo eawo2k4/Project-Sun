@@ -3,7 +3,7 @@
 // A Win16 task: loads an NE program into its own segmented address space and
 // runs it on the interpreter until it exits.
 //
-// System DLLs are built in (Kernel.cpp, User.cpp, Gdi.cpp, WIN87EM). Each
+// System DLLs are built in (Kernel.cpp, User.cpp, Gdi.cpp, WIN87EM, ...). Each
 // one is a host segment; the loader resolves an import MODULE.ordinal to the
 // far address module-selector:ordinal, so a call lands in the matching C++
 // routine.
@@ -28,7 +28,10 @@
 //
 // Interrupts: INT 21h (the DOS calls Windows programs use: exit, version,
 // console output, files, date/time), INT 31h (DPMI queries), INT 20h
-// (terminate).
+// (terminate), and the BIOS services programs still reach for (Bios.cpp):
+// INT 1Ah (clock), INT 11h/12h (equipment, memory), INT 2Fh's Windows
+// queries. Selector 0040h maps a BIOS data area with a live tick counter.
+// x87 instructions run on the Cpu; WIN87EM's __fpMath works on its FPU.
 
 #include <chrono>
 #include <cstdint>
@@ -101,8 +104,11 @@ public:
     void SetMute(bool mute) { mute_ = mute; }
 
     // The Windows flags reported by GetWinFlags / __WINFLAGS: protected mode,
-    // 286, standard mode, no coprocessor (the interpreter is a 286 without x87).
-    static constexpr uint16_t kWinFlags = 0x0013;
+    // 286, standard mode, math coprocessor (the interpreter runs x87 code, so
+    // Windows would leave a program's floating-point instructions as they are).
+    static constexpr uint16_t kWinFlags = 0x0413;
+    // The BIOS data area's selector, as in Windows (and KERNEL's __0040H).
+    static constexpr uint16_t kBiosDataSelector = 0x0040;
 
     bool Load(const std::vector<uint8_t>& file, const std::string& commandLine, std::string& error);
     TaskExit Run(uint64_t budget = std::numeric_limits<uint64_t>::max());
@@ -117,6 +123,7 @@ public:
     FileSystem& Files() { return files_; }
     Profiles& Profile() { return profiles_; }
     Menus& MenuTable() { return menus_; }
+    AtomTable& LocalAtoms() { return localAtoms_; }  // KERNEL's AddAtom/FindAtom
     uint16_t Environment() const { return envSel_; }
     bool Muted() const { return mute_; }
     void CountSound() { ++sounds_; }
@@ -163,6 +170,12 @@ public:
     uint16_t LoadLibraryModule(const std::string& name);
     bool FreeLibraryModule(uint16_t handle);
     DllModule* FindDll(uint16_t handle);  // by hInstance or hModule
+    // The DS a callback in code segment `codeSel` gets, as Windows arranges it
+    // for exported functions: the DGROUP of the module the code belongs to. For
+    // code outside any module (a run-time thunk), `hInstance` if it is a
+    // module's instance, else the task's DGROUP. Never an arbitrary block: a
+    // program may pass one as a window's hInstance (an edit control's heap).
+    uint16_t CallbackData(uint16_t codeSel, uint16_t hInstance);
     DllModule* FindDll(const std::string& name);  // by module or file name
     size_t DllCount() const { return dlls_.size(); }
     // The resources of the module an hInstance/hModule belongs to (the
@@ -227,8 +240,14 @@ private:
     std::string TraceResult(const CatalogEntry* c) const;
     void TracePrint(const std::string& line);
     uint16_t EquateValue(const CatalogEntry& c);
+    bool IsPointerArgument(const char* params, uint16_t sel) const;
     bool Interrupt(uint8_t vector);
     void Int31();
+    // Bios.cpp
+    void SetUpBiosData();
+    void RefreshBiosData(uint8_t* bda);
+    uint32_t BiosTicks(bool& newDay);
+    bool BiosInterrupt(uint8_t vector);
     bool DosFileService(uint8_t ah);
 
     Memory memory_;
@@ -236,6 +255,7 @@ private:
     GlobalHeap globals_;
     LocalHeaps locals_{memory_};
     Menus menus_;
+    AtomTable localAtoms_;
     FileSystem files_;
     Profiles profiles_{files_};
     NeImage image_;
@@ -263,6 +283,8 @@ private:
     std::set<std::string> loadingDlls_;  // cycle guard
     uint16_t bootstrapSel_ = 0;
     std::chrono::steady_clock::time_point start_ = std::chrono::steady_clock::now();
+    uint32_t startMsOfDay_ = 0;  // local time at start_, in ms since midnight
+    uint32_t reportedDays_ = 0;  // midnights passed that INT 1Ah has reported
 };
 
 }  // namespace retro::win16

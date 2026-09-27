@@ -132,27 +132,87 @@ void Api_CreateFontIndirect(Runtime& rt, Cpu& cpu) {  // (const LOGFONT FAR*)
 }
 
 // TEXTMETRIC (Win16, 31 bytes): 8 ints, 9 bytes, 3 ints.
+void WriteTextMetrics(Memory& mem, FarPtr p, const TEXTMETRICW& tm) {
+    const LONG ints[] = {tm.tmHeight, tm.tmAscent, tm.tmDescent, tm.tmInternalLeading,
+                         tm.tmExternalLeading, tm.tmAveCharWidth, tm.tmMaxCharWidth, tm.tmWeight};
+    for (int i = 0; i < 8; ++i) mem.Write16(p.sel, uint16_t(p.off + 2 * i), uint16_t(ints[i]));
+    const BYTE bytes[] = {tm.tmItalic, tm.tmUnderlined, tm.tmStruckOut,
+                          BYTE(std::min<WCHAR>(tm.tmFirstChar, 255)), BYTE(std::min<WCHAR>(tm.tmLastChar, 255)),
+                          BYTE(std::min<WCHAR>(tm.tmDefaultChar, 255)), BYTE(std::min<WCHAR>(tm.tmBreakChar, 255)),
+                          tm.tmPitchAndFamily, tm.tmCharSet};
+    for (int i = 0; i < 9; ++i) mem.Write8(p.sel, uint16_t(p.off + 16 + i), bytes[i]);
+    mem.Write16(p.sel, uint16_t(p.off + 25), uint16_t(tm.tmOverhang));
+    mem.Write16(p.sel, uint16_t(p.off + 27), uint16_t(tm.tmDigitizedAspectX));
+    mem.Write16(p.sel, uint16_t(p.off + 29), uint16_t(tm.tmDigitizedAspectY));
+}
+
 void Api_GetTextMetrics(Runtime& rt, Cpu& cpu) {  // (HDC, TEXTMETRIC FAR*) -> BOOL
     const PascalArgs a(cpu, {2, 4});
     HDC dc = Dc(rt, a.Word(0));
     TEXTMETRICW tm{};
     const bool ok = dc && GetTextMetricsW(dc, &tm);
-    if (ok) {
-        const FarPtr p = a.Ptr(1);
-        Memory& mem = rt.Mem();
-        const LONG ints[] = {tm.tmHeight, tm.tmAscent, tm.tmDescent, tm.tmInternalLeading,
-                             tm.tmExternalLeading, tm.tmAveCharWidth, tm.tmMaxCharWidth, tm.tmWeight};
-        for (int i = 0; i < 8; ++i) mem.Write16(p.sel, uint16_t(p.off + 2 * i), uint16_t(ints[i]));
-        const BYTE bytes[] = {tm.tmItalic, tm.tmUnderlined, tm.tmStruckOut,
-                              BYTE(std::min<WCHAR>(tm.tmFirstChar, 255)), BYTE(std::min<WCHAR>(tm.tmLastChar, 255)),
-                              BYTE(std::min<WCHAR>(tm.tmDefaultChar, 255)), BYTE(std::min<WCHAR>(tm.tmBreakChar, 255)),
-                              tm.tmPitchAndFamily, tm.tmCharSet};
-        for (int i = 0; i < 9; ++i) mem.Write8(p.sel, uint16_t(p.off + 16 + i), bytes[i]);
-        mem.Write16(p.sel, uint16_t(p.off + 25), uint16_t(tm.tmOverhang));
-        mem.Write16(p.sel, uint16_t(p.off + 27), uint16_t(tm.tmDigitizedAspectX));
-        mem.Write16(p.sel, uint16_t(p.off + 29), uint16_t(tm.tmDigitizedAspectY));
-    }
+    if (ok) WriteTextMetrics(rt.Mem(), a.Ptr(1), tm);
     Return(cpu, a, ok ? 1 : 0);
+}
+
+// EnumFonts: the faces of a Windows 3.1 system (its raster fonts and the core
+// TrueType ones), each at a typical size. With a face name, just that face.
+void Api_EnumFonts(Runtime& rt, Cpu& cpu) {  // (HDC, LPCSTR face, FONTENUMPROC, LPARAM) -> last callback result
+    const PascalArgs a(cpu, {2, 4, 4, 4});
+    struct Face {
+        const char* name;
+        int height;
+        BYTE pitch, charset;
+        uint16_t type;  // RASTER_FONTTYPE 1, TRUETYPE_FONTTYPE 4
+    };
+    static const Face kFaces[] = {
+        {"System", 16, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET, 1},
+        {"Terminal", 12, FIXED_PITCH | FF_MODERN, OEM_CHARSET, 1},
+        {"Fixedsys", 15, FIXED_PITCH | FF_MODERN, ANSI_CHARSET, 1},
+        {"Courier", 13, FIXED_PITCH | FF_MODERN, ANSI_CHARSET, 1},
+        {"MS Sans Serif", 13, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET, 1},
+        {"MS Serif", 13, VARIABLE_PITCH | FF_ROMAN, ANSI_CHARSET, 1},
+        {"Small Fonts", 11, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET, 1},
+        {"Arial", 16, VARIABLE_PITCH | FF_SWISS, ANSI_CHARSET, 4},
+        {"Courier New", 16, FIXED_PITCH | FF_MODERN, ANSI_CHARSET, 4},
+        {"Times New Roman", 16, VARIABLE_PITCH | FF_ROMAN, ANSI_CHARSET, 4},
+        {"Symbol", 16, VARIABLE_PITCH | FF_DECORATIVE, SYMBOL_CHARSET, 4},
+        {"Wingdings", 16, VARIABLE_PITCH | FF_DECORATIVE, SYMBOL_CHARSET, 4},
+    };
+    const FarPtr facePtr = a.Ptr(1), proc = a.Ptr(2);
+    const std::string only = facePtr.IsNull() ? "" : rt.Mem().ReadString(facePtr.sel, facePtr.off, 31);
+    HDC dc = Dc(rt, a.Word(0));
+    uint32_t result = 0;
+    if (dc && !proc.IsNull()) {
+        for (const Face& f : kFaces) {
+            if (!only.empty() && _stricmp(only.c_str(), f.name) != 0) continue;
+            LOGFONTW lf{};
+            lf.lfHeight = f.height;
+            lf.lfWeight = std::strcmp(f.name, "System") == 0 ? FW_BOLD : FW_NORMAL;
+            lf.lfCharSet = f.charset;
+            lf.lfPitchAndFamily = f.pitch;
+            lf.lfOutPrecision = f.type == 4 ? OUT_TT_PRECIS : OUT_RASTER_PRECIS;
+            lf.lfQuality = NONANTIALIASED_QUALITY;
+            MultiByteToWideChar(1252, 0, f.name, -1, lf.lfFaceName, LF_FACESIZE);
+            HFONT font = CreateFontIndirectW(&lf);
+            TEXTMETRICW tm{};
+            HGDIOBJ old = SelectObject(dc, font);
+            GetTextMetricsW(dc, &tm);
+            SelectObject(dc, old);
+            DeleteObject(font);
+
+            Runtime::Scratch lfMem(rt, 50), tmMem(rt, 32);
+            WriteLogFont(rt.Mem(), {lfMem.Offset(), lfMem.Selector()}, lf, 50);
+            WriteTextMetrics(rt.Mem(), {tmMem.Offset(), tmMem.Selector()}, tm);
+            const uint32_t data = a.Long(3);
+            result = rt.Processor().CallFar(proc.sel, proc.off,
+                                            {lfMem.Selector(), lfMem.Offset(), tmMem.Selector(), tmMem.Offset(),
+                                             f.type, uint16_t(data >> 16), uint16_t(data)},
+                                            rt.CallbackData(proc.sel, 0));
+            if (uint16_t(result) == 0 || rt.HasExited()) break;  // the callback stopped the enumeration
+        }
+    }
+    Return(cpu, a, uint16_t(result));
 }
 
 SIZE TextSize(Runtime& rt, HDC dc, FarPtr text, int count) {
@@ -398,9 +458,7 @@ void OrgExt(Runtime& rt, Cpu& cpu, F f) {
 void Api_SetWindowOrg(Runtime& rt, Cpu& cpu) {
     OrgExt(rt, cpu, [](HDC dc, int x, int y, POINT* o) { return SetWindowOrgEx(dc, x, y, o) != FALSE; });
 }
-void Api_SetViewportOrg(Runtime& rt, Cpu& cpu) {
-    OrgExt(rt, cpu, [](HDC dc, int x, int y, POINT* o) { return SetViewportOrgEx(dc, x, y, o) != FALSE; });
-}
+
 void Api_SetWindowExt(Runtime& rt, Cpu& cpu) {
     OrgExt(rt, cpu, [](HDC dc, int x, int y, POINT* o) {
         SIZE s{};
@@ -812,6 +870,193 @@ void Api_FrameRect(Runtime& rt, Cpu& cpu) {  // (HDC, const RECT FAR*, HBRUSH)
     Return(cpu, a, dc && brush && FrameRect(dc, &r, brush) ? 1 : 0);
 }
 
+// Coordinate state: origins, extents, the current position. Each comes in the
+// Windows 3.0 form (returning x | y << 16) and the 3.1 ...Ex form (through a
+// POINT or SIZE pointer, returning BOOL); both go to the host's DC.
+std::pair<LONG, LONG> XY(const POINT& p) { return {p.x, p.y}; }
+std::pair<LONG, LONG> XY(const SIZE& s) { return {s.cx, s.cy}; }
+
+void WritePair(Runtime& rt, FarPtr p, std::pair<LONG, LONG> v) {
+    if (p.IsNull()) return;
+    rt.Mem().Write16(p.sel, p.off, uint16_t(v.first));
+    rt.Mem().Write16(p.sel, uint16_t(p.off + 2), uint16_t(v.second));
+}
+
+template <typename T, BOOL(WINAPI* F)(HDC, T*)>
+void Api_GetPair(Runtime& rt, Cpu& cpu) {  // (HDC) -> x | y << 16
+    const PascalArgs a(cpu, {2});
+    HDC dc = Dc(rt, a.Word(0));
+    T v{};
+    const bool ok = dc && F(dc, &v);
+    Return(cpu, a, ok ? MakeLong(XY(v).first, XY(v).second) : 0);
+}
+
+template <typename T, BOOL(WINAPI* F)(HDC, T*)>
+void Api_GetPairEx(Runtime& rt, Cpu& cpu) {  // (HDC, POINT/SIZE FAR*) -> BOOL
+    const PascalArgs a(cpu, {2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    T v{};
+    const bool ok = dc && F(dc, &v);
+    if (ok) WritePair(rt, a.Ptr(1), XY(v));
+    Return(cpu, a, ok ? 1 : 0);
+}
+
+template <typename T, BOOL(WINAPI* F)(HDC, int, int, T*)>
+void Api_SetPair(Runtime& rt, Cpu& cpu) {  // (HDC, int, int) -> the previous x | y << 16
+    const PascalArgs a(cpu, {2, 2, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    T previous{};
+    const bool ok = dc && F(dc, a.Int(1), a.Int(2), &previous);
+    Return(cpu, a, ok ? MakeLong(XY(previous).first, XY(previous).second) : 0);
+}
+
+template <typename T, BOOL(WINAPI* F)(HDC, int, int, T*)>
+void Api_SetPairEx(Runtime& rt, Cpu& cpu) {  // (HDC, int, int, POINT/SIZE FAR* previous) -> BOOL
+    const PascalArgs a(cpu, {2, 2, 2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    T previous{};
+    const bool ok = dc && F(dc, a.Int(1), a.Int(2), &previous);
+    if (ok) WritePair(rt, a.Ptr(3), XY(previous));
+    Return(cpu, a, ok ? 1 : 0);
+}
+
+template <BOOL(WINAPI* F)(HDC, int, int, int, int, LPSIZE)>
+void Api_Scale(Runtime& rt, Cpu& cpu) {  // (HDC, xNum, xDenom, yNum, yDenom) -> the previous extent
+    const PascalArgs a(cpu, {2, 2, 2, 2, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    SIZE previous{};
+    const bool ok = dc && F(dc, a.Int(1), a.Int(2), a.Int(3), a.Int(4), &previous);
+    Return(cpu, a, ok ? MakeLong(previous.cx, previous.cy) : 0);
+}
+
+template <BOOL(WINAPI* F)(HDC, int, int, int, int, LPSIZE)>
+void Api_ScaleEx(Runtime& rt, Cpu& cpu) {  // (HDC, xNum, xDenom, yNum, yDenom, SIZE FAR*) -> BOOL
+    const PascalArgs a(cpu, {2, 2, 2, 2, 2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    SIZE previous{};
+    const bool ok = dc && F(dc, a.Int(1), a.Int(2), a.Int(3), a.Int(4), &previous);
+    if (ok) WritePair(rt, a.Ptr(5), XY(previous));
+    Return(cpu, a, ok ? 1 : 0);
+}
+
+// Visibility against the DC's clipping region.
+void Api_RectVisible(Runtime& rt, Cpu& cpu) {  // (HDC, const RECT FAR*) -> BOOL
+    const PascalArgs a(cpu, {2, 4});
+    HDC dc = Dc(rt, a.Word(0));
+    const RECT r = ReadRect(rt.Mem(), a.Ptr(1));
+    Return(cpu, a, dc && RectVisible(dc, &r) ? 1 : 0);
+}
+
+void Api_PtVisible(Runtime& rt, Cpu& cpu) {  // (HDC, int x, int y) -> BOOL
+    const PascalArgs a(cpu, {2, 2, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    Return(cpu, a, dc && PtVisible(dc, a.Int(1), a.Int(2)) ? 1 : 0);
+}
+
+// UnrealizeObject: resets a brush's origin (or a palette's mapping) the next
+// time it's selected. Brush origins are applied as they're set, so: nothing to do.
+void Api_UnrealizeObject(Runtime&, Cpu& cpu) {  // (HGDIOBJ) -> BOOL
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(2);
+}
+
+// Viewport origins, relative to the DC's device origin (a child window DC's
+// is at the child's corner of its top-level surface; see Gdi::GetWindowDc).
+POINT DeviceOrigin(Runtime& rt, uint16_t hdc) {
+    const Point16 o = rt.Graphics().DeviceOrigin(hdc);
+    return {o.x, o.y};
+}
+
+// SetViewportOrg[Ex] / OffsetViewportOrg[Ex]: (HDC, x, y[, POINT FAR* previous]).
+void ViewportOrg(Runtime& rt, Cpu& cpu, bool offset, bool ex) {
+    const PascalArgs a = ex ? PascalArgs(cpu, {2, 2, 2, 4}) : PascalArgs(cpu, {2, 2, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    const POINT o = DeviceOrigin(rt, a.Word(0));
+    POINT previous{};
+    bool ok = false;
+    if (dc) {
+        ok = offset ? OffsetViewportOrgEx(dc, a.Int(1), a.Int(2), &previous) != FALSE
+                    : SetViewportOrgEx(dc, a.Int(1) + o.x, a.Int(2) + o.y, &previous) != FALSE;
+    }
+    previous.x -= o.x;
+    previous.y -= o.y;
+    if (ex) {
+        if (ok) WritePair(rt, a.Ptr(3), XY(previous));
+        Return(cpu, a, ok ? 1 : 0);
+    } else {
+        Return(cpu, a, ok ? MakeLong(previous.x, previous.y) : 0);
+    }
+}
+
+// GetViewportOrg (-> x | y << 16) / GetViewportOrgEx (HDC, POINT FAR*) -> BOOL.
+void GetViewportOrigin(Runtime& rt, Cpu& cpu, bool ex) {
+    const PascalArgs a = ex ? PascalArgs(cpu, {2, 4}) : PascalArgs(cpu, {2});
+    HDC dc = Dc(rt, a.Word(0));
+    const POINT o = DeviceOrigin(rt, a.Word(0));
+    POINT p{};
+    const bool ok = dc && GetViewportOrgEx(dc, &p);
+    p.x -= o.x;
+    p.y -= o.y;
+    if (ex) {
+        if (ok) WritePair(rt, a.Ptr(1), XY(p));
+        Return(cpu, a, ok ? 1 : 0);
+    } else {
+        Return(cpu, a, ok ? MakeLong(p.x, p.y) : 0);
+    }
+}
+
+void Api_SetViewportOrg(Runtime& rt, Cpu& cpu) { ViewportOrg(rt, cpu, false, false); }
+void Api_SetViewportOrgEx(Runtime& rt, Cpu& cpu) { ViewportOrg(rt, cpu, false, true); }
+void Api_OffsetViewportOrg(Runtime& rt, Cpu& cpu) { ViewportOrg(rt, cpu, true, false); }
+void Api_OffsetViewportOrgEx(Runtime& rt, Cpu& cpu) { ViewportOrg(rt, cpu, true, true); }
+void Api_GetViewportOrg(Runtime& rt, Cpu& cpu) { GetViewportOrigin(rt, cpu, false); }
+void Api_GetViewportOrgEx(Runtime& rt, Cpu& cpu) { GetViewportOrigin(rt, cpu, true); }
+
+// DPtoLP / LPtoDP: points through the DC's mapping mode, in place.
+void ConvertPoints(Runtime& rt, Cpu& cpu, bool toLogical) {  // (HDC, POINT FAR*, int count) -> BOOL
+    const PascalArgs a(cpu, {2, 4, 2});
+    HDC dc = Dc(rt, a.Word(0));
+    const FarPtr p = a.Ptr(1);
+    const int count = std::max<int>(a.Int(2), 0);
+    const POINT o = DeviceOrigin(rt, a.Word(0));  // device coordinates are relative to it
+    BOOL ok = dc != nullptr;
+    for (int i = 0; ok && i < count; ++i) {
+        const uint16_t at = uint16_t(p.off + 4 * i);
+        POINT pt{int16_t(rt.Mem().Read16(p.sel, at)), int16_t(rt.Mem().Read16(p.sel, uint16_t(at + 2)))};
+        if (toLogical) {
+            pt.x += o.x;
+            pt.y += o.y;
+            ok = DPtoLP(dc, &pt, 1);
+        } else {
+            ok = LPtoDP(dc, &pt, 1);
+            pt.x -= o.x;
+            pt.y -= o.y;
+        }
+        rt.Mem().Write16(p.sel, at, uint16_t(pt.x));
+        rt.Mem().Write16(p.sel, uint16_t(at + 2), uint16_t(pt.y));
+    }
+    Return(cpu, a, ok ? 1 : 0);
+}
+
+void Api_DPtoLP(Runtime& rt, Cpu& cpu) { ConvertPoints(rt, cpu, true); }
+void Api_LPtoDP(Runtime& rt, Cpu& cpu) { ConvertPoints(rt, cpu, false); }
+
+// MulDiv: a * b / c through a 32-bit product, rounded; -32768 when c is 0 or
+// the result doesn't fit.
+void Api_MulDiv(Runtime&, Cpu& cpu) {  // (int a, int b, int c) -> int
+    const PascalArgs a(cpu, {2, 2, 2});
+    const int64_t product = int64_t(a.Int(0)) * a.Int(1), c = a.Int(2);
+    int64_t result = -32768;
+    if (c != 0) {
+        // Round half away from zero.
+        const int64_t magnitude = (std::abs(product) + std::abs(c) / 2) / std::abs(c);
+        const int64_t q = (product < 0) != (c < 0) ? -magnitude : magnitude;
+        if (q >= -32768 && q <= 32767) result = q;
+    }
+    cpu.Regs().r[AX] = uint16_t(result);
+    cpu.ReturnFar(a.Bytes());
+}
+
 void Api_InvertRect(Runtime& rt, Cpu& cpu) {  // (HDC, const RECT FAR*)
     const PascalArgs a(cpu, {2, 4});
     HDC dc = Dc(rt, a.Word(0));
@@ -862,7 +1107,39 @@ std::vector<ApiFunction> GdiDrawApi() {
         {91, "GETTEXTEXTENT", Api_GetTextExtent},
         {92, "GETTEXTFACE", Api_GetTextFace},
         {93, "GETTEXTMETRICS", Api_GetTextMetrics},
+        {15, "OFFSETWINDOWORG", Api_SetPair<POINT, OffsetWindowOrgEx>},
+        {16, "SCALEWINDOWEXT", Api_Scale<ScaleWindowExtEx>},
+        {17, "OFFSETVIEWPORTORG", Api_OffsetViewportOrg},
+        {18, "SCALEVIEWPORTEXT", Api_Scale<ScaleViewportExtEx>},
+        {67, "DPTOLP", Api_DPtoLP},
+        {94, "GETVIEWPORTEXT", Api_GetPair<SIZE, GetViewportExtEx>},
+        {103, "PTVISIBLE", Api_PtVisible},
+        {104, "RECTVISIBLEOLD", Api_RectVisible},
+        {150, "UNREALIZEOBJECT", Api_UnrealizeObject},
+        {465, "RECTVISIBLE", Api_RectVisible},
+        {95, "GETVIEWPORTORG", Api_GetViewportOrg},
+        {96, "GETWINDOWEXT", Api_GetPair<SIZE, GetWindowExtEx>},
+        {97, "GETWINDOWORG", Api_GetPair<POINT, GetWindowOrgEx>},
+        {148, "SETBRUSHORG", Api_SetPair<POINT, SetBrushOrgEx>},
+        {149, "GETBRUSHORG", Api_GetPair<POINT, GetBrushOrgEx>},
+        {469, "GETBRUSHORGEX", Api_GetPairEx<POINT, GetBrushOrgEx>},
+        {470, "GETCURRENTPOSITIONEX", Api_GetPairEx<POINT, GetCurrentPositionEx>},
+        {472, "GETVIEWPORTEXTEX", Api_GetPairEx<SIZE, GetViewportExtEx>},
+        {473, "GETVIEWPORTORGEX", Api_GetViewportOrgEx},
+        {474, "GETWINDOWEXTEX", Api_GetPairEx<SIZE, GetWindowExtEx>},
+        {475, "GETWINDOWORGEX", Api_GetPairEx<POINT, GetWindowOrgEx>},
+        {476, "OFFSETVIEWPORTORGEX", Api_OffsetViewportOrgEx},
+        {477, "OFFSETWINDOWORGEX", Api_SetPairEx<POINT, OffsetWindowOrgEx>},
+        {479, "SETVIEWPORTEXTEX", Api_SetPairEx<SIZE, SetViewportExtEx>},
+        {480, "SETVIEWPORTORGEX", Api_SetViewportOrgEx},
+        {481, "SETWINDOWEXTEX", Api_SetPairEx<SIZE, SetWindowExtEx>},
+        {482, "SETWINDOWORGEX", Api_SetPairEx<POINT, SetWindowOrgEx>},
+        {484, "SCALEVIEWPORTEXTEX", Api_ScaleEx<ScaleViewportExtEx>},
+        {485, "SCALEWINDOWEXTEX", Api_ScaleEx<ScaleWindowExtEx>},
+        {70, "ENUMFONTS", Api_EnumFonts},
+        {99, "LPTODP", Api_LPtoDP},
         {106, "SETBITMAPBITS", Api_SetBitmapBits},
+        {128, "MULDIV", Api_MulDiv},
         {154, "GETNEARESTCOLOR", Api_GetNearestColor},
         {345, "GETTEXTALIGN", Api_GetTextAlign},
         {346, "SETTEXTALIGN", Api_SetTextAlign},

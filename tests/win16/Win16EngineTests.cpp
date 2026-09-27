@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -12,6 +13,7 @@
 #include "retro/FramePacing.h"
 #include "TestPrograms.h"
 #include "win16/ApiCatalog.h"
+#include "win16/Atoms.h"
 #include "win16/Files.h"
 #include "win16/LocalHeap.h"
 #include "win16/Menus.h"
@@ -1094,6 +1096,86 @@ void TestDllModules() {
     CHECK(rt.ProcAddress(dll->hInstance, 4, "") == 0);  // no ordinal 4
 }
 
+void TestKernelServices() {
+    const RunOutcome o = RunProgram(KernelServicesProgram(), 1'000'000);
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 0);
+}
+
+void TestWindowServices() {
+    const RunOutcome o = RunProgram(WindowServicesProgram(), 1'000'000);
+    CHECK(o.loaded && o.exit.kind == TaskExit::Kind::Exited && o.exit.code == 0);
+}
+
+void TestSelectorAliases() {
+    Memory mem(1 << 20);
+    const uint16_t data = mem.Allocate(0x100, SegmentKind::Data);
+    mem.Write8(data, 0x10, 0xAB);
+    // A code alias shares the bytes, and can't write them.
+    const uint16_t code = mem.Alias(data, SegmentKind::Code);
+    CHECK(code && code != data && mem.Read8(code, 0x10, Access::Execute) == 0xAB);
+    bool faulted = false;
+    try {
+        mem.Write8(code, 0x10, 1);
+    } catch (const ProtectionFault&) {
+        faulted = true;
+    }
+    CHECK(faulted);
+    mem.Write8(data, 0x11, 0xCD);
+    CHECK(mem.Read8(code, 0x11) == 0xCD);
+    // Freeing an alias leaves the memory to its owner.
+    mem.Free(code);
+    CHECK(!mem.Lookup(code) && mem.Read8(data, 0x10) == 0xAB);
+    // A bare descriptor pointed at the same bytes.
+    const uint16_t bare = mem.AllocateDescriptor();
+    CHECK(bare && mem.SetBase(bare, mem.Lookup(data)->base) && mem.SetLimit(bare, 0xFF));
+    CHECK(mem.Read8(bare, 0x10) == 0xAB && !mem.Resize(bare, 0x200));
+    CHECK(!mem.SetBase(bare, 0xFFFFFF00u));  // past the arena
+    CHECK(!mem.SetBase(data, 0));             // an owner's base doesn't move
+    // PrestoChangoSelector onto itself: the type flips, it still owns its memory.
+    CHECK(mem.CopyDescriptor(data, data, SegmentKind::Code));
+    CHECK(mem.Lookup(data)->kind == SegmentKind::Code && mem.Lookup(data)->owner);
+    // No aliases of host segments.
+    CHECK(mem.Alias(mem.Allocate(0x10000, SegmentKind::Host), SegmentKind::Data) == 0);
+    // A fixed GDT selector, refreshed on every access, any RPL.
+    int refreshed = 0;
+    CHECK(mem.DefineFixed(0x40, 0x300, [&](uint8_t* p) { p[0x6C] = uint8_t(++refreshed); }));
+    CHECK(mem.Read8(0x40, 0x6C) == 1 && mem.Read8(0x43, 0x6C) == 2);
+    CHECK(!mem.DefineFixed(0x40, 0x10) && !mem.DefineFixed(0x47, 0x10));  // taken; not a GDT selector
+    CHECK(!mem.Lookup(0x48) && !mem.Resize(0x40, 0x400));
+}
+
+void TestAtomTable() {
+    AtomTable t;
+    const uint16_t hello = t.Add("Hello");
+    CHECK(hello >= 0xC000 && t.Add("HELLO") == hello && t.Find("hello") == hello);
+    std::string name;
+    CHECK(t.Name(hello, name) && name == "Hello");
+    CHECK(t.Delete(hello) == 0 && t.Find("Hello") == hello);  // one reference left
+    CHECK(t.Delete(hello) == 0 && t.Find("Hello") == 0 && t.Delete(hello) == hello);
+    CHECK(t.Add("#123") == 123 && t.Find("#123") == 123 && t.Name(123, name) && name == "#123");
+    CHECK(t.Delete(123) == 0);
+    CHECK(t.Add("#49152") == 0 && t.Add("#0") == 0 && t.Add("") == 0 && t.Add("#12x") == 0);
+    CHECK(t.Add("World") != hello && t.Add("World") >= 0xC000);
+}
+
+void TestBiosData() {
+    Runtime rt;
+    Memory& mem = rt.Mem();
+    CHECK((mem.Read16(Runtime::kBiosDataSelector, 0x10) & 0x0002) != 0);  // a coprocessor
+    CHECK(mem.Read16(Runtime::kBiosDataSelector, 0x13) == 640);
+    auto ticks = [&] {
+        return mem.Read16(Runtime::kBiosDataSelector, 0x6C) |
+               (uint32_t(mem.Read16(Runtime::kBiosDataSelector, 0x6E)) << 16);
+    };
+    const uint32_t before = ticks();
+    CHECK(before < 0x1800B0);  // ticks in a day
+    // The counter runs at 18.2 Hz while the program polls it.
+    const auto start = std::chrono::steady_clock::now();
+    while (ticks() == before && std::chrono::steady_clock::now() - start < std::chrono::seconds(1)) {
+    }
+    CHECK(ticks() != before);
+}
+
 void TestBudget() {
     // An endless loop stops at the budget instead of hanging the host.
     NeProgram p = BaseProgram();
@@ -1152,6 +1234,11 @@ int main() {
         {"DllProgram", TestDllProgram},
         {"DllLoadFailures", TestDllLoadFailures},
         {"DllModules", TestDllModules},
+        {"KernelServices", TestKernelServices},
+        {"WindowServices", TestWindowServices},
+        {"SelectorAliases", TestSelectorAliases},
+        {"AtomTable", TestAtomTable},
+        {"BiosData", TestBiosData},
         {"Budget", TestBudget},
     };
     return test::RunAll(cases);

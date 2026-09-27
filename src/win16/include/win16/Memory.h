@@ -10,8 +10,12 @@
 //
 // Selectors look like the ones Windows 3.x hands out: TI = 1 (LDT), RPL = 3,
 // first index 0x20, so the first segment is 0x0107, then 0x010F, ...
+//
+// A few fixed GDT selectors exist as well, like Windows' 0040h, which maps the
+// BIOS data area (DefineFixed).
 
 #include <cstdint>
+#include <functional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,6 +35,7 @@ struct Descriptor {
     uint32_t limit = 0;  // last valid offset
     SegmentKind kind = SegmentKind::Data;
     bool present = false;
+    bool owner = true;  // owns its arena range (false: an alias, or a bare descriptor)
 };
 
 // Thrown by checked accesses; the CPU turns it into a #GP fault.
@@ -59,11 +64,30 @@ public:
     // new bytes are zero. The segment may move in the arena (its base changes,
     // which programs never see). False if out of memory or not a data/code segment.
     bool Resize(uint16_t selector, uint32_t size);
+    // Selector management (KERNEL's AllocSelector & co, DPMI). These
+    // descriptors don't own memory: freeing one leaves the bytes alone.
+    // A new descriptor: base 0, limit 0, until SetBase/SetLimit or CopyDescriptor.
+    uint16_t AllocateDescriptor(SegmentKind kind = SegmentKind::Data);
+    // A second selector for a segment's bytes, of another type (a code alias
+    // of data, say). 0 if `selector` isn't a code or data segment.
+    uint16_t Alias(uint16_t selector, SegmentKind kind);
+    // `to` takes `from`'s base and limit, with type `kind` (PrestoChangoSelector).
+    bool CopyDescriptor(uint16_t from, uint16_t to, SegmentKind kind);
+    bool SetBase(uint16_t selector, uint32_t base);    // false if it would reach past the arena
+    bool SetLimit(uint16_t selector, uint32_t limit);  // limits above FFFFh are clamped
+    bool SetKind(uint16_t selector, SegmentKind kind);
+
+    // Defines a fixed GDT selector (0x0040, say: any RPL selects it) of `size`
+    // bytes of zero-filled data. `refresh`, if given, runs before every access
+    // through the selector, to keep live fields (a tick counter) current.
+    // False if the selector isn't a GDT one, is already defined, or no memory.
+    bool DefineFixed(uint16_t selector, uint32_t size, std::function<void(uint8_t*)> refresh = {});
+
     // Arena bytes not yet handed out (GetFreeSpace, GlobalCompact).
     uint32_t FreeBytes() const;
 
-    // Descriptor for a selector, or nullptr if the selector is null, not an
-    // LDT selector, out of range or not present.
+    // Descriptor for a selector, or nullptr if the selector is null, not
+    // present, or a GDT selector that isn't one of the fixed ones.
     const Descriptor* Lookup(uint16_t selector) const;
 
     static bool IsNull(uint16_t selector) { return (selector & ~3u) == 0; }
@@ -94,10 +118,22 @@ private:
     };
     // Paragraph-aligned arena range of `span` bytes; UINT32_MAX if none.
     uint32_t AllocRange(uint32_t span);
+    // A free LDT index, or 0.
+    uint16_t FreeIndex() const;
+    // The LDT descriptor of a code or data selector (not host, not GDT), or nullptr.
+    Descriptor* Editable(uint16_t selector);
 
     std::vector<uint8_t> arena_;
     std::vector<Descriptor> ldt_;
+    struct Fixed {
+        uint16_t index;
+        Descriptor descriptor;
+        std::function<void(uint8_t*)> refresh;
+    };
+    const Fixed* FindFixed(uint16_t selector) const;
+
     std::vector<Range> free_;  // freed arena ranges, reused first-fit
+    std::vector<Fixed> fixed_;
     uint32_t next_ = 16;       // keep linear 0 unused
     uint16_t nextIndex_ = kFirstIndex;
 };

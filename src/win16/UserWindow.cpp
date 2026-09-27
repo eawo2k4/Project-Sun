@@ -285,8 +285,255 @@ void GetWindow(Runtime& rt, Cpu& cpu) {  // (HWND, GW_xxx) -> HWND
     Return(cpu, a, result);
 }
 
+bool Contains(const Rect16& r, int x, int y) { return x >= r.left && x < r.right && y >= r.top && y < r.bottom; }
+
+bool IsChildOf(const User::Window& w, uint16_t parent) {
+    return parent ? (w.parent == parent && (w.style & ws::Child)) : !(w.style & ws::Child);
+}
+
+// The deepest visible window at screen point (x, y) under `parent` (0: the
+// top-level ones), the most recently created first.
+uint16_t WindowAt(const User& u, uint16_t parent, int x, int y) {
+    const std::vector<uint16_t> handles = u.Handles();
+    for (auto it = handles.rbegin(); it != handles.rend(); ++it) {
+        const User::Window* w = u.Find(*it);
+        if (!IsChildOf(*w, parent) || !w->visible || !Contains(u.WindowRect(*it), x, y)) continue;
+        const uint16_t child = WindowAt(u, *it, x, y);
+        return child ? child : *it;
+    }
+    return 0;
+}
+
+void WindowFromPoint(Runtime& rt, Cpu& cpu) {  // (POINT, screen) -> HWND or NULL
+    const uint32_t pt = ArgLong(cpu, 0);
+    cpu.Regs().r[AX] = WindowAt(rt.Windows(), 0, int16_t(pt), int16_t(pt >> 16));
+    cpu.ReturnFar(4);
+}
+
+// ChildWindowFromPoint: the parent's child (any, hidden ones too) at a point in
+// the parent's client coordinates; the parent itself if no child is there;
+// NULL outside the parent.
+void ChildWindowFromPoint(Runtime& rt, Cpu& cpu) {  // (HWND parent, POINT) -> HWND
+    const PascalArgs a(cpu, {2, 4});
+    const User& u = rt.Windows();
+    const uint16_t parent = a.Word(0);
+    const Rect16 area = u.WindowRect(parent);
+    const int x = area.left + int16_t(a.Long(1)), y = area.top + int16_t(a.Long(1) >> 16);
+    uint16_t result = 0;
+    if (u.Find(parent) && Contains(area, x, y)) {
+        result = parent;
+        const std::vector<uint16_t> handles = u.Handles();
+        for (auto it = handles.rbegin(); it != handles.rend(); ++it) {
+            if (IsChildOf(*u.Find(*it), parent) && parent && Contains(u.WindowRect(*it), x, y)) {
+                result = *it;
+                break;
+            }
+        }
+    }
+    cpu.Regs().r[AX] = result;
+    cpu.ReturnFar(a.Bytes());
+}
+
+// EnumWindows / EnumTaskWindows (top-level windows: all the task's) and
+// EnumChildWindows (all descendants), in creation order. The callback,
+// BOOL (HWND, LPARAM), returns FALSE to stop.
+void EnumerateWindows(Runtime& rt, Cpu& cpu, const PascalArgs& a, size_t procArg, uint16_t parent) {
+    const FarPtr proc = a.Ptr(procArg);
+    const uint32_t lParam = a.Long(procArg + 1);
+    User& u = rt.Windows();
+    auto isDescendant = [&](uint16_t h) {
+        for (const User::Window* w = u.Find(h); w && w->parent; w = u.Find(w->parent)) {
+            if (w->parent == parent && (w->style & ws::Child)) return true;
+            if (!(w->style & ws::Child)) break;
+        }
+        return false;
+    };
+    std::vector<uint16_t> list;  // taken first: callbacks may create or destroy windows
+    for (uint16_t h : u.Handles()) {
+        const User::Window* w = u.Find(h);
+        if (parent ? isDescendant(h) : !(w->style & ws::Child)) list.push_back(h);
+    }
+    const uint16_t ds = rt.CallbackData(proc.sel, 0);
+    for (uint16_t h : list) {
+        if (!u.Find(h) || rt.HasExited()) continue;
+        if (uint16_t(rt.Processor().CallFar(proc.sel, proc.off, {h, uint16_t(lParam >> 16), uint16_t(lParam)}, ds)) == 0)
+            break;
+    }
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void EnumWindows(Runtime& rt, Cpu& cpu) {  // (WNDENUMPROC, LPARAM) -> BOOL
+    EnumerateWindows(rt, cpu, PascalArgs(cpu, {4, 4}), 0, 0);
+}
+
+void EnumTaskWindows(Runtime& rt, Cpu& cpu) {  // (HTASK, WNDENUMPROC, LPARAM) -> BOOL: one task, so all of them
+    EnumerateWindows(rt, cpu, PascalArgs(cpu, {2, 4, 4}), 1, 0);
+}
+
+void EnumChildWindows(Runtime& rt, Cpu& cpu) {  // (HWND parent, WNDENUMPROC, LPARAM) -> BOOL
+    const PascalArgs a(cpu, {2, 4, 4});
+    if (!rt.Windows().Find(a.Word(0))) {
+        cpu.Regs().r[AX] = 0;
+        cpu.ReturnFar(a.Bytes());
+        return;
+    }
+    EnumerateWindows(rt, cpu, a, 1, a.Word(0));
+}
+
 // (LPCSTR class or MAKEINTATOM or NULL, LPCSTR title or NULL) -> the first
 // top-level window matching both (case-insensitively), or NULL.
+// lstrcmp / lstrcmpi, the way Windows' language driver orders strings: letters
+// compare regardless of case first; lstrcmp then puts lowercase before uppercase.
+int CompareStrings(const std::string& a, const std::string& b, bool ignoreCase) {
+    auto upper = [](char c) { return std::toupper(static_cast<unsigned char>(c)); };
+    const size_t n = std::min(a.size(), b.size());
+    for (size_t i = 0; i < n; ++i) {
+        const int ua = upper(a[i]), ub = upper(b[i]);
+        if (ua != ub) return ua < ub ? -1 : 1;
+    }
+    if (a.size() != b.size()) return a.size() < b.size() ? -1 : 1;
+    if (ignoreCase) return 0;
+    for (size_t i = 0; i < n; ++i) {
+        if (a[i] != b[i]) return std::islower(static_cast<unsigned char>(a[i])) ? -1 : 1;
+    }
+    return 0;
+}
+
+void CompareStringArgs(Runtime& rt, Cpu& cpu, bool ignoreCase) {  // (LPCSTR, LPCSTR) -> int
+    const PascalArgs a(cpu, {4, 4});
+    const FarPtr s1 = a.Ptr(0), s2 = a.Ptr(1);
+    cpu.Regs().r[AX] = uint16_t(int16_t(CompareStrings(rt.Mem().ReadString(s1.sel, s1.off, 0xFFFF),
+                                                       rt.Mem().ReadString(s2.sel, s2.off, 0xFFFF), ignoreCase)));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void lstrcmp(Runtime& rt, Cpu& cpu) { CompareStringArgs(rt, cpu, false); }
+void lstrcmpi(Runtime& rt, Cpu& cpu) { CompareStringArgs(rt, cpu, true); }
+
+// Hooks. The Windows 3.0 functions: SetWindowsHook returns the previous
+// hook's procedure, which the new one passes on through DefHookProc.
+void SetWindowsHook(Runtime& rt, Cpu& cpu) {  // (int id, HOOKPROC) -> the previous hook procedure
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr proc = a.Ptr(1);
+    const uint32_t previous = rt.Windows().TopHookProc(a.Int(0));
+    rt.Windows().AddHook(a.Int(0), proc.sel, proc.off, rt.CallbackData(proc.sel, 0));
+    SetResult(cpu, previous);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void UnhookWindowsHook(Runtime& rt, Cpu& cpu) {  // (int id, HOOKPROC) -> BOOL
+    const PascalArgs a(cpu, {2, 4});
+    const FarPtr proc = a.Ptr(1);
+    cpu.Regs().r[AX] = rt.Windows().RemoveHook(rt.Windows().FindHook(a.Int(0), proc.sel, proc.off)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void DefHookProc(Runtime& rt, Cpu& cpu) {  // (int code, WPARAM, LPARAM, HOOKPROC FAR* next) -> result
+    const PascalArgs a(cpu, {2, 2, 4, 4});
+    const FarPtr at = a.Ptr(3);
+    uint32_t result = 0;
+    if (!at.IsNull()) {
+        const uint16_t off = rt.Mem().Read16(at.sel, at.off), sel = rt.Mem().Read16(at.sel, uint16_t(at.off + 2));
+        const uint32_t next = rt.Windows().FindHookByProc(sel, off);
+        if (next) result = rt.Windows().CallHook(next, a.Int(0), a.Word(1), a.Long(2));
+    }
+    SetResult(cpu, result);
+    cpu.ReturnFar(a.Bytes());
+}
+
+// The Windows 3.1 functions, with HHOOK handles.
+void SetWindowsHookEx(Runtime& rt, Cpu& cpu) {  // (int id, HOOKPROC, HINSTANCE, HTASK) -> HHOOK
+    const PascalArgs a(cpu, {2, 4, 2, 2});
+    const FarPtr proc = a.Ptr(1);
+    SetResult(cpu, rt.Windows().AddHook(a.Int(0), proc.sel, proc.off, rt.CallbackData(proc.sel, a.Word(2))));
+    cpu.ReturnFar(a.Bytes());
+}
+
+void UnhookWindowsHookEx(Runtime& rt, Cpu& cpu) {  // (HHOOK) -> BOOL
+    const PascalArgs a(cpu, {4});
+    cpu.Regs().r[AX] = rt.Windows().RemoveHook(a.Long(0)) ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void CallNextHookEx(Runtime& rt, Cpu& cpu) {  // (HHOOK, int code, WPARAM, LPARAM) -> result
+    const PascalArgs a(cpu, {4, 2, 2, 4});
+    SetResult(cpu, rt.Windows().CallNextHook(a.Long(0), a.Int(1), a.Word(2), a.Long(3)));
+    cpu.ReturnFar(a.Bytes());
+}
+
+// GetClassInfo: a registered class's WNDCLASS. The class name pointer is the
+// caller's own; the menu name isn't kept, so it comes back NULL.
+void GetClassInfo(Runtime& rt, Cpu& cpu) {  // (HINSTANCE, LPCSTR class or atom, WNDCLASS FAR*) -> BOOL
+    const PascalArgs a(cpu, {2, 4, 4});
+    const FarPtr name = a.Ptr(1), out = a.Ptr(2);
+    std::string className = name.sel ? rt.Mem().ReadString(name.sel, name.off) : "";
+    for (char& ch : className) ch = char(std::toupper(static_cast<unsigned char>(ch)));
+    const User::WindowClass* c =
+        name.sel == 0 ? rt.Windows().FindClassAtom(name.off) : rt.Windows().FindClass(className);
+    if (c && !out.IsNull()) {
+        const uint16_t words[13] = {c->style,     c->procOff, c->procSel, c->clsExtra,     c->wndExtra,
+                                    c->hInstance, c->hIcon,   c->hCursor, c->hbrBackground, 0,
+                                    0,            name.off,   name.sel};
+        for (uint16_t i = 0; i < 13; ++i) rt.Mem().Write16(out.sel, uint16_t(out.off + 2 * i), words[i]);
+    }
+    cpu.Regs().r[AX] = c ? 1 : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+// Scroll bars: ranges and positions are kept (programs read them back), but
+// the bars aren't drawn yet.
+void SetScrollPos(Runtime& rt, Cpu& cpu) {  // (HWND, int bar, int pos, BOOL redraw) -> previous position
+    const PascalArgs a(cpu, {2, 2, 2, 2});
+    ScrollBar* s = rt.Windows().Scroll(a.Word(0), a.Word(1));
+    int16_t previous = 0;
+    if (s) {
+        previous = s->pos;
+        s->pos = std::clamp<int16_t>(a.Int(2), std::min(s->min, s->max), std::max(s->min, s->max));
+    }
+    cpu.Regs().r[AX] = uint16_t(previous);
+    cpu.ReturnFar(a.Bytes());
+}
+
+void GetScrollPos(Runtime& rt, Cpu& cpu) {  // (HWND, int bar) -> position
+    const PascalArgs a(cpu, {2, 2});
+    const ScrollBar* s = rt.Windows().Scroll(a.Word(0), a.Word(1));
+    cpu.Regs().r[AX] = s ? uint16_t(s->pos) : 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void SetScrollRange(Runtime& rt, Cpu& cpu) {  // (HWND, int bar, int min, int max, BOOL redraw)
+    const PascalArgs a(cpu, {2, 2, 2, 2, 2});
+    if (ScrollBar* s = rt.Windows().Scroll(a.Word(0), a.Word(1))) {
+        s->min = a.Int(2);
+        s->max = a.Int(3);
+        s->pos = std::clamp<int16_t>(s->pos, std::min(s->min, s->max), std::max(s->min, s->max));
+    }
+    cpu.Regs().r[AX] = 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void GetScrollRange(Runtime& rt, Cpu& cpu) {  // (HWND, int bar, int FAR* min, int FAR* max)
+    const PascalArgs a(cpu, {2, 2, 4, 4});
+    const ScrollBar* s = rt.Windows().Scroll(a.Word(0), a.Word(1));
+    const FarPtr lo = a.Ptr(2), hi = a.Ptr(3);
+    if (!lo.IsNull()) rt.Mem().Write16(lo.sel, lo.off, s ? uint16_t(s->min) : 0);
+    if (!hi.IsNull()) rt.Mem().Write16(hi.sel, hi.off, s ? uint16_t(s->max) : 0);
+    cpu.Regs().r[AX] = 0;
+    cpu.ReturnFar(a.Bytes());
+}
+
+void ScrollBarNoOp(Runtime&, Cpu& cpu) {  // ShowScrollBar, EnableScrollBar: (HWND, UINT, UINT) -> TRUE
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(6);
+}
+
+// SetMessageQueue: the queue grows as needed, so any size is fine.
+void SetMessageQueue(Runtime&, Cpu& cpu) {  // (int size) -> BOOL
+    cpu.Regs().r[AX] = 1;
+    cpu.ReturnFar(2);
+}
+
 void FindWindow(Runtime& rt, Cpu& cpu) {
     const PascalArgs a(cpu, {4, 4});
     const FarPtr cls = a.Ptr(0), title = a.Ptr(1);
@@ -375,7 +622,7 @@ void CallWindowProc(Runtime& rt, Cpu& cpu) {  // (WNDPROC, HWND, msg, wParam, lP
         const User::Window* w = rt.Windows().Find(hwnd);
         result = rt.Processor().CallFar(proc.sel, proc.off,
                                         {hwnd, msg, wParam, uint16_t(lParam >> 16), uint16_t(lParam)},
-                                        w ? w->hInstance : rt.Module().dgroup);
+                                        rt.CallbackData(proc.sel, w ? w->hInstance : 0));
     } else if (d && d->kind == SegmentKind::Host) {
         result = rt.Windows().DefProc(hwnd, msg, wParam, lParam);  // DefWindowProc's own address
     }
@@ -651,6 +898,7 @@ std::vector<ApiFunction> UserWindowApi() {
         {23, "GETFOCUS", GetFocus},
         {28, "CLIENTTOSCREEN", ClientToScreen},
         {29, "SCREENTOCLIENT", ScreenToClient},
+        {30, "WINDOWFROMPOINT", WindowFromPoint},
         {31, "ISICONIC", ReturnFalse1},
         {32, "GETWINDOWRECT", GetWindowRect},
         {34, "ENABLEWINDOW", EnableWindow},
@@ -663,7 +911,13 @@ std::vector<ApiFunction> UserWindowApi() {
         {47, "ISWINDOW", IsWindow},
         {49, "ISWINDOWVISIBLE", IsWindowVisible},
         {50, "FINDWINDOW", FindWindow},
+        {54, "ENUMWINDOWS", EnumWindows},
+        {55, "ENUMCHILDWINDOWS", EnumChildWindows},
         {56, "MOVEWINDOW", MoveWindow},
+        {62, "SETSCROLLPOS", SetScrollPos},
+        {63, "GETSCROLLPOS", GetScrollPos},
+        {64, "SETSCROLLRANGE", SetScrollRange},
+        {65, "GETSCROLLRANGE", GetScrollRange},
         {59, "SETACTIVEWINDOW", SetActiveWindow},
         {60, "GETACTIVEWINDOW", GetActiveWindow},
         {69, "SETCURSOR", SetCursor},
@@ -679,6 +933,7 @@ std::vector<ApiFunction> UserWindowApi() {
         {79, "INTERSECTRECT", IntersectRect},
         {80, "UNIONRECT", UnionRect},
         {106, "GETKEYSTATE", GetKeyState},
+        {121, "SETWINDOWSHOOK", SetWindowsHook},
         {122, "CALLWINDOWPROC", CallWindowProc},
         {129, "GETCLASSWORD", GetClassWord},
         {130, "SETCLASSWORD", SetClassWord},
@@ -688,15 +943,28 @@ std::vector<ApiFunction> UserWindowApi() {
         {135, "GETWINDOWLONG", GetWindowLong},
         {136, "SETWINDOWLONG", SetWindowLong},
         {180, "GETSYSCOLOR", GetSysColor},
+        {191, "CHILDWINDOWFROMPOINT", ChildWindowFromPoint},
+        {225, "ENUMTASKWINDOWS", EnumTaskWindows},
         {232, "SETWINDOWPOS", SetWindowPos},
+        {234, "UNHOOKWINDOWSHOOK", UnhookWindowsHook},
+        {235, "DEFHOOKPROC", DefHookProc},
         {236, "GETCAPTURE", GetCapture},
         {244, "EQUALRECT", EqualRect},
         {249, "GETASYNCKEYSTATE", GetAsyncKeyState},
         {262, "GETWINDOW", GetWindow},
+        {266, "SETMESSAGEQUEUE", SetMessageQueue},
+        {267, "SHOWSCROLLBAR", ScrollBarNoOp},
         {272, "ISZOOMED", ReturnFalse1},
         {286, "GETDESKTOPWINDOW", GetDesktopWindow},
+        {291, "SETWINDOWSHOOKEX", SetWindowsHookEx},
+        {292, "UNHOOKWINDOWSHOOKEX", UnhookWindowsHookEx},
+        {293, "CALLNEXTHOOKEX", CallNextHookEx},
+        {404, "GETCLASSINFO", GetClassInfo},
         {420, "_WSPRINTF", wsprintf},
         {421, "WVSPRINTF", wvsprintf},
+        {430, "LSTRCMP", lstrcmp},
+        {471, "LSTRCMPI", lstrcmpi},
+        {482, "ENABLESCROLLBAR", ScrollBarNoOp},
     };
 }
 

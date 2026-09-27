@@ -1154,10 +1154,10 @@ inline NeProgram CrtProgram() {
     a.db({0xB8});
     code.relocs.push_back({5, 1, a.Here(), 1, 178});  // KERNEL.178 __WINFLAGS
     a.db({0xFF, 0xFF});
-    cmpAx(0x0013);
+    cmpAx(0x0413);  // WF_PMODE | WF_CPU286 | WF_STANDARD | WF_80x87
     FailUnless(a, JZ, 3);
     e.Call(Emit::KERNEL, 132);  // GetWinFlags
-    cmpAx(0x0013);
+    cmpAx(0x0413);
     FailUnless(a, JZ, 3);
 
     // 4. LocalAlloc(LMEM_MOVEABLE, 100); LocalLock; *handle == pointer
@@ -1734,6 +1734,531 @@ inline NeProgram UiProgram() {
 
     code.bytes = a.Finish();
     p.segments = {code, DataSegment(data, 0x200)};
+    return p;
+}
+
+// The KERNEL-level services real programs lean on: the FPU (x87 code and
+// WIN87EM), the BIOS (0040h and INT 1Ah), Catch/Throw, selectors, atoms,
+// strings and code pages, MulDiv, AccessResource. Exit 0, or the failed check:
+//   1 GetWinFlags reports a coprocessor
+//   2 x87 code: 11 / 4, then __fpMath round (BX 6), pop as a long (BX 7),
+//     depth (BX 10), control word (BX 4, 5)
+//   3 __0040H's tick count matches INT 1Ah; the RTC time; INT 11h, INT 12h
+//   4 Catch returns 0, then Throw's value, with SI restored
+//   5 code through a DS->CS alias and a PrestoChangoSelector copy; FreeSelector
+//   6 local atoms; a global atom is RegisterWindowMessage's number too
+//   7 lstrcmp / lstrcmpi / AnsiUpper / IsCharAlpha / hmemcpy
+//   8 KEYBOARD: OemToAnsi, AnsiToOem, GetKBCodePage, GetKeyboardType
+//   9 MulDiv rounding and division by zero
+//  10 AccessResource + _hread read an RCDATA resource
+//  11 CopyRect with a NULL source fails instead of faulting; SetHandleCount
+//  12 TOOLHELP InterruptRegister / InterruptUnRegister
+inline NeProgram KernelServicesProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI", "WIN87EM", "KEYBOARD", "TOOLHELP"};
+    const std::string resData = "RESDATA!";
+    p.resources = {{10, "", 1, "", std::vector<uint8_t>(resData.begin(), resData.end())}};
+    constexpr uint16_t kHinst = 0x00, kAlias = 0x04, kNew = 0x06, kFar = 0x08, kAtom = 0x0C, kFd = 0x0E,
+                       kRect = 0x10, kSun = 0x18, kSunUp = 0x1C, kCatch = 0x20, kBuf = 0x34, kHi = 0x44,
+                       kGlobal = 0x48, kLower = 0x4A, kUpper = 0x4E, kOem = 0x52, kOemOut = 0x54,
+                       kCopySrc = 0x58, kCopyDst = 0x60, kThunk = 0x70, kFpVals = 0x80, kBufRes = 0x90,
+                       kMixed = 0xA0, kResExpect = 0xA8;
+    std::vector<uint8_t> data(0x100, 0);
+    auto put = [&](uint16_t at, const std::string& s) { std::copy(s.begin(), s.end(), data.begin() + at); };
+    put(kSun, "Sun");
+    put(kSunUp, "SUN");
+    put(kHi, "Hi");
+    put(kLower, "abc");
+    put(kUpper, "ABC");
+    data[kOem] = 0x82;  // CP437 e-acute
+    put(kCopySrc, "RETRO");
+    const uint8_t thunk[] = {0xB8, 0x42, 0x42, 0xCB};  // mov ax, 4242h / retf
+    std::copy(std::begin(thunk), std::end(thunk), data.begin() + kThunk);
+    data[kFpVals] = 11;
+    data[kFpVals + 2] = 4;
+    put(kMixed, "Mixed");
+    put(kResExpect, resData);
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    constexpr uint16_t WIN87EM = 4, KEYBOARD = 5, TOOLHELP = 6;
+    auto ok = [&](int fail) { a.db({0x85, 0xC0}); FailUnless(a, JNZ, fail); };  // AX != 0
+    auto eq = [&](uint16_t v, int fail) { e.CmpAx(v); FailUnless(a, JZ, fail); };
+    auto fpMath = [&](uint16_t bx) { a.db({0xBB}).dw(bx); e.Call(WIN87EM, 1); };
+    // repe cmpsb of `count` bytes at DS:si against DS:di
+    auto same = [&](uint16_t si, uint16_t di, uint8_t count, int fail) {
+        a.db({0x1E, 0x07, 0xBE}).dw(si).db({0xBF}).dw(di).db({0xB9, count, 0, 0xFC, 0xF3, 0xA6});
+        FailUnless(a, JZ, fail);
+    };
+
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    // 1. GetWinFlags & WF_80x87
+    e.Call(Emit::KERNEL, 132);
+    a.db({0xA9, 0x00, 0x04});  // test ax, 0400h
+    FailUnless(a, JNZ, 1);
+    // 2. __fpMath init; fild 11; fild 4; fdivp -> 2.75; round (truncate) -> 2; pop as a long
+    fpMath(0);
+    eq(0, 2);
+    a.db({0xDF, 0x06}).dw(kFpVals).db({0xDF, 0x06}).dw(kFpVals + 2).db({0xDE, 0xF9});
+    a.db({0xB8, 0x00, 0x0C});  // mov ax, 0C00h: round toward zero
+    fpMath(6);
+    fpMath(7);
+    eq(2, 2);
+    a.db({0x85, 0xD2}); FailUnless(a, JZ, 2);  // dx = 0
+    fpMath(10);
+    eq(0, 2);                                  // the stack is empty again
+    a.db({0xB8}).dw(0x0F7F);
+    fpMath(4);
+    fpMath(5);
+    eq(0x0F7F, 2);
+    // 3. mov ax, __0040H; mov es, ax; mov si, es:[6Ch]; INT 1Ah AH=0: dx - si < 2
+    a.db({0xB8});
+    code.relocs.push_back({2, 1, a.Here(), 1, 193});  // selector of KERNEL.193 __0040H
+    a.db({0xFF, 0xFF});
+    eq(0x0040, 3);
+    a.db({0x8E, 0xC0, 0x26, 0x8B, 0x36, 0x6C, 0x00, 0xB4, 0x00, 0xCD, 0x1A, 0x89, 0xD0, 0x29, 0xF0});
+    e.CmpAx(2); FailUnless(a, JC, 3);
+    a.db({0xB4, 0x02, 0xCD, 0x1A});              // RTC time: CF clear, CH (BCD hours) < 24h
+    FailUnless(a, 0x73 /* JNC */, 3);
+    a.db({0x80, 0xFD, 0x24}); FailUnless(a, JC, 3);  // cmp ch, 24h
+    a.db({0xCD, 0x11, 0xA9, 0x02, 0x00});        // int 11h; test ax, 2: a coprocessor
+    FailUnless(a, JNZ, 3);
+    a.db({0xCD, 0x12});
+    eq(640, 3);
+    // 4. si = 1234h; Catch(buf) = 0; si = 0; Throw(buf, 5): Catch returns 5, si = 1234h
+    a.db({0xBE, 0x34, 0x12});
+    e.Far(kCatch);
+    e.Call(Emit::KERNEL, 55);
+    e.CmpAx(5);
+    a.Short(JZ, "thrown");
+    a.db({0x85, 0xC0}); FailUnless(a, JZ, 4);  // the first return is 0
+    a.db({0x31, 0xF6});                        // xor si, si
+    e.Far(kCatch); e.Imm(5);
+    e.Call(Emit::KERNEL, 56);                  // Throw: doesn't return here
+    a.Near(0xE9, "fail4");
+    a.Label("thrown");
+    a.db({0x81, 0xFE, 0x34, 0x12}); FailUnless(a, JZ, 4);  // cmp si, 1234h
+    // 5. AllocDStoCSAlias(ds); call far alias:thunk -> 4242h
+    a.db({0x1E});
+    e.Call(Emit::KERNEL, 171);
+    ok(5);
+    e.StoreAx(kAlias);
+    e.Set(kFar, kThunk);
+    e.StoreAx(kFar + 2);
+    a.db({0xFF, 0x1E}).dw(kFar);  // call far [kFar]
+    eq(0x4242, 5);
+    e.Imm(0);
+    e.Call(Emit::KERNEL, 175);    // AllocSelector(0)
+    ok(5);
+    e.StoreAx(kNew);
+    a.db({0x1E});
+    e.Mem(kNew);
+    e.Call(Emit::KERNEL, 177);    // PrestoChangoSelector(ds, new): a code copy of DGROUP
+    a.db({0x3B, 0x06}).dw(kNew); FailUnless(a, JZ, 5);
+    e.StoreAx(kFar + 2);
+    a.db({0xFF, 0x1E}).dw(kFar);
+    eq(0x4242, 5);
+    e.Mem(kAlias);
+    e.Call(Emit::KERNEL, 176);    // FreeSelector
+    eq(0, 5);
+    e.Mem(kNew);
+    e.Call(Emit::KERNEL, 176);
+    eq(0, 5);
+    // 6. AddAtom("Sun"); FindAtom("SUN"); GetAtomName; DeleteAtom; gone
+    e.Far(kSun);
+    e.Call(Emit::KERNEL, 70);
+    ok(6);
+    e.StoreAx(kAtom);
+    e.Far(kSunUp);
+    e.Call(Emit::KERNEL, 69);
+    a.db({0x3B, 0x06}).dw(kAtom); FailUnless(a, JZ, 6);
+    e.Mem(kAtom); e.Far(kBuf); e.Imm(16);
+    e.Call(Emit::KERNEL, 72);
+    eq(3, 6);
+    same(kBuf, kSun, 4, 6);
+    e.Mem(kAtom);
+    e.Call(Emit::KERNEL, 71);
+    eq(0, 6);
+    e.Far(kSunUp);
+    e.Call(Emit::KERNEL, 69);
+    eq(0, 6);
+    //    GlobalAddAtom("Hi") >= C000h, and RegisterWindowMessage("Hi") is the same number
+    e.Far(kHi);
+    e.Call(Emit::USER, 268);
+    e.CmpAx(0xC000); FailUnless(a, 0x73 /* JAE */, 6);
+    e.StoreAx(kGlobal);
+    e.Far(kHi);
+    e.Call(Emit::USER, 118);
+    a.db({0x3B, 0x06}).dw(kGlobal); FailUnless(a, JZ, 6);
+    // 7. lstrcmp("abc", "ABC") = -1 (lower case first); lstrcmpi = 0
+    e.Far(kLower); e.Far(kUpper);
+    e.Call(Emit::USER, 430);
+    eq(0xFFFF, 7);
+    e.Far(kLower); e.Far(kUpper);
+    e.Call(Emit::USER, 471);
+    eq(0, 7);
+    //    AnsiUpper("Mixed") in place; AnsiUpper('q') = 'Q'; IsCharAlpha('5') = 0
+    e.Far(kMixed);
+    e.Call(Emit::USER, 431);
+    e.CmpMem(kMixed, 'M' | ('I' << 8)); FailUnless(a, JZ, 7);
+    e.Long('q');
+    e.Call(Emit::USER, 431);
+    eq('Q', 7);
+    e.Imm('5');
+    e.Call(Emit::USER, 433);
+    eq(0, 7);
+    //    hmemcpy(dst, "RETRO", 6)
+    e.Far(kCopyDst); e.Far(kCopySrc); e.Long(6);
+    e.Call(Emit::KERNEL, 348);
+    same(kCopyDst, kCopySrc, 6, 7);
+    // 8. OemToAnsi(82h) = E9h; AnsiToOem back; code page 437; an enhanced keyboard
+    e.Far(kOem); e.Far(kOemOut);
+    e.Call(KEYBOARD, 6);
+    e.CmpMem(kOemOut, 0x00E9); FailUnless(a, JZ, 8);
+    e.Far(kOemOut); e.Far(kOemOut);
+    e.Call(KEYBOARD, 5);
+    e.CmpMem(kOemOut, 0x0082); FailUnless(a, JZ, 8);
+    e.Call(KEYBOARD, 132);
+    eq(437, 8);
+    e.Imm(0);
+    e.Call(KEYBOARD, 130);
+    eq(4, 8);
+    // 9. MulDiv(10, 96, 72) = 13; MulDiv(1, 1, 0) = -32768; MulDiv(-5, 3, 2) = -8
+    e.Imm(10); e.Imm(96); e.Imm(72);
+    e.Call(Emit::GDI, 128);
+    eq(13, 9);
+    e.Imm(1); e.Imm(1); e.Imm(0);
+    e.Call(Emit::GDI, 128);
+    eq(0x8000, 9);
+    e.Imm(uint16_t(-5)); e.Imm(3); e.Imm(2);
+    e.Call(Emit::GDI, 128);
+    eq(uint16_t(-8), 9);
+    // 10. FindResource(#1, RT_RCDATA); AccessResource; _hread 8 bytes; _lclose
+    e.Mem(kHinst); e.Long(1); e.Long(10);
+    e.Call(Emit::KERNEL, 60);
+    ok(10);
+    a.db({0x89, 0xC3});        // mov bx, ax
+    e.Mem(kHinst);
+    a.db({0x53});              // push bx
+    e.Call(Emit::KERNEL, 64);  // AccessResource(hInstance, hrsrc)
+    e.CmpAx(5); FailUnless(a, 0x73 /* JAE */, 10);
+    e.StoreAx(kFd);
+    e.Mem(kFd); e.Far(kBufRes); e.Long(8);
+    e.Call(Emit::KERNEL, 349);
+    eq(8, 10);
+    same(kBufRes, kResExpect, 8, 10);
+    e.Mem(kFd);
+    e.Call(Emit::KERNEL, 81);
+    // 11. CopyRect(rect, NULL) returns (Windows 3.1 validates the pointer); SetHandleCount(20) = 20
+    e.Far(kRect); e.Long(0);
+    e.Call(Emit::USER, 74);
+    eq(0, 11);
+    e.Imm(20);
+    e.Call(Emit::KERNEL, 199);
+    eq(20, 11);
+    // 12. InterruptRegister(NULL task, NULL) = TRUE; InterruptUnRegister(NULL) = TRUE
+    e.Imm(0); e.Long(0);
+    e.Call(TOOLHELP, 75);
+    eq(1, 12);
+    e.Imm(0);
+    e.Call(TOOLHELP, 76);
+    eq(1, 12);
+    e.Exit0();
+    e.FailStubs(12);
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x100)};
+    return p;
+}
+
+// The USER and GDI services frameworks (MFC, Delphi's VCL) build on. Exit 0,
+// or the failed check:
+//   1 a WH_CALLWNDPROC hook sees the messages of CreateWindow (WM_CREATE
+//     among them) and chains with CallNextHookEx; unhooked, it sees no more;
+//     SetWindowsHook returns the previous hook procedure
+//   2 window properties by name and by atom
+//   3 GetClassInfo: the program's class, not EDIT
+//   4 a child window's DC draws on its parent at the child's place, clipped
+//     to the child, with a viewport origin of its own
+//   5 EnumChildWindows / EnumWindows / EnumTaskWindows
+//   6 WindowFromPoint / ChildWindowFromPoint
+//   7 scroll bar range and position
+//   8 a class whose window procedure is DefWindowProc itself
+//   9 WaitMessage returns when a message is waiting
+//  10 SetViewportOrgEx / GetViewportOrg / GetCurrentPositionEx / RectVisible
+//  11 RegisterWindowMessage: the same number for the same name
+inline NeProgram WindowServicesProgram() {
+    NeProgram p = BaseProgram();
+    p.modules = {"KERNEL", "USER", "GDI"};
+    constexpr uint16_t kHinst = 0x00, kHwnd = 0x02, kChild = 0x04, kHook = 0x06, kHookCount = 0x0A,
+                       kSawCreate = 0x0C, kHdc = 0x0E, kEnumCount = 0x10, kAtom = 0x12, kCount2 = 0x14,
+                       kPlain = 0x16, kMsgId = 0x1A, kClass = 0x20, kTitle = 0x24, kObj = 0x28, kObjUp = 0x2C,
+                       kObj2 = 0x30, kEdit = 0x36, kMsgName = 0x3C, kDefClass = 0x44, kWndClass = 0x50,
+                       kWc2 = 0x70, kPoint = 0x90, kRange = 0x94, kRect = 0x98, kMsg = 0xA0, kPt2 = 0xB4;
+    std::vector<uint8_t> data(0x100, 0);
+    auto put = [&](uint16_t at, const std::string& s) { std::copy(s.begin(), s.end(), data.begin() + at); };
+    put(kClass, "Svc");
+    put(kTitle, "S");
+    put(kObj, "Obj");
+    put(kObjUp, "OBJ");
+    put(kObj2, "Obj2");
+    put(kEdit, "EDIT");
+    put(kMsgName, "Svc.Msg");
+    put(kDefClass, "Plain");
+    data[kRect + 4] = 10;  // (0, 0, 10, 10)
+    data[kRect + 6] = 10;
+
+    NeSeg code;
+    Asm16 a;
+    Emit e{a, code};
+    auto ok = [&](int fail) { a.db({0x85, 0xC0}); FailUnless(a, JNZ, fail); };  // AX != 0
+    auto eq = [&](uint16_t v, int fail) { e.CmpAx(v); FailUnless(a, JZ, fail); };
+    auto eqMem = [&](uint16_t off, int fail) { a.db({0x3B, 0x06}).dw(off); FailUnless(a, JZ, fail); };
+    auto pushLabel = [&](const std::string& label) { a.db({0x0E, 0x68}).Abs16(label); };  // push cs / push offset
+
+    e.Call(Emit::KERNEL, 91);
+    a.db({0x89, 0x3E, kHinst, 0x00});
+    // 1. SetWindowsHookEx(WH_CALLWNDPROC, HookProc, hInstance, 0), then the window
+    e.Imm(4); pushLabel("HookProc"); e.Mem(kHinst); e.Imm(0);
+    e.Call(Emit::USER, 291);
+    a.db({0x85, 0xD2}); FailUnless(a, JNZ, 1);
+    e.StoreAx(kHook);
+    a.db({0x89, 0x16}).dw(kHook + 2);  // mov [kHook+2], dx
+    e.RegisterClass(kWndClass, kClass, kHinst, "WndProc", 4 /* BLACK_BRUSH */);
+    ok(1);
+    e.CreatePopup(kClass, kTitle, 0, 0, 200, 150, kHinst);
+    ok(1);
+    e.StoreAx(kHwnd);
+    e.CmpMem(kSawCreate, 1); FailUnless(a, JZ, 1);
+    e.CmpMem(kHookCount, 0); FailUnless(a, JNZ, 1);
+    e.Mem(kHook + 2); e.Mem(kHook);
+    e.Call(Emit::USER, 292);  // UnhookWindowsHookEx
+    eq(1, 1);
+    a.db({0xA1}).dw(kHookCount);
+    e.StoreAx(kCount2);
+    e.Mem(kHwnd); e.Imm(0x0401); e.Imm(0); e.Long(0);
+    e.Call(Emit::USER, 111);  // SendMessage: no hook any more
+    a.db({0xA1}).dw(kHookCount);
+    eqMem(kCount2, 1);
+    //    SetWindowsHook(4, HookProc2) = NULL; SetWindowsHook(4, HookProc) = HookProc2; unhook both
+    e.Imm(4); pushLabel("HookProc2");
+    e.Call(Emit::USER, 121);
+    a.db({0x09, 0xD0}); FailUnless(a, JZ, 1);  // or ax, dx: NULL
+    e.Imm(4); pushLabel("HookProc");
+    e.Call(Emit::USER, 121);
+    a.db({0x3D}).Abs16("HookProc2"); FailUnless(a, JZ, 1);
+    e.Imm(4); pushLabel("HookProc");
+    e.Call(Emit::USER, 234);
+    eq(1, 1);
+    e.Imm(4); pushLabel("HookProc2");
+    e.Call(Emit::USER, 234);
+    eq(1, 1);
+    // 2. SetProp("Obj", 1234h); GetProp("OBJ"); by atom; RemoveProp
+    e.Mem(kHwnd); e.Far(kObj); e.Imm(0x1234);
+    e.Call(Emit::USER, 26);
+    eq(1, 2);
+    e.Mem(kHwnd); e.Far(kObjUp);
+    e.Call(Emit::USER, 25);
+    eq(0x1234, 2);
+    e.Far(kObj2);
+    e.Call(Emit::USER, 268);  // GlobalAddAtom("Obj2")
+    ok(2);
+    e.StoreAx(kAtom);
+    e.Mem(kHwnd); e.Imm(0); e.Mem(kAtom); e.Imm(7);
+    e.Call(Emit::USER, 26);   // SetProp(hwnd, MAKEINTATOM(atom), 7)
+    eq(1, 2);
+    e.Mem(kHwnd); e.Far(kObj2);
+    e.Call(Emit::USER, 25);
+    eq(7, 2);
+    e.Mem(kHwnd); e.Far(kObj);
+    e.Call(Emit::USER, 24);   // RemoveProp
+    eq(0x1234, 2);
+    e.Mem(kHwnd); e.Far(kObj);
+    e.Call(Emit::USER, 25);
+    eq(0, 2);
+    // 3. GetClassInfo(hInstance, "Svc") = TRUE with our WndProc; EDIT isn't a class here
+    e.Mem(kHinst); e.Far(kClass); e.Far(kWc2);
+    e.Call(Emit::USER, 404);
+    eq(1, 3);
+    a.db({0x81, 0x3E}).dw(kWc2 + 2).Abs16("WndProc"); FailUnless(a, JZ, 3);
+    e.Imm(0); e.Far(kEdit); e.Far(kWc2);
+    e.Call(Emit::USER, 404);
+    eq(0, 3);
+    // 4. A child at (10, 20), 30x30. Its DC: SetPixel(0, 0) and (40, 0) red, the viewport
+    //    origin reads (0, 0), DPtoLP leaves (0, 0) alone.
+    e.Far(kClass); e.Far(kTitle); e.Long(0x50000000); e.Imm(10); e.Imm(20); e.Imm(30); e.Imm(30);
+    e.Mem(kHwnd); e.Imm(1); e.Mem(kHinst); e.Long(0);
+    e.Call(Emit::USER, 41);
+    ok(4);
+    e.StoreAx(kChild);
+    e.Mem(kChild);
+    e.Call(Emit::USER, 66);
+    ok(4);
+    e.StoreAx(kHdc);
+    e.Mem(kHdc); e.Imm(0); e.Imm(0); e.Long(RGB16(255, 0, 0));
+    e.Call(Emit::GDI, 31);
+    e.Mem(kHdc); e.Imm(40); e.Imm(0); e.Long(RGB16(255, 0, 0));
+    e.Call(Emit::GDI, 31);
+    e.Mem(kHdc);
+    e.Call(Emit::GDI, 95);    // GetViewportOrg
+    a.db({0x09, 0xD0}); FailUnless(a, JZ, 4);
+    e.Mem(kHdc); e.Far(kPt2); e.Imm(1);
+    e.Call(Emit::GDI, 67);    // DPtoLP
+    e.CmpMem(kPt2, 0); FailUnless(a, JZ, 4);
+    e.CheckPixel(uint8_t(kHdc), 0, 0, RGB16(255, 0, 0), 4);
+    //    SetViewportOrgEx(child DC, 2, 3): previous (0, 0); GetViewportOrgEx (2, 3); a green pixel at (0, 0)
+    e.Mem(kHdc); e.Imm(2); e.Imm(3); e.Far(kPoint);
+    e.Call(Emit::GDI, 480);
+    eq(1, 4);
+    e.CmpMem(kPoint, 0); FailUnless(a, JZ, 4);
+    e.Mem(kHdc); e.Far(kPoint);
+    e.Call(Emit::GDI, 473);
+    e.CmpMem(kPoint, 2); FailUnless(a, JZ, 4);
+    e.CmpMem(kPoint + 2, 3); FailUnless(a, JZ, 4);
+    e.Mem(kHdc); e.Imm(0); e.Imm(0); e.Long(RGB16(0, 255, 0));
+    e.Call(Emit::GDI, 31);
+    e.Mem(kChild); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);
+    //    The parent's DC: red at (10, 20), nothing at (50, 20), green at (12, 23)
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);
+    e.StoreAx(kHdc);
+    e.CheckPixel(uint8_t(kHdc), 10, 20, RGB16(255, 0, 0), 4);
+    e.CheckPixel(uint8_t(kHdc), 50, 20, 0, 4);
+    e.CheckPixel(uint8_t(kHdc), 12, 23, RGB16(0, 255, 0), 4);
+    e.Mem(kHwnd); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);
+    // 5. EnumChildWindows(hwnd): 1; EnumWindows: 1 more (the child isn't top-level); EnumTaskWindows: 1 more
+    e.Mem(kHwnd); pushLabel("EnumProc"); e.Long(0);
+    e.Call(Emit::USER, 55);
+    e.CmpMem(kEnumCount, 1); FailUnless(a, JZ, 5);
+    pushLabel("EnumProc"); e.Long(0);
+    e.Call(Emit::USER, 54);
+    e.CmpMem(kEnumCount, 2); FailUnless(a, JZ, 5);
+    e.Imm(0); pushLabel("EnumProc"); e.Long(0);
+    e.Call(Emit::USER, 225);
+    e.CmpMem(kEnumCount, 3); FailUnless(a, JZ, 5);
+    // 6. WindowFromPoint(15, 25) = child; (5, 5) = hwnd; ChildWindowFromPoint(15, 25) = child, (500, 500) = NULL
+    e.Long((25u << 16) | 15);
+    e.Call(Emit::USER, 30);
+    eqMem(kChild, 6);
+    e.Long((5u << 16) | 5);
+    e.Call(Emit::USER, 30);
+    eqMem(kHwnd, 6);
+    e.Mem(kHwnd); e.Long((25u << 16) | 15);
+    e.Call(Emit::USER, 191);
+    eqMem(kChild, 6);
+    e.Mem(kHwnd); e.Long((500u << 16) | 500);
+    e.Call(Emit::USER, 191);
+    eq(0, 6);
+    // 7. SetScrollRange(SB_VERT, 0, 50); SetScrollPos(70) = 0 (the previous); GetScrollPos = 50; GetScrollRange
+    e.Mem(kHwnd); e.Imm(1); e.Imm(0); e.Imm(50); e.Imm(0);
+    e.Call(Emit::USER, 64);
+    e.Mem(kHwnd); e.Imm(1); e.Imm(70); e.Imm(0);
+    e.Call(Emit::USER, 62);
+    eq(0, 7);
+    e.Mem(kHwnd); e.Imm(1);
+    e.Call(Emit::USER, 63);
+    eq(50, 7);
+    e.Mem(kHwnd); e.Imm(1); e.Far(kRange); e.Far(kRange + 2);
+    e.Call(Emit::USER, 65);
+    e.CmpMem(kRange + 2, 50); FailUnless(a, JZ, 7);
+    // 8. Class "Plain" with lpfnWndProc = DefWindowProc; a window of it takes messages
+    a.db({0xC7, 0x06}).dw(kWndClass + 2);
+    code.relocs.push_back({5, 1, a.Here(), 2, 107});  // offset of USER.107
+    a.dw(0xFFFF);
+    a.db({0xC7, 0x06}).dw(kWndClass + 4);
+    code.relocs.push_back({2, 1, a.Here(), 2, 107});  // selector of USER.107
+    a.dw(0xFFFF);
+    e.Set(kWndClass + 22, kDefClass);
+    e.Far(kWndClass);
+    e.Call(Emit::USER, 57);
+    ok(8);
+    e.CreatePopup(kDefClass, kTitle, 300, 0, 20, 20, kHinst);
+    ok(8);
+    e.StoreAx(kPlain);
+    e.Mem(kPlain); e.Imm(0x0400); e.Imm(0); e.Long(0);
+    e.Call(Emit::USER, 111);
+    eq(0, 8);
+    e.Mem(kPlain);
+    e.Call(Emit::USER, 53);
+    // 9. PostMessage(WM_USER + 2); WaitMessage returns; PeekMessage(PM_REMOVE) gets it
+    e.Mem(kHwnd); e.Imm(0x0402); e.Imm(0); e.Long(0);
+    e.Call(Emit::USER, 110);
+    e.Call(Emit::USER, 112);
+    e.Far(kMsg); e.Imm(0); e.Imm(0); e.Imm(0); e.Imm(1);
+    e.Call(Emit::USER, 109);
+    eq(1, 9);
+    e.CmpMem(kMsg + 2, 0x0402); FailUnless(a, JZ, 9);
+    // 10. The window's DC: SetViewportOrgEx(5, 6); GetViewportOrg = (5, 6); MoveTo(3, 4) then
+    //     GetCurrentPositionEx; RectVisible(0, 0, 10, 10)
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 66);
+    e.StoreAx(kHdc);
+    e.Mem(kHdc); e.Imm(5); e.Imm(6); e.Far(kPoint);
+    e.Call(Emit::GDI, 480);
+    eq(1, 10);
+    e.Mem(kHdc);
+    e.Call(Emit::GDI, 95);
+    eq(5, 10);
+    a.db({0x83, 0xFA, 0x06}); FailUnless(a, JZ, 10);  // cmp dx, 6
+    e.Mem(kHdc); e.Imm(3); e.Imm(4);
+    e.Call(Emit::GDI, 20);
+    e.Mem(kHdc); e.Far(kPoint);
+    e.Call(Emit::GDI, 470);
+    eq(1, 10);
+    e.CmpMem(kPoint, 3); FailUnless(a, JZ, 10);
+    e.CmpMem(kPoint + 2, 4); FailUnless(a, JZ, 10);
+    e.Mem(kHdc); e.Far(kRect);
+    e.Call(Emit::GDI, 465);
+    eq(1, 10);
+    e.Mem(kHwnd); e.Mem(kHdc);
+    e.Call(Emit::USER, 68);
+    // 11. RegisterWindowMessage("Svc.Msg") twice: the same number, C000h or above
+    e.Far(kMsgName);
+    e.Call(Emit::USER, 118);
+    e.CmpAx(0xC000); FailUnless(a, 0x73 /* JAE */, 11);
+    e.StoreAx(kMsgId);
+    e.Far(kMsgName);
+    e.Call(Emit::USER, 118);
+    eqMem(kMsgId, 11);
+    e.Mem(kHwnd);
+    e.Call(Emit::USER, 53);
+    e.Exit0();
+    e.FailStubs(11);
+
+    // WndProc(hwnd, msg, wParam, lParam): DefWindowProc.
+    a.Label("WndProc");
+    a.db({0x55, 0x89, 0xE5});
+    e.Arg(14); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 107);
+    a.db({0x5D, 0xCA, 0x0A, 0x00});  // pop bp / retf 10
+
+    // HookProc(int code, WPARAM, LPARAM -> CWPSTRUCT {lParam, wParam, message, hwnd}):
+    // counts calls, notes WM_CREATE, passes the call on.
+    a.Label("HookProc");
+    a.db({0x55, 0x89, 0xE5});
+    a.db({0xFF, 0x06}).dw(kHookCount);                    // inc word [kHookCount]
+    a.db({0xC4, 0x5E, 0x06});                             // les bx, [bp+6]
+    a.db({0x26, 0x83, 0x7F, 0x06, 0x01});                 // cmp word es:[bx+6], WM_CREATE
+    a.Short(JNZ, "hp_chain");
+    e.Set(kSawCreate, 1);
+    a.Label("hp_chain");
+    e.Mem(kHook + 2); e.Mem(kHook); e.Arg(12); e.Arg(10); e.Arg(8); e.Arg(6);
+    e.Call(Emit::USER, 293);                              // CallNextHookEx
+    a.db({0x5D, 0xCA, 0x08, 0x00});                       // pop bp / retf 8
+    a.Label("HookProc2");
+    a.db({0x31, 0xC0, 0x31, 0xD2, 0xCA, 0x08, 0x00});     // xor ax, ax / xor dx, dx / retf 8
+
+    // EnumProc(HWND, LPARAM): counts, and continues.
+    a.Label("EnumProc");
+    a.db({0xFF, 0x06}).dw(kEnumCount);
+    a.db({0xB8, 0x01, 0x00, 0xCA, 0x06, 0x00});           // mov ax, 1 / retf 6
+
+    code.bytes = a.Finish();
+    p.segments = {code, DataSegment(data, 0x100)};
     return p;
 }
 
