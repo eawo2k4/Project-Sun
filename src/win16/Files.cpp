@@ -105,13 +105,24 @@ int FileSystem::Open(const std::string& path, uint16_t mode, uint16_t& error) {
         error = dos::AccessDenied;
         return -1;
     }
-    int handle = 5;  // 0-4: stdin, stdout, stderr, aux, prn
-    while (files_.count(handle)) ++handle;
-    if (handle > 255) {
+    const int handle = FreeHandle();
+    if (handle < 0) {
         error = dos::TooManyFiles;
         return -1;
     }
     files_[handle] = std::move(file);
+    return handle;
+}
+
+int FileSystem::FreeHandle() const {
+    int handle = 5;  // 0-4: stdin, stdout, stderr, aux, prn
+    while (files_.count(handle)) ++handle;
+    return handle > 255 ? -1 : handle;
+}
+
+int FileSystem::OpenMemory(std::string bytes) {
+    const int handle = FreeHandle();
+    if (handle >= 0) files_[handle] = std::make_unique<std::istringstream>(std::move(bytes), std::ios::binary);
     return handle;
 }
 
@@ -120,7 +131,7 @@ bool FileSystem::Close(int handle) { return files_.erase(handle) != 0; }
 int32_t FileSystem::Read(int handle, uint8_t* dst, uint32_t bytes) {
     const auto it = files_.find(handle);
     if (it == files_.end()) return -1;
-    std::ifstream& f = *it->second;
+    std::istream& f = *it->second;
     f.clear();
     f.read(reinterpret_cast<char*>(dst), std::streamsize(bytes));
     const int32_t got = int32_t(f.gcount());
@@ -131,7 +142,7 @@ int32_t FileSystem::Read(int handle, uint8_t* dst, uint32_t bytes) {
 int32_t FileSystem::Seek(int handle, int32_t offset, int origin) {
     const auto it = files_.find(handle);
     if (it == files_.end() || origin < 0 || origin > 2) return -1;
-    std::ifstream& f = *it->second;
+    std::istream& f = *it->second;
     f.clear();
     const std::ios::seekdir dir = origin == 0 ? std::ios::beg : origin == 1 ? std::ios::cur : std::ios::end;
     const std::streamoff before = f.tellg();

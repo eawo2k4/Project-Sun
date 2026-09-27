@@ -26,6 +26,8 @@
 #include <string>
 #include <vector>
 
+#include "win16/Atoms.h"
+
 namespace retro::win16 {
 
 class Runtime;
@@ -160,6 +162,11 @@ public:
     uint64_t captured = 0;
 };
 
+// A window's scroll bar: range and position (SetScrollRange/SetScrollPos).
+struct ScrollBar {
+    int16_t min = 0, max = 0, pos = 0;
+};
+
 class User {
 public:
     struct WindowClass {
@@ -183,6 +190,8 @@ public:
         bool enabled = true;
         bool destroying = false;
         std::vector<uint8_t> extra;  // cbWndExtra bytes (GetWindowWord/Long)
+        std::map<std::string, uint16_t> props;  // SetProp, by upper-cased name
+        ScrollBar scroll[2];                    // SB_HORZ, SB_VERT (a model: not drawn yet)
         uint16_t sysMenu = 0;        // GetSystemMenu
         uint64_t host = 0;  // host window (top-level windows only)
         Rect16 update;      // invalid area (bounding box); empty = nothing to paint
@@ -226,11 +235,41 @@ public:
     WindowHost& Host() { return *host_; }
 
     uint16_t RegisterWindowClass(uint16_t sel, uint16_t off);  // WNDCLASS far pointer; returns the atom
+    // RegisterWindowMessage: the name's global atom (C000h-FFFFh, the numbers
+    // class atoms and GlobalAddAtom share).
+    uint16_t RegisterMessageName(const std::string& name);
+    AtomTable& GlobalAtoms() { return atoms_; }
+    // A window's scroll bar (bar: SB_HORZ 0, SB_VERT 1; SB_CTL uses the horizontal
+    // slot, as scroll bar controls aren't implemented), or nullptr.
+    ScrollBar* Scroll(uint16_t hwnd, uint16_t bar);
+    // Window properties (SetProp/GetProp/RemoveProp), by upper-cased name.
+    bool SetProperty(uint16_t hwnd, const std::string& key, uint16_t value);
+    uint16_t Property(uint16_t hwnd, const std::string& key) const;
+    uint16_t RemoveProperty(uint16_t hwnd, const std::string& key);  // the value removed, or 0
     uint16_t Create(const CreateParams& p);
     bool Destroy(uint16_t hwnd);
     bool Show(uint16_t hwnd, uint16_t cmdShow);  // returns previous visibility
 
+    // SendMessage: WH_CALLWNDPROC hooks first, then the window procedure.
     uint32_t Send(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam);
+    // The window procedure alone (DispatchMessage: posted messages aren't hooked).
+    uint32_t Deliver(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam);
+
+    // Hooks (SetWindowsHook[Ex]): a chain per type, newest first. WH_CALLWNDPROC
+    // hooks run before every sent message (that's how MFC attaches its window
+    // objects); other types are kept, so chaining and unhooking work, but
+    // aren't called yet.
+    static constexpr int16_t kCallWndProcHook = 4;
+    uint32_t AddHook(int16_t type, uint16_t sel, uint16_t off, uint16_t ds);  // returns the HHOOK
+    bool RemoveHook(uint32_t handle);
+    uint32_t FindHook(int16_t type, uint16_t sel, uint16_t off) const;  // HHOOK, or 0
+    uint32_t FindHookByProc(uint16_t sel, uint16_t off) const;          // any type
+    // The newest hook's procedure (a far address) of a type, or 0.
+    uint32_t TopHookProc(int16_t type) const;
+    // Calls the hook after `handle` in its chain (CallNextHookEx); 0 at the end.
+    uint32_t CallNextHook(uint32_t handle, int16_t code, uint16_t wParam, uint32_t lParam);
+    // Calls the hook `handle` itself.
+    uint32_t CallHook(uint32_t handle, int16_t code, uint16_t wParam, uint32_t lParam);
     uint32_t DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam);
     bool Post(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam);
     void PostQuit(uint16_t exitCode);
@@ -291,6 +330,7 @@ public:
 
     const Window* Find(uint16_t hwnd) const;
     const WindowClass* FindClass(const std::string& name) const;
+    const WindowClass* FindClassAtom(uint16_t atom) const;
     uint16_t HwndForHost(uint64_t host) const;
     uint64_t HostForHwnd(uint16_t hwnd) const;
     size_t WindowCount() const { return windows_.size(); }
@@ -328,7 +368,14 @@ private:
     bool quitPending_ = false;
     uint16_t quitCode_ = 0;
     uint16_t nextHwnd_ = 0x2004;
-    uint16_t nextAtom_ = 0xC000;
+    AtomTable atoms_;  // global atoms: class names, registered messages, GlobalAddAtom
+    struct Hook {
+        uint32_t handle;
+        int16_t type;
+        uint16_t sel, off, ds;
+    };
+    std::vector<Hook> hooks_;  // newest first
+    uint16_t nextHook_ = 1;
     int cascade_ = 0;
 };
 

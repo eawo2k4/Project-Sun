@@ -154,6 +154,13 @@ const User::WindowClass* User::FindClass(const std::string& name) const {
     return nullptr;
 }
 
+const User::WindowClass* User::FindClassAtom(uint16_t atom) const {
+    for (const WindowClass& c : classes_) {
+        if (c.atom == atom) return &c;
+    }
+    return nullptr;
+}
+
 uint16_t User::HwndForHost(uint64_t host) const {
     const auto it = hostToHwnd_.find(host);
     return it == hostToHwnd_.end() ? 0 : it->second;
@@ -162,6 +169,94 @@ uint16_t User::HwndForHost(uint64_t host) const {
 uint64_t User::HostForHwnd(uint16_t hwnd) const {
     const Window* w = Find(hwnd);
     return w ? w->host : 0;
+}
+
+uint32_t User::AddHook(int16_t type, uint16_t sel, uint16_t off, uint16_t ds) {
+    if (type != kCallWndProcHook) {
+        rt_.Note("hooks:" + std::to_string(type),
+                 "window hooks of type " + std::to_string(type) + " are accepted but never called yet");
+    }
+    const uint32_t handle = 0x48000000u | nextHook_++;
+    hooks_.insert(hooks_.begin(), Hook{handle, type, sel, off, ds});
+    return handle;
+}
+
+bool User::RemoveHook(uint32_t handle) {
+    const auto it = std::find_if(hooks_.begin(), hooks_.end(), [&](const Hook& h) { return h.handle == handle; });
+    if (it == hooks_.end()) return false;
+    hooks_.erase(it);
+    return true;
+}
+
+uint32_t User::FindHook(int16_t type, uint16_t sel, uint16_t off) const {
+    for (const Hook& h : hooks_) {
+        if (h.type == type && h.sel == sel && h.off == off) return h.handle;
+    }
+    return 0;
+}
+
+uint32_t User::FindHookByProc(uint16_t sel, uint16_t off) const {
+    for (const Hook& h : hooks_) {
+        if (h.sel == sel && h.off == off) return h.handle;
+    }
+    return 0;
+}
+
+uint32_t User::TopHookProc(int16_t type) const {
+    for (const Hook& h : hooks_) {
+        if (h.type == type) return (uint32_t(h.sel) << 16) | h.off;
+    }
+    return 0;
+}
+
+uint32_t User::CallHook(uint32_t handle, int16_t code, uint16_t wParam, uint32_t lParam) {
+    const auto it = std::find_if(hooks_.begin(), hooks_.end(), [&](const Hook& h) { return h.handle == handle; });
+    if (it == hooks_.end() || rt_.HasExited()) return 0;
+    const Hook h = *it;  // the hook may unhook itself
+    // (int code, WPARAM, LPARAM), Pascal; DS = the hook's instance data.
+    return rt_.Processor().CallFar(h.sel, h.off,
+                                   {uint16_t(code), wParam, uint16_t(lParam >> 16), uint16_t(lParam)}, h.ds);
+}
+
+uint32_t User::CallNextHook(uint32_t handle, int16_t code, uint16_t wParam, uint32_t lParam) {
+    auto it = std::find_if(hooks_.begin(), hooks_.end(), [&](const Hook& h) { return h.handle == handle; });
+    if (it == hooks_.end()) return 0;
+    const int16_t type = it->type;
+    it = std::find_if(it + 1, hooks_.end(), [&](const Hook& h) { return h.type == type; });
+    return it == hooks_.end() ? 0 : CallHook(it->handle, code, wParam, lParam);
+}
+
+uint16_t User::RegisterMessageName(const std::string& name) {
+    return name.empty() || name[0] == '#' ? 0 : atoms_.Add(name);
+}
+
+ScrollBar* User::Scroll(uint16_t hwnd, uint16_t bar) {
+    Window* w = FindMutable(hwnd);
+    return w && bar <= 2 ? &w->scroll[bar == 1 ? 1 : 0] : nullptr;
+}
+
+bool User::SetProperty(uint16_t hwnd, const std::string& key, uint16_t value) {
+    Window* w = FindMutable(hwnd);
+    if (!w || key.empty()) return false;
+    w->props[key] = value;
+    return true;
+}
+
+uint16_t User::Property(uint16_t hwnd, const std::string& key) const {
+    const Window* w = Find(hwnd);
+    if (!w) return 0;
+    const auto it = w->props.find(key);
+    return it == w->props.end() ? 0 : it->second;
+}
+
+uint16_t User::RemoveProperty(uint16_t hwnd, const std::string& key) {
+    Window* w = FindMutable(hwnd);
+    if (!w) return 0;
+    const auto it = w->props.find(key);
+    if (it == w->props.end()) return 0;
+    const uint16_t value = it->second;
+    w->props.erase(it);
+    return value;
 }
 
 uint16_t User::RegisterWindowClass(uint16_t sel, uint16_t off) {
@@ -181,16 +276,19 @@ uint16_t User::RegisterWindowClass(uint16_t sel, uint16_t off) {
     c.hbrBackground = mem.Read16(sel, uint16_t(off + 16));
     c.name = Upper(mem.ReadString(mem.Read16(sel, uint16_t(off + 24)), mem.Read16(sel, uint16_t(off + 22))));
 
+    // The window procedure is program code, or a built-in one (DefWindowProc itself, say).
     const Descriptor* proc = mem.Lookup(c.procSel);
-    if (c.name.empty() || FindClass(c.name) || !proc || proc->kind != SegmentKind::Code) {
+    if (c.name.empty() || FindClass(c.name) || !proc || proc->kind == SegmentKind::Data) {
+        char address[16];
+        std::snprintf(address, sizeof(address), "%04X:%04X", c.procSel, c.procOff);
         rt_.Print("RegisterClass(\"" + c.name + "\") failed: " +
                   (c.name.empty() ? "no class name"
                    : FindClass(c.name) ? "class already registered"
-                                       : "window procedure is not in a code segment"));
+                                       : std::string("window procedure ") + address + " is not in a code segment"));
         return 0;
     }
     c.extra.assign(std::min<uint16_t>(c.clsExtra, 1024), 0);
-    c.atom = nextAtom_++;
+    c.atom = atoms_.Add(c.name);
     classes_.push_back(c);
     return c.atom;
 }
@@ -200,9 +298,7 @@ uint16_t User::Create(const CreateParams& p) {
     const WindowClass* cls = nullptr;
     std::string className;
     if (p.classSel == 0) {
-        for (const WindowClass& c : classes_) {
-            if (c.atom == p.classOff) cls = &c;
-        }
+        cls = FindClassAtom(p.classOff);
         className = "#" + std::to_string(p.classOff);
     } else {
         className = Upper(mem.ReadString(p.classSel, p.classOff));
@@ -340,15 +436,35 @@ bool User::Show(uint16_t hwnd, uint16_t cmdShow) {
 }
 
 uint32_t User::Send(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam) {
+    if (!Find(hwnd) || rt_.HasExited()) return 0;
+    const auto hook = std::find_if(hooks_.begin(), hooks_.end(),
+                                   [](const Hook& h) { return h.type == kCallWndProcHook; });
+    if (hook != hooks_.end()) {
+        // lParam -> CWPSTRUCT {lParam, wParam, message, hwnd}; wParam: sent by this task.
+        Runtime::Scratch cwp(rt_, 10);
+        const uint16_t s = cwp.Selector(), o = cwp.Offset();
+        Memory& mem = rt_.Mem();
+        mem.Write16(s, o, uint16_t(lParam));
+        mem.Write16(s, uint16_t(o + 2), uint16_t(lParam >> 16));
+        mem.Write16(s, uint16_t(o + 4), wParam);
+        mem.Write16(s, uint16_t(o + 6), msg);
+        mem.Write16(s, uint16_t(o + 8), hwnd);
+        CallHook(hook->handle, 0 /* HC_ACTION */, 1, (uint32_t(s) << 16) | o);
+    }
+    // The hook may have subclassed (or destroyed) the window.
+    return Deliver(hwnd, msg, wParam, lParam);
+}
+
+uint32_t User::Deliver(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParam) {
     const Window* w = Find(hwnd);
     if (!w) return 0;
     if (!w->procSel) return DefProc(hwnd, msg, wParam, lParam);
     if (rt_.HasExited()) return 0;  // the task has ended: no more calls into it
     // The window procedure runs on the interpreter; Pascal arguments
-    // (hwnd, msg, wParam, lParam), DS = the window's instance data.
+    // (hwnd, msg, wParam, lParam), DS = its module's data.
     return rt_.Processor().CallFar(w->procSel, w->procOff,
                                    {hwnd, msg, wParam, uint16_t(lParam >> 16), uint16_t(lParam)},
-                                   w->hInstance);
+                                   rt_.CallbackData(w->procSel, w->hInstance));
 }
 
 uint32_t User::DefProc(uint16_t hwnd, uint16_t msg, uint16_t wParam, uint32_t lParamFull) {
@@ -876,6 +992,13 @@ void InitApp(Runtime&, Cpu& cpu) {
     cpu.ReturnFar(2);
 }
 
+void RegisterWindowMessage(Runtime& rt, Cpu& cpu) {  // (LPCSTR) -> message number, 0 on failure
+    const PascalArgs a(cpu, {4});
+    const FarPtr p = a.Ptr(0);
+    cpu.Regs().r[AX] = p.IsNull() ? 0 : rt.Windows().RegisterMessageName(rt.Mem().ReadString(p.sel, p.off));
+    cpu.ReturnFar(a.Bytes());
+}
+
 void PostQuitMessage(Runtime& rt, Cpu& cpu) {
     rt.Windows().PostQuit(cpu.StackArg(0));
     cpu.ReturnFar(2);
@@ -980,6 +1103,16 @@ void GetMessage(Runtime& rt, Cpu& cpu) {
     cpu.ReturnFar(10);
 }
 
+// WaitMessage: blocks until a message is waiting (it stays in the queue).
+void WaitMessage(Runtime& rt, Cpu& cpu) {
+    Msg16 m;
+    if (rt.Windows().Next(m, 0, 0, 0, false, true) == User::Fetch::NoInput) {
+        rt.Exit(TaskExit::Kind::Blocked, 0, "WaitMessage: the queue is empty and no input can ever arrive");
+        return;
+    }
+    cpu.ReturnFar(0);
+}
+
 // PeekMessage(lpMsg, hwnd, wMsgFilterMin, wMsgFilterMax, wRemoveMsg)
 void PeekMessage(Runtime& rt, Cpu& cpu) {
     const FarPtr msgPtr = ArgPtr(cpu, 8);
@@ -1014,7 +1147,7 @@ void DispatchMessage(Runtime& rt, Cpu& cpu) {
                                             rt.Module().dgroup);
         }
     } else if (m.hwnd) {
-        result = rt.Windows().Send(m.hwnd, m.message, m.wParam, m.lParam);
+        result = rt.Windows().Deliver(m.hwnd, m.message, m.wParam, m.lParam);
     }
     SetResult(cpu, result);
     cpu.ReturnFar(4);
@@ -1203,8 +1336,10 @@ std::vector<ApiFunction> UserApi() {
         {109, "PEEKMESSAGE", PeekMessage},
         {110, "POSTMESSAGE", PostMessage},
         {111, "SENDMESSAGE", SendMessage},
+        {112, "WAITMESSAGE", WaitMessage},
         {113, "TRANSLATEMESSAGE", TranslateMessage},
         {114, "DISPATCHMESSAGE", DispatchMessage},
+        {118, "REGISTERWINDOWMESSAGE", RegisterWindowMessage},
         {124, "UPDATEWINDOW", UpdateWindow},
         {125, "INVALIDATERECT", InvalidateRect},
         {127, "VALIDATERECT", ValidateRect},
@@ -1215,7 +1350,7 @@ std::vector<ApiFunction> UserApi() {
         {179, "GETSYSTEMMETRICS", GetSystemMetrics},
         {452, "CREATEWINDOWEX", CreateWindowEx},
     };
-    for (auto part : {UserWindowApi(), MenuApi(), UserDrawApi(), UserSoundApi()})
+    for (auto part : {UserWindowApi(), MenuApi(), UserDrawApi(), UserSoundApi(), UserAtomApi(), UserCharsetApi()})
         api.insert(api.end(), part.begin(), part.end());
     return api;
 }

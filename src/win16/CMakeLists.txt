@@ -1,5 +1,6 @@
 # RetroWin16: the 16-bit Windows execution engine (NE loader, virtual LDT,
-# 286-class interpreter, built-in KERNEL/USER/GDI/MMSYSTEM).
+# 286-class interpreter with an x87 FPU, built-in KERNEL/USER/GDI/MMSYSTEM,
+# the BIOS bits Windows programs use).
 #
 # The CPU, loader, memory, KERNEL and USER are platform-neutral C++. GDI
 # (Gdi.cpp, GdiDraw.cpp) draws with the host's Win32 GDI, sound (Sound.cpp)
@@ -7,9 +8,14 @@
 # application provides.
 add_library(RetroWin16 STATIC
     ApiCatalog.cpp
+    Atoms.cpp
+    Bios.cpp
     CatalogLookup.cpp
+    Charset.cpp
     Cpu.cpp
+    CpuFpu.cpp
     Files.cpp
+    Fpu.cpp
     Gdi.cpp
     Kernel.cpp
     GdiDraw.cpp
@@ -25,8 +31,10 @@ add_library(RetroWin16 STATIC
     UserWindow.cpp
     include/win16/Api.h
     include/win16/ApiCatalog.h
+    include/win16/Atoms.h
     include/win16/Cpu.h
     include/win16/Files.h
+    include/win16/Fpu.h
     include/win16/Gdi.h
     include/win16/Kernel.h
     include/win16/LocalHeap.h

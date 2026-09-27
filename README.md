@@ -25,18 +25,25 @@ Project Sun/
 │  │  ├─ include/retro/PathUtil.h      ANSI/UTF-8 path helpers
 │  │  ├─ include/retro/ShimProtocol.h  launcher → shim config payload (GUID + struct)
 │  │  └─ *.cpp
-│  ├─ win16/               RetroWin16.lib: 16-bit Windows engine (no Windows headers)
+│  ├─ win16/               RetroWin16.lib: 16-bit Windows engine (GDI, sound and code
+│  │  │                            pages through the host; the rest is platform-neutral)
 │  │  ├─ NeImage.cpp               NE parser: segments, relocations, imports, entries, resources
 │  │  ├─ NeLoader.cpp              selectors per segment, fixup chains, PSP, initial registers
-│  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset
+│  │  ├─ Memory.cpp                virtual LDT + linear arena, #GP-checked selector:offset, aliases
 │  │  ├─ Cpu.cpp                   286-class 16-bit interpreter
+│  │  ├─ CpuFpu.cpp, Fpu.cpp       its x87 FPU (and the INT 34h-3Dh emulator forms)
+│  │  ├─ Bios.cpp                  BIOS data area (selector 0040h), INT 1Ah/11h/12h/16h/2Fh
 │  │  ├─ ApiCatalog.cpp            generated: every system DLL export (name, params, constants)
-│  │  ├─ Kernel.cpp                KERNEL: task, heaps, modules, strings, files, INI, resources
+│  │  ├─ Kernel.cpp                KERNEL: task, heaps, modules, strings, files, INI, resources,
+│  │  │                            selectors, Catch/Throw; TOOLHELP
+│  │  ├─ Atoms.cpp                 atom tables, window properties
+│  │  ├─ Charset.cpp               KEYBOARD (OEM <-> ANSI), AnsiUpper & co.
 │  │  ├─ LocalHeap.cpp             LocalAlloc & co. inside DGROUP (Win16 handle tables)
 │  │  ├─ Files.cpp                 the task's file view (program directory, read-only), INI files
 │  │  ├─ Resources.cpp             resource lookup/loading, string tables
 │  │  ├─ User.cpp                  USER: classes, windows, message queue, timers, callbacks
-│  │  ├─ UserWindow.cpp            USER: geometry, window words, focus, input state, cursor, wsprintf
+│  │  ├─ UserWindow.cpp            USER: geometry, window words, focus, input, cursor, hooks,
+│  │  │                            enumeration, scroll bars, wsprintf, lstrcmp
 │  │  ├─ Menus.cpp                 USER: menus (model), accelerators, dialog boxes (not shown yet)
 │  │  ├─ Gdi.cpp                   GDI: 16-bit handles over host GDI, text, back buffers, presentation
 │  │  ├─ GdiDraw.cpp               GDI: fonts, shapes, DIBs, GetObject, device caps; DrawText
@@ -101,8 +108,29 @@ Project Sun/
 - **CPU:** a 286-class interpreter covering the 8086/80186 integer instruction set
   with protected-mode segment loads. Faults stop the task with the exact `CS:IP`
   and cause.
+- **FPU:** the interpreter has an x87, so floating-point games work.
+  - `GetWinFlags` reports a coprocessor (`WF_80x87`), so Windows would leave the
+    program's floating-point instructions as they are. They're real x87 code in the
+    file; the NE "OS fixups" only turn them into emulator calls on machines without one.
+  - All of the 287/387 instruction set: loads and stores (32/64/80-bit reals, 16/32/64-bit
+    integers, packed BCD), arithmetic in every operand form, compares and `FNSTSW AX`,
+    the transcendental functions, `FSAVE`/`FRSTOR`/`FSTENV`, rounding control.
+  - Values are held as doubles: 80-bit loads and stores convert, and results carry
+    double precision, which is what C programs of the time asked for. Exceptions are
+    masked, as the Windows C runtime sets them: they give NaN or infinity and set the
+    status word's flags.
+  - Code that still uses Microsoft's emulator encoding (`INT 34h`-`3Dh`) runs the same
+    instructions.
+  - WIN87EM's `__fpMath` housekeeping (initialize, control word, rounding, pop to a long,
+    stack depth, status) works on this FPU.
+- **BIOS:** selector `0040h` (and KERNEL's `__0040H`) maps a BIOS data area, as in
+  Windows, with a tick count at `0040:006C` that runs at 18.2 Hz while a program polls
+  it. INT 1Ah gives the tick count and the real-time clock, INT 11h/12h the equipment
+  word and 640 KB, INT 16h says no key is waiting, and INT 2Fh answers the Windows mode
+  queries (standard mode, protected mode).
 - **System DLLs:** KERNEL, USER and GDI are built in (`Kernel.cpp`, `User.cpp`,
-  `Gdi.cpp`), plus WIN87EM's `__fpMath` start-up and shut-down calls. Imports are
+  `Gdi.cpp`), plus WIN87EM, KEYBOARD (code pages, keyboard queries) and TOOLHELP's
+  fault and notification registration (accepted; the callbacks aren't called). Imports are
   resolved to `module-selector:ordinal` on a *host* segment, so a far call runs the C++
   implementation.
   - **API catalog:** every export of the Windows 3.x system DLLs is catalogued, with
@@ -129,18 +157,34 @@ Project Sun/
     stops the task with e.g.
     `USER.216 (GetDlgItem) is not implemented yet (returning to 0127:04A2)`, rather
     than crashing.
-  - **Imported constants:** `__AHINCR`, `__AHSHIFT` and `__WINFLAGS` resolve to their
-    values. The real-mode memory selectors (`__A000H`, `__0040H`, …) resolve to null,
-    with a note.
+  - **Imported constants:** `__AHINCR`, `__AHSHIFT`, `__WINFLAGS` and `__0040H` resolve
+    to their values. The other real-mode memory selectors (`__A000H`, `__F000H`, …)
+    resolve to null, with a note.
+  - **Bad pointers fail the call:** Windows 3.1 validates pointer arguments, and
+    programs came to rely on it (`CopyRect(&rc, NULL)` from an MFC game, say). When an
+    API faults on one of its pointer arguments, the call returns 0 instead, with a note.
+  - **Callbacks get their module's data segment:** a window procedure, hook or
+    enumeration callback runs with the DGROUP of the module its code belongs to, which is
+    what Windows arranges for exported functions, even when a program passes some other
+    block as a window's `hInstance` (the usual trick for giving an edit control its own
+    heap).
   - `GetProcAddress` only finds implemented functions, so a program that probes for an
     API sees it missing.
 
   Implemented so far:
   - KERNEL: `InitTask`, `FatalExit`, `FatalAppExit`, `GetVersion`, `GetWinFlags`
-    (286, standard mode, no coprocessor), `WaitEvent`, `Yield`, `DOS3Call`.
+    (286, standard mode, coprocessor), `WaitEvent`, `Yield`, `DOS3Call`, `Catch`/`Throw`
+    (within one callback level), `SetHandleCount`.
     - Global heap: `GlobalAlloc`, `GlobalReAlloc`, `GlobalLock`, `GlobalUnlock`,
       `GlobalFree`, `GlobalSize`, `GlobalHandle`, `GlobalFlags`, `GlobalCompact`,
-      `GetFreeSpace`, `LockSegment`/`UnlockSegment`.
+      `GlobalWire`/`GlobalUnWire`, `GetFreeSpace`, `LockSegment`/`UnlockSegment`,
+      `hmemcpy`.
+    - Selectors, for code generated at run time (Delphi's window procedure thunks, say):
+      `AllocSelector`, `FreeSelector`, `PrestoChangoSelector`, `AllocCStoDSAlias`,
+      `AllocDStoCSAlias`, `Get`/`SetSelectorBase`, `Get`/`SetSelectorLimit`, and the
+      same through DPMI (INT 31h: allocate, free, set base, limit, access rights, alias).
+      An alias shares its segment's bytes; freeing it leaves them to their owner.
+    - Atoms: `AddAtom`, `FindAtom`, `DeleteAtom`, `GetAtomName`, `InitAtomTable`.
     - Local heap: `LocalInit`, `LocalAlloc`, `LocalReAlloc`, `LocalFree`, `LocalLock`,
       `LocalUnlock`, `LocalSize`, `LocalHandle`, `LocalFlags`, `LocalCompact`.
     - Modules: `GetModuleHandle`, `GetModuleFileName`, `GetModuleUsage`,
@@ -148,12 +192,15 @@ Project Sun/
       program's DLLs and built-in modules), `FreeLibrary`, `GetInstanceData`,
       `GetCurrentTask`, `GetCurrentPDB`, `GetDOSEnvironment`.
     - Strings: `lstrcpy`, `lstrcpyn`, `lstrcat`, `lstrlen`, `OutputDebugString`.
-    - Files: `OpenFile`, `_lopen`, `_lread`, `_llseek`, `_lclose` (`_lcreat`/`_lwrite`
-      are refused), plus `GetWindowsDirectory`, `GetSystemDirectory` and `SetErrorMode`.
+    - Files: `OpenFile`, `_lopen`, `_lread`, `_hread`, `_llseek`, `_lclose`
+      (`_lcreat`/`_lwrite`/`_hwrite` are refused), plus `GetWindowsDirectory`,
+      `GetSystemDirectory` and `SetErrorMode`.
     - INI files: `GetProfileInt`/`String`, `GetPrivateProfileInt`/`String`,
       `WriteProfileString`, `WritePrivateProfileString`.
     - Resources: `FindResource`, `LoadResource`, `LockResource`, `FreeResource`,
-      `SizeofResource`.
+      `SizeofResource`, `AccessResource` (a file handle that reads the resource).
+  - KEYBOARD: `AnsiToOem`/`OemToAnsi` (and the `Buff` forms; ANSI is code page 1252, OEM
+    437), `GetKBCodePage`, `GetKeyboardType`, `MapVirtualKey`, `VkKeyScan`.
   - USER:
     - Windows and messages: `RegisterClass`, `CreateWindow`/`CreateWindowEx`,
       `ShowWindow`, `UpdateWindow`, `DestroyWindow`, `DefWindowProc`, `CallWindowProc`,
@@ -166,7 +213,20 @@ Project Sun/
       (including `GWL_WNDPROC` subclassing), `GetClassWord`/`SetClassWord`/`GetClassLong`,
       `SetWindowText`/`GetWindowText`/`GetWindowTextLength`, `EnableWindow`,
       `IsWindow…`, `GetParent`, `GetWindow`, `FindWindow`, `GetDesktopWindow`,
-      `BringWindowToTop`.
+      `BringWindowToTop`, `GetClassInfo`, `SetMessageQueue`, `WaitMessage`.
+    - Finding windows: `EnumWindows`, `EnumTaskWindows`, `EnumChildWindows`,
+      `WindowFromPoint`, `ChildWindowFromPoint`.
+    - Hooks: `SetWindowsHook`/`UnhookWindowsHook`/`DefHookProc` (Windows 3.0) and
+      `SetWindowsHookEx`/`UnhookWindowsHookEx`/`CallNextHookEx`. `WH_CALLWNDPROC` hooks
+      run before every sent message, which is how MFC attaches its window objects; the
+      other hook types are kept in their chains but not called yet.
+    - Atoms and properties: `GlobalAddAtom`, `GlobalFindAtom`, `GlobalDeleteAtom`,
+      `GlobalGetAtomName`, `RegisterWindowMessage` (the name's global atom), `SetProp`,
+      `GetProp`, `RemoveProp` (by name or atom).
+    - Scroll bars, as a model (not drawn yet): `SetScrollRange`/`GetScrollRange`,
+      `SetScrollPos`/`GetScrollPos`, `ShowScrollBar`, `EnableScrollBar`.
+    - A class's window procedure can be `DefWindowProc` itself, as Delphi registers its
+      application window.
     - Focus and input: `SetFocus`/`GetFocus`, `SetActiveWindow`/`GetActiveWindow`,
       `GetKeyState`/`GetAsyncKeyState`, `SetCapture`/`ReleaseCapture`/`GetCapture`,
       `SetCursor`, `ShowCursor`, `LoadCursor` (standard cursors), `GetCursorPos`.
@@ -182,7 +242,9 @@ Project Sun/
       `CreateDialog` fails with one. `IsDialogMessage`, `EndDialog` and `GetDlgItem` are
       there for message loops.
     - Text: `MessageBox` (a real one, see below), `wsprintf`/`wvsprintf`, `DrawText`,
-      `LoadString`.
+      `LoadString`, `lstrcmp`/`lstrcmpi` (the language driver's order: letters regardless
+      of case first, lower case before upper), `AnsiUpper`/`AnsiLower` (and the `Buff`
+      forms), `AnsiNext`/`AnsiPrev`, `IsCharAlpha`/`AlphaNumeric`/`Upper`/`Lower`.
     - Resources: `LoadBitmap`; `LoadIcon` still returns a placeholder.
   - USER painting: `BeginPaint`/`EndPaint` (real `PAINTSTRUCT`), `GetDC`/`ReleaseDC`,
     `InvalidateRect`/`ValidateRect`, `GetClientRect`, `FillRect`, `FrameRect`,
@@ -202,8 +264,13 @@ Project Sun/
       `Set`/`GetTextAlign`, `SetTextCharacterExtra`, `Set`/`GetTextColor`,
       `Set`/`GetBkColor`, `Set`/`GetBkMode`.
     - Modes and clipping: `SetROP2`, `SetStretchBltMode`, `SetPolyFillMode`,
-      `Set`/`GetMapMode`, `SetWindowOrg`/`Ext`, `SetViewportOrg`/`Ext`,
-      `IntersectClipRect`, `ExcludeClipRect`, `GetClipBox`, `GetNearestColor`.
+      `Set`/`GetMapMode`, `IntersectClipRect`, `ExcludeClipRect`, `GetClipBox`,
+      `RectVisible`, `PtVisible`, `GetNearestColor`, `UnrealizeObject`.
+    - Coordinates, in both the Windows 3.0 form and the 3.1 `…Ex` form: `Set`/`Get`/
+      `Offset`/`Scale` of the window and viewport origins and extents,
+      `GetCurrentPosition(Ex)`, `Set`/`GetBrushOrg`, `DPtoLP`/`LPtoDP`, and `MulDiv`.
+    - `EnumFonts`: the faces of a Windows 3.1 system (its raster fonts and the core
+      TrueType ones).
   - Sound: `MessageBeep`; MMSYSTEM `sndPlaySound`, `timeSetEvent`/`timeKillEvent`,
     `timeGetTime`, `timeBegin`/`EndPeriod`, `timeGetDevCaps`, `timeGetSystemTime`, the
     device queries, and MCI (which fails politely). SOUND.DRV calls are ignored.
@@ -304,6 +371,10 @@ Project Sun/
   - Each top-level window has a 32-bit back buffer at its 16-bit size. `GetDC` and
     `BeginPaint` draw into it; each call saves the DC state, and `ReleaseDC`/`EndPaint`
     restore it.
+  - A child window draws on its top-level window's back buffer, as in Windows: its DC
+    has its own handle, the device origin at the child's corner, and clipping to the
+    child and its ancestors. Viewport origins and device coordinates (`DPtoLP`, …) are
+    reported relative to the child.
   - Windows keep an update region. `WM_PAINT` is generated when nothing else is queued
     and stays pending until validated. `BeginPaint` clips to the region and sends
     `WM_ERASEBKGND`, which `DefWindowProc` answers with the class brush.
@@ -312,8 +383,8 @@ Project Sun/
   default 60), then handed to the host. The host scales each one onto the screen with a
   single nearest-neighbour blit into the integer-scaled viewport, so there's no tearing.
   A `PeekMessage` game loop therefore runs at the cap.
-- **Interrupts:** INT 21h (exit, version, console output, drive, PSP), INT 20h, and
-  INT 31h DPMI queries (segment base, version).
+- **Interrupts:** INT 21h (exit, version, console output, drive, PSP), INT 20h, the
+  BIOS services above, and INT 31h DPMI (descriptors, segment base, version).
 
 Launcher exit code: the program's own (INT 21h/4Ch, `FatalExit`, the `WM_QUIT` code if
 the program exits with it), or 6 if the task stopped on a fault, an unimplemented API, or
@@ -356,20 +427,26 @@ Not yet:
 - Graphics: regions, palettes (8-bit games; `GetDeviceCaps` reports a true-colour
   display, and `DIB_PAL_COLORS` isn't supported), and system bitmaps (`OBM_xxx`).
 - Windowing: non-client areas (a 16-bit window is all client area), a drawn menu bar
-  and popup menus, dialog boxes, and child windows (they get no back buffer).
-- Controls: child controls and the system classes (`BUTTON`, `EDIT`, …).
+  and popup menus, drawn scroll bars, and dialog boxes. Child windows draw, but a
+  parent doesn't clip its children out of its own painting (`WS_CLIPCHILDREN`).
+- Controls: the system classes (`BUTTON`, `EDIT`, `LISTBOX`, …, and the dialog class
+  `#32770`), which frameworks subclass (Delphi's `TMemo`, Borland's BWCC).
+- Hooks other than `WH_CALLWNDPROC` (`WH_GETMESSAGE`, `WH_KEYBOARD`, `WH_MSGFILTER`,
+  `WH_CBT`, …) aren't called.
 - Resources: icons and cursors from a program's resources (they're parsed, but
   `LoadIcon` returns a placeholder and custom cursors show as the arrow).
 - Sound: wave and MIDI output (`waveOut`, `midiOut`) and MCI.
 - Timers: `SetSystemTimer`.
-- Files and memory: writing files, and huge (> 64 KB) global blocks.
+- Files and memory: writing files, and huge (> 64 KB) global blocks (`hmemcpy` and
+  `_hread` stop at the end of a segment).
+- 32-bit extenders: Watcom's Win386 (it asks DPMI for extended memory, INT 31h 0501h).
 - Modules: starting other programs (`WinExec`, `LoadModule`), unloading DLLs (their
   `WEP` isn't called), and system DLLs shipped with a game (`COMMDLG.DLL`, …: the
   engine's stub is used instead, since they need USER internals).
-- CPU: 386 instructions (`66h`/`67h` prefixes), 286 system instructions (`0Fh`), and
-  floating point. WIN87EM's emulation interrupts and x87 instructions stop the task
-  with a clear message.
-- KERNEL: `Catch`/`Throw`.
+- CPU: 386 instructions (`66h`/`67h` prefixes) and 286 system instructions (`0Fh`).
+  The FPU computes in double precision, not the x87's 80 bits.
+- KERNEL: `Throw` out of a callback into the code that called Windows (the task stops
+  with a clear message).
 
 ## Shim modules
 

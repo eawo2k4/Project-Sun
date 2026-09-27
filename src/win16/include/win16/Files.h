@@ -17,8 +17,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <istream>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,6 +46,9 @@ public:
     // Opens for reading (mode bits 0-1 = 0). Returns a DOS handle (>= 5), or
     // -1 with a DOS error code.
     int Open(const std::string& path, uint16_t mode, uint16_t& error);
+    // A read-only handle on bytes in memory (AccessResource: a resource, as if
+    // read from the module file). -1 if no handles are left.
+    int OpenMemory(std::string bytes);
     bool Close(int handle);
     bool IsOpen(int handle) const { return files_.count(handle) != 0; }
     // Bytes read (0 at end of file), or -1 for a bad handle.
@@ -55,7 +60,9 @@ public:
 private:
     std::filesystem::path root_ = std::filesystem::current_path();
     std::string programPath_ = "C:\\WINDOWS\\PROGRAM.EXE";
-    std::map<int, std::unique_ptr<std::ifstream>> files_;
+    int FreeHandle() const;  // -1 if none
+
+    std::map<int, std::unique_ptr<std::istream>> files_;
 };
 
 // WIN.INI and private INI files, read from disk through the FileSystem, with

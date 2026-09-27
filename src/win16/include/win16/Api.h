@@ -26,6 +26,11 @@ std::vector<ApiFunction> KernelApi();
 std::vector<ApiFunction> UserApi();
 std::vector<ApiFunction> GdiApi();
 std::vector<ApiFunction> MmsystemApi();
+std::vector<ApiFunction> ToolhelpApi();  // Kernel.cpp
+std::vector<ApiFunction> KeyboardApi();  // Charset.cpp
+std::vector<ApiFunction> UserCharsetApi();  // Charset.cpp: AnsiUpper, IsCharAlpha, ...
+std::vector<ApiFunction> KernelAtomApi();  // Atoms.cpp: local atoms
+std::vector<ApiFunction> UserAtomApi();    // Atoms.cpp: global atoms, window properties
 // Parts of the USER and GDI tables, by source file.
 std::vector<ApiFunction> UserWindowApi();  // UserWindow.cpp
 std::vector<ApiFunction> MenuApi();        // Menus.cpp

@@ -65,7 +65,8 @@ uint16_t Gdi::Wrap(void* host, Kind kind, bool owned, bool stock, uint16_t windo
 void Gdi::Unwrap(uint16_t handle) {
     const auto it = objects_.find(handle);
     if (it == objects_.end()) return;
-    byHost_.erase(it->second.host);
+    // A child window DC shares its host DC with the surface's own handle.
+    if (const auto h = byHost_.find(it->second.host); h != byHost_.end() && h->second == handle) byHost_.erase(h);
     objects_.erase(it);
 }
 
@@ -253,16 +254,69 @@ const uint32_t* Gdi::SurfacePixels(uint16_t hwnd, int& width, int& height) const
 // --- DCs --------------------------------------------------------------------------------------
 
 uint16_t Gdi::GetWindowDc(uint16_t hwnd) {
-    Surface* s = SurfaceFor(hwnd);
-    if (!s) return 0;
-    SaveDC(static_cast<HDC>(s->dc));  // every GetDC starts from the default state
-    ++s->saved;
-    return s->hdc16;
+    if (hwnd == 0 || surfaces_.count(hwnd)) {
+        Surface* s = SurfaceFor(hwnd);
+        if (!s) return 0;
+        SaveDC(static_cast<HDC>(s->dc));  // every GetDC starts from the default state
+        ++s->saved;
+        return s->hdc16;
+    }
+
+    // A child window: its top-level window's surface.
+    const User& u = rt_.Windows();
+    const User::Window* w = u.Find(hwnd);
+    if (!w || !(w->style & ws::Child)) return 0;
+    uint16_t top = hwnd;
+    Rect16 clip = u.WindowRect(hwnd);
+    for (const User::Window* p = w; p && (p->style & ws::Child); p = u.Find(top)) {
+        top = p->parent;
+        const Rect16 r = u.WindowRect(top);
+        clip = {std::max(clip.left, r.left), std::max(clip.top, r.top), std::min(clip.right, r.right),
+                std::min(clip.bottom, r.bottom)};
+    }
+    const auto it = surfaces_.find(top);
+    if (it == surfaces_.end()) return 0;
+    Surface& s = it->second;
+    const Rect16 origin = u.WindowRect(top), me = u.WindowRect(hwnd);
+    const int16_t x = int16_t(me.left - origin.left), y = int16_t(me.top - origin.top);
+
+    HDC dc = static_cast<HDC>(s.dc);
+    SaveDC(dc);
+    ++s.saved;
+    SetMapMode(dc, MM_TEXT);
+    SetWindowOrgEx(dc, 0, 0, nullptr);
+    SetViewportOrgEx(dc, x, y, nullptr);
+    if (HRGN rgn = CreateRectRgn(clip.left - origin.left, clip.top - origin.top, clip.right - origin.left,
+                                 clip.bottom - origin.top)) {
+        ExtSelectClipRgn(dc, rgn, RGN_AND);  // device coordinates
+        DeleteObject(rgn);
+    }
+    const uint16_t h = nextHandle_;
+    nextHandle_ = uint16_t(nextHandle_ + 4);
+    objects_[h] = Object{Kind::Dc, s.dc, false, false, hwnd};
+    childDcs_[h] = ChildDc{top, x, y};
+    return h;
+}
+
+Point16 Gdi::DeviceOrigin(uint16_t hdc) const {
+    const auto it = childDcs_.find(hdc);
+    return it == childDcs_.end() ? Point16{} : Point16{it->second.x, it->second.y};
 }
 
 bool Gdi::ReleaseWindowDc(uint16_t hdc) {
     const Object* o = Find(hdc);
     if (!o || o->kind != Kind::Dc || !o->window) return false;
+    if (const auto child = childDcs_.find(hdc); child != childDcs_.end()) {
+        const auto s = surfaces_.find(child->second.top);
+        if (s != surfaces_.end() && s->second.saved > 0) {
+            RestoreDC(static_cast<HDC>(s->second.dc), -1);
+            --s->second.saved;
+            s->second.dirty = true;
+        }
+        childDcs_.erase(child);
+        Unwrap(hdc);
+        return true;
+    }
     for (auto& [hwnd, s] : surfaces_) {
         if (s.hdc16 != hdc) continue;
         if (s.saved > 0) {

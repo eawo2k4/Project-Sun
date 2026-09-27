@@ -1,9 +1,14 @@
 // Instruction-level tests of the 16-bit interpreter: each case runs a short
 // hand-assembled snippet ending in INT 3 and checks registers, flags, memory
-// or the fault it raised. Expected values follow real x86 behaviour.
+// or the fault it raised. Expected values follow real x86 behaviour (for the
+// x87, real results rounded to double precision).
 
+#include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <initializer_list>
+#include <limits>
+#include <numbers>
 #include <string>
 #include <vector>
 
@@ -49,6 +54,18 @@ struct Machine {
         return *this;
     }
     uint16_t R(Reg reg) const { return cpu.Regs().r[reg]; }
+    // Data segment accessors.
+    void PutDouble(uint16_t off, double v) { std::memcpy(mem.SegmentData(data) + off, &v, 8); }
+    void PutWord(uint16_t off, uint16_t v) { std::memcpy(mem.SegmentData(data) + off, &v, 2); }
+    void PutLong(uint16_t off, uint32_t v) { std::memcpy(mem.SegmentData(data) + off, &v, 4); }
+    double Double(uint16_t off) const {
+        double v;
+        std::memcpy(&v, mem.SegmentData(data) + off, 8);
+        return v;
+    }
+    uint16_t Word(uint16_t off) const { return uint16_t(mem.SegmentData(data)[off] | (mem.SegmentData(data)[off + 1] << 8)); }
+    uint32_t Long(uint16_t off) const { return Word(off) | (uint32_t(Word(uint16_t(off + 2))) << 16); }
+    const uint8_t* Bytes(uint16_t off) const { return mem.SegmentData(data) + off; }
     bool F(uint16_t f) const { return cpu.Flag(f); }
     bool Ok() const { return result == RunResult::Stopped; }
     bool Faulted(FaultKind k) const { return result == RunResult::Faulted && cpu.Fault().kind == k; }
@@ -303,9 +320,274 @@ void TestProtectionFaults() {
     Machine ud({0x0F, 0x0B});  // 286 system / 0F opcodes: not yet
     ud.Run();
     CHECK(ud.Faulted(FaultKind::InvalidOpcode));
-    Machine fpu({0xD9, 0xE8});  // fld1: no x87 emulation yet
+    Machine fpu({0xD9, 0xD1});  // D9 D1: an undefined x87 encoding
     fpu.Run();
     CHECK(fpu.Faulted(FaultKind::InvalidOpcode));
+}
+
+// --- x87 ---------------------------------------------------------------------------------------
+// Operands live in the data segment: [00] [08] [10] [18] ... Encodings use
+// direct addressing (modrm mod 00, rm 110, disp16).
+
+void TestFpuArithmetic() {
+    // fld [0]; fld [8]; faddp; fstp [10] -> 1.5 + 2.25
+    Machine add({0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xC1, 0xDD, 0x1E, 0x10, 0x00});
+    add.PutDouble(0x00, 1.5);
+    add.PutDouble(0x08, 2.25);
+    add.Run();
+    CHECK(add.Ok() && add.Double(0x10) == 3.75);
+    CHECK(add.cpu.FpuState().Depth() == 0);
+
+    // The operand order of the reversed forms: a = 10, b = 4.
+    //   fld a; fld b; fsubp  -> st1 - st0 = 6      fld a; fld b; fsubrp -> st0 - st1 = -6
+    //   fld a; fld b; fdivp  -> 2.5               fld a; fld b; fdivrp -> 0.4
+    //   fld a; fsub m64 b -> 6;  fld a; fsubr m64 b -> -6;  fld a; fdivr m64 b -> 0.4
+    Machine rev({0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xE9, 0xDD, 0x1E, 0x10, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xE1, 0xDD, 0x1E, 0x18, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xF9, 0xDD, 0x1E, 0x20, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xF1, 0xDD, 0x1E, 0x28, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDC, 0x26, 0x08, 0x00, 0xDD, 0x1E, 0x30, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDC, 0x2E, 0x08, 0x00, 0xDD, 0x1E, 0x38, 0x00,
+                 0xDD, 0x06, 0x00, 0x00, 0xDC, 0x3E, 0x08, 0x00, 0xDD, 0x1E, 0x40, 0x00});
+    rev.PutDouble(0x00, 10);
+    rev.PutDouble(0x08, 4);
+    rev.Run();
+    CHECK(rev.Ok());
+    CHECK(rev.Double(0x10) == 6 && rev.Double(0x18) == -6);
+    CHECK(rev.Double(0x20) == 2.5 && rev.Double(0x28) == 0.4);
+    CHECK(rev.Double(0x30) == 6 && rev.Double(0x38) == -6 && rev.Double(0x40) == 0.4);
+
+    // fld1; fldz; fdivp -> +inf with ZE; fnstsw ax
+    Machine zero({0xD9, 0xE8, 0xD9, 0xEE, 0xDE, 0xF9, 0xDD, 0x1E, 0x10, 0x00, 0xDF, 0xE0});
+    zero.Run();
+    CHECK(zero.Ok() && std::isinf(zero.Double(0x10)) && zero.Double(0x10) > 0);
+    CHECK((zero.R(AX) & fpu::ZE) != 0);
+
+    // fld m32 [0] (0.1f), fstp m32 [4]: single precision survives the round trip
+    Machine single({0xD9, 0x06, 0x00, 0x00, 0xD9, 0x1E, 0x04, 0x00});
+    const float tenth = 0.1f;
+    uint32_t bits;
+    std::memcpy(&bits, &tenth, 4);
+    single.PutLong(0, bits);
+    single.Run();
+    CHECK(single.Ok() && single.Long(4) == bits);
+}
+
+void TestFpuIntegersAndRounding() {
+    // fild word [0] (-7); fild dword [2] (100000); faddp; fistp dword [8] -> 99993
+    Machine ints({0xDF, 0x06, 0x00, 0x00, 0xDB, 0x06, 0x02, 0x00, 0xDE, 0xC1, 0xDB, 0x1E, 0x08, 0x00});
+    ints.PutWord(0, uint16_t(-7));
+    ints.PutLong(2, 100000);
+    ints.Run();
+    CHECK(ints.Ok() && ints.Long(8) == 99993);
+
+    // Rounding modes, through fldcw: 2.5 and -2.5 stored as integers.
+    const struct {
+        uint16_t control;
+        int16_t up, down;  // results for 2.5, -2.5
+    } kModes[] = {{0x037F, 2, -2}, {0x077F, 2, -3}, {0x0B7F, 3, -2}, {0x0F7F, 2, -2}};
+    for (const auto& mode : kModes) {
+        // fldcw [20]; fld [0]; fistp word [10]; fld [8]; fistp word [12]
+        Machine r({0xD9, 0x2E, 0x20, 0x00, 0xDD, 0x06, 0x00, 0x00, 0xDF, 0x1E, 0x10, 0x00,
+                   0xDD, 0x06, 0x08, 0x00, 0xDF, 0x1E, 0x12, 0x00});
+        r.PutDouble(0x00, 2.5);
+        r.PutDouble(0x08, -2.5);
+        r.PutWord(0x20, mode.control);
+        r.Run();
+        CHECK(r.Ok() && int16_t(r.Word(0x10)) == mode.up && int16_t(r.Word(0x12)) == mode.down);
+    }
+
+    // Out of range for 16 bits: the integer indefinite (8000h) and IE.
+    Machine big({0xDD, 0x06, 0x00, 0x00, 0xDF, 0x1E, 0x10, 0x00, 0xDF, 0xE0});
+    big.PutDouble(0, 40000);
+    big.Run();
+    CHECK(big.Ok() && big.Word(0x10) == 0x8000 && (big.R(AX) & fpu::IE));
+
+    // 64-bit integers: fild qword [0]; fistp qword [8]
+    Machine wide({0xDF, 0x2E, 0x00, 0x00, 0xDF, 0x3E, 0x08, 0x00});
+    wide.PutLong(0, 0x89ABCDEF);
+    wide.PutLong(4, 0x00012345);  // 0x0001234589ABCDEF: exact in a double
+    wide.Run();
+    CHECK(wide.Ok() && wide.Long(8) == 0x89ABCDEF && wide.Long(12) == 0x00012345);
+
+    // BCD: fild dword 1234567 (negated); fbstp [10]; fbld [10]; fistp dword [20]
+    Machine bcd({0xDB, 0x06, 0x00, 0x00, 0xD9, 0xE0, 0xDF, 0x36, 0x10, 0x00, 0xDF, 0x26, 0x10, 0x00,
+                 0xDB, 0x1E, 0x20, 0x00});
+    bcd.PutLong(0, 1234567);
+    bcd.Run();
+    const uint8_t* packed = bcd.Bytes(0x10);
+    CHECK(bcd.Ok() && packed[0] == 0x67 && packed[1] == 0x45 && packed[2] == 0x23 && packed[3] == 0x01 &&
+          packed[9] == 0x80);
+    CHECK(int32_t(bcd.Long(0x20)) == -1234567);
+}
+
+void TestFpuCompareAndBranch() {
+    // fld [0] (1); fld [8] (2); fcompp (2 vs 1); fnstsw ax; sahf; ja -> bl = 1
+    Machine gt({0xDD, 0x06, 0x00, 0x00, 0xDD, 0x06, 0x08, 0x00, 0xDE, 0xD9, 0xDF, 0xE0, 0x9E,
+                0xB3, 0x00, 0x76, 0x02, 0xB3, 0x01});
+    gt.PutDouble(0, 1);
+    gt.PutDouble(8, 2);
+    gt.Run();
+    CHECK(gt.Ok() && (gt.R(BX) & 0xFF) == 1 && gt.cpu.FpuState().Depth() == 0);
+
+    // Equal: C3 (ZF after sahf); less: C0 (CF).
+    Machine eq({0xD9, 0xE8, 0xD9, 0xE8, 0xDE, 0xD9, 0xDF, 0xE0});
+    eq.Run();
+    CHECK(eq.Ok() && (eq.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == fpu::C3);
+    Machine lt({0xD9, 0xE8, 0xD9, 0xEE, 0xDE, 0xD9, 0xDF, 0xE0});  // fld1; fldz; fcompp: 0 < 1
+    lt.Run();
+    CHECK(lt.Ok() && (lt.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == fpu::C0);
+
+    // fcom m64 against a NaN: unordered (C3 C2 C0) and IE; fucompp: unordered, no IE
+    Machine nan({0xD9, 0xE8, 0xDC, 0x16, 0x00, 0x00, 0xDF, 0xE0});
+    nan.PutDouble(0, std::numeric_limits<double>::quiet_NaN());
+    nan.Run();
+    CHECK(nan.Ok() && (nan.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == (fpu::C3 | fpu::C2 | fpu::C0));
+    CHECK((nan.R(AX) & fpu::IE) != 0);
+    Machine quiet({0xDD, 0x06, 0x00, 0x00, 0xD9, 0xE8, 0xDA, 0xE9, 0xDF, 0xE0});
+    quiet.PutDouble(0, std::numeric_limits<double>::quiet_NaN());
+    quiet.Run();
+    CHECK(quiet.Ok() && (quiet.R(AX) & fpu::IE) == 0 && (quiet.R(AX) & fpu::C2));
+
+    // ftst on -3; fxam on +0 (C3) and on an empty register (C3 C0)
+    Machine tst({0xDD, 0x06, 0x00, 0x00, 0xD9, 0xE4, 0xDF, 0xE0});
+    tst.PutDouble(0, -3);
+    tst.Run();
+    CHECK(tst.Ok() && (tst.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == fpu::C0);
+    Machine xam({0xD9, 0xEE, 0xD9, 0xE5, 0xDF, 0xE0});
+    xam.Run();
+    CHECK(xam.Ok() && (xam.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == fpu::C3);
+    Machine empty({0xDB, 0xE3, 0xD9, 0xE5, 0xDF, 0xE0});  // fninit; fxam
+    empty.Run();
+    CHECK(empty.Ok() && (empty.R(AX) & (fpu::C3 | fpu::C2 | fpu::C0)) == (fpu::C3 | fpu::C0));
+}
+
+void TestFpuStackAndState() {
+    // fld1; fldpi; fxch; fstp [0] (1); fstp [8] (pi)
+    Machine xch({0xD9, 0xE8, 0xD9, 0xEB, 0xD9, 0xC9, 0xDD, 0x1E, 0x00, 0x00, 0xDD, 0x1E, 0x08, 0x00});
+    xch.Run();
+    CHECK(xch.Ok() && xch.Double(0) == 1 && xch.Double(8) == std::numbers::pi);
+
+    // fstp from an empty stack: stack underflow (IE, SF), a NaN stored
+    Machine under({0xDD, 0x1E, 0x00, 0x00, 0xDF, 0xE0});
+    under.Run();
+    CHECK(under.Ok() && std::isnan(under.Double(0)));
+    CHECK((under.R(AX) & (fpu::IE | fpu::SF)) == (fpu::IE | fpu::SF));
+
+    // Nine pushes overflow the eight registers: IE, SF and C1
+    Machine over({0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xE8,
+                  0xD9, 0xE8, 0xD9, 0xE8, 0xDF, 0xE0});
+    over.Run();
+    CHECK(over.Ok() && (over.R(AX) & (fpu::IE | fpu::SF | fpu::C1)) == (fpu::IE | fpu::SF | fpu::C1));
+
+    // 80-bit: fldpi; fstp tbyte [0]; fld tbyte [0]; fstp [10]
+    Machine ext({0xD9, 0xEB, 0xDB, 0x3E, 0x00, 0x00, 0xDB, 0x2E, 0x00, 0x00, 0xDD, 0x1E, 0x10, 0x00});
+    ext.Run();
+    const uint8_t kPi80[10] = {0x00, 0xC0, 0x68, 0x21, 0xA2, 0xDA, 0x0F, 0xC9, 0x00, 0x40};
+    CHECK(ext.Ok() && std::memcmp(ext.Bytes(0), kPi80, 10) == 0 && ext.Double(0x10) == std::numbers::pi);
+
+    // fnstcw after finit: 037F; fsave [20] empties the stack, frstor [20] brings it back
+    Machine save({0x9B, 0xDB, 0xE3, 0xD9, 0x3E, 0x00, 0x00, 0xD9, 0xE8, 0xD9, 0xEB, 0xDD, 0x36, 0x20, 0x00,
+                  0xD9, 0xE5, 0xDF, 0xE0, 0x89, 0xC3,              // fxam; fnstsw ax; mov bx, ax
+                  0xDD, 0x26, 0x20, 0x00, 0xDD, 0x1E, 0x08, 0x00, 0xDD, 0x1E, 0x10, 0x00});
+    save.Run();
+    CHECK(save.Ok() && save.Word(0) == 0x037F);
+    CHECK((save.R(BX) & (fpu::C3 | fpu::C2 | fpu::C0)) == (fpu::C3 | fpu::C0));  // empty after fsave
+    CHECK(save.Double(8) == std::numbers::pi && save.Double(0x10) == 1);
+}
+
+void TestFpuFunctions() {
+    auto near = [](double a, double b) { return std::fabs(a - b) < 1e-12; };
+    // sqrt(2): fld1; fld1; faddp; fsqrt; fstp [10]
+    Machine sqrt2({0xD9, 0xE8, 0xD9, 0xE8, 0xDE, 0xC1, 0xD9, 0xFA, 0xDD, 0x1E, 0x10, 0x00});
+    sqrt2.Run();
+    CHECK(sqrt2.Ok() && near(sqrt2.Double(0x10), std::sqrt(2.0)));
+
+    // fpatan(1, 1) = pi/4; fptan pushes 1.0 after tan(x)
+    Machine atan({0xD9, 0xE8, 0xD9, 0xE8, 0xD9, 0xF3, 0xDD, 0x1E, 0x10, 0x00});
+    atan.Run();
+    CHECK(atan.Ok() && near(atan.Double(0x10), std::numbers::pi / 4));
+    Machine tan({0xDD, 0x06, 0x00, 0x00, 0xD9, 0xF2, 0xDD, 0x1E, 0x10, 0x00, 0xDD, 0x1E, 0x18, 0x00});
+    tan.PutDouble(0, std::numbers::pi / 4);
+    tan.Run();
+    CHECK(tan.Ok() && tan.Double(0x10) == 1.0 && near(tan.Double(0x18), 1.0));
+
+    // fyl2x: 1 * log2(8) = 3; fscale: 3 * 2^4 = 48; f2xm1(0.5) = sqrt(2) - 1
+    Machine log({0xD9, 0xE8, 0xDD, 0x06, 0x00, 0x00, 0xD9, 0xF1, 0xDD, 0x1E, 0x10, 0x00});
+    log.PutDouble(0, 8);
+    log.Run();
+    CHECK(log.Ok() && near(log.Double(0x10), 3));
+    Machine scale({0xDD, 0x06, 0x08, 0x00, 0xDD, 0x06, 0x00, 0x00, 0xD9, 0xFD, 0xDD, 0x1E, 0x10, 0x00});
+    scale.PutDouble(0, 3);
+    scale.PutDouble(8, 4);
+    scale.Run();
+    CHECK(scale.Ok() && scale.Double(0x10) == 48);
+    Machine exp({0xDD, 0x06, 0x00, 0x00, 0xD9, 0xF0, 0xDD, 0x1E, 0x10, 0x00});
+    exp.PutDouble(0, 0.5);
+    exp.Run();
+    CHECK(exp.Ok() && near(exp.Double(0x10), std::sqrt(2.0) - 1));
+
+    // fprem: 10 mod 3 = 1, quotient 3 -> C1 (bit 0) and C3 (bit 1)
+    Machine rem({0xDD, 0x06, 0x08, 0x00, 0xDD, 0x06, 0x00, 0x00, 0xD9, 0xF8, 0xDF, 0xE0,
+                 0xDD, 0x1E, 0x10, 0x00});
+    rem.PutDouble(0, 10);
+    rem.PutDouble(8, 3);
+    rem.Run();
+    CHECK(rem.Ok() && rem.Double(0x10) == 1);
+    CHECK((rem.R(AX) & (fpu::C0 | fpu::C1 | fpu::C2 | fpu::C3)) == (fpu::C1 | fpu::C3));
+
+    // frndint with the default rounding: 2.5 -> 2; fsincos(0): sin 0, then cos 1 on top
+    Machine rnd({0xDD, 0x06, 0x00, 0x00, 0xD9, 0xFC, 0xDD, 0x1E, 0x10, 0x00});
+    rnd.PutDouble(0, 2.5);
+    rnd.Run();
+    CHECK(rnd.Ok() && rnd.Double(0x10) == 2);
+    Machine sincos({0xD9, 0xEE, 0xD9, 0xFB, 0xDD, 0x1E, 0x10, 0x00, 0xDD, 0x1E, 0x18, 0x00});
+    sincos.Run();
+    CHECK(sincos.Ok() && sincos.Double(0x10) == 1 && sincos.Double(0x18) == 0);
+}
+
+void TestFpuEmulatorInterrupts() {
+    // Microsoft's emulator encoding: INT 35h E8 = fld1 (D9 E8); INT 3Bh 1E 10 00 = fistp word [10] (DF);
+    // INT 3Ch C5 1E 20 00 = fstp qword es:[20] (segment ES, opcode DD); INT 3Dh = fwait.
+    Machine emu({0xD9, 0xE8, 0xD9, 0xE8, 0xDE, 0xC1,  // fld1; fld1; faddp -> 2
+                 0xCD, 0x35, 0xE8,                    // fld1 (emulated)
+                 0xCD, 0x3B, 0x1E, 0x10, 0x00,        // fistp word [10] -> 1
+                 0xCD, 0x3D,                          // fwait
+                 0xCD, 0x3C, 0xC5, 0x1E, 0x20, 0x00});  // fstp qword es:[20] -> 2
+    emu.Run();
+    CHECK(emu.Ok() && emu.Word(0x10) == 1 && emu.Double(0x20) == 2);
+    CHECK(emu.cpu.FpuState().Depth() == 0);
+}
+
+void TestFpuConversions() {
+    const double kValues[] = {0.0, -0.0, 1.0, -2.5, std::numbers::pi, 1e300, -1e-300, 4.9e-324 /* denormal */,
+                              std::numeric_limits<double>::max(), std::numeric_limits<double>::infinity(),
+                              -std::numeric_limits<double>::infinity()};
+    for (double v : kValues) {
+        uint8_t ext[10];
+        Fpu::ToExtended(v, ext);
+        const double back = Fpu::FromExtended(ext);
+        CHECK(back == v && std::signbit(back) == std::signbit(v));
+    }
+    uint8_t ext[10];
+    Fpu::ToExtended(std::numeric_limits<double>::quiet_NaN(), ext);
+    CHECK(std::isnan(Fpu::FromExtended(ext)));
+    // 1.0 in extended precision: 3FFF 8000000000000000
+    Fpu::ToExtended(1.0, ext);
+    const uint8_t kOne[10] = {0, 0, 0, 0, 0, 0, 0, 0x80, 0xFF, 0x3F};
+    CHECK(std::memcmp(ext, kOne, 10) == 0);
+
+    Fpu f;
+    CHECK(f.RoundInt(2.5) == 2 && f.RoundInt(3.5) == 4 && f.RoundInt(-2.5) == -2 && f.RoundInt(-0.4) == 0);
+    CHECK(f.ToInteger(32767.4, 16) == 32767 && (f.status & fpu::PE) && !(f.status & fpu::IE));
+    CHECK(f.ToInteger(32768, 16) == -32768 && (f.status & fpu::IE));
+
+    uint8_t bcd[10];
+    f.ToBcd(-90210, bcd);
+    CHECK(bcd[0] == 0x10 && bcd[1] == 0x02 && bcd[2] == 0x09 && bcd[9] == 0x80 && Fpu::FromBcd(bcd) == -90210);
+    f.status = 0;
+    f.ToBcd(1e19, bcd);
+    CHECK((f.status & fpu::IE) && bcd[9] == 0xFF && bcd[8] == 0xFF && bcd[7] == 0xC0);
 }
 
 void TestHostSegmentCalls() {
@@ -355,6 +637,13 @@ int main() {
         {"SegmentsAndAddressing", TestSegmentsAndAddressing},
         {"ProtectionFaults", TestProtectionFaults},
         {"HostSegmentCalls", TestHostSegmentCalls},
+        {"FpuArithmetic", TestFpuArithmetic},
+        {"FpuIntegersAndRounding", TestFpuIntegersAndRounding},
+        {"FpuCompareAndBranch", TestFpuCompareAndBranch},
+        {"FpuStackAndState", TestFpuStackAndState},
+        {"FpuFunctions", TestFpuFunctions},
+        {"FpuEmulatorInterrupts", TestFpuEmulatorInterrupts},
+        {"FpuConversions", TestFpuConversions},
     };
     return test::RunAll(cases);
 }

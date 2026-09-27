@@ -45,23 +45,50 @@ std::string ModuleBaseName(const std::string& name) {
 }
 
 // WIN87EM: the floating-point emulator library. Programs built with the
-// emulator call __fpMath at startup (BX = 0) and exit (BX = 2); the real work
-// happens through the INT 34h-3Eh emulation interrupts, not supported yet.
+// emulator run their x87 instructions directly (we report a coprocessor), and
+// call __fpMath (register arguments, function in BX) for housekeeping, which
+// works on the interpreter's FPU.
 void FpMath(Runtime& rt, Cpu& cpu) {
     Registers& r = cpu.Regs();
+    Fpu& f = cpu.FpuState();
     switch (r.r[BX]) {
-    case 0:  // initialize
-    case 1:  // reset
-    case 2:  // terminate
+    case 0:  // install
+    case 1:  // initialize
+        f.Reset();
         r.r[AX] = 0;
-        cpu.ReturnFar(0);
-        return;
+        break;
+    case 2:   // deinstall
+    case 3:   // set the error handler (DX:AX): exceptions stay masked, it's never called
+    case 12:  // save a word of emulator state
+        break;
+    case 4: f.control = r.r[AX]; break;  // set the control word
+    case 5: r.r[AX] = f.control; break;  // get the control word
+    case 6: {  // round ST(0) to an integer, with the rounding mode in AX
+        const uint16_t saved = f.control;
+        f.control = uint16_t((saved & ~0x0C00) | (r.r[AX] & 0x0C00));
+        f.Set(0, f.RoundInt(f.Get(0)));
+        f.control = saved;
+        break;
+    }
+    case 7: {  // pop ST(0) into DX:AX as a long
+        const uint32_t v = uint32_t(f.ToInteger(f.Pop(), 32));
+        r.r[AX] = uint16_t(v);
+        r.r[DX] = uint16_t(v >> 16);
+        break;
+    }
+    case 8: r.r[AX] = f.StatusWord(); break;
+    case 9: f.status &= ~(fpu::kExceptionMask | fpu::SF | 0x8000); break;  // clear exceptions
+    case 10: r.r[AX] = uint16_t(f.Depth()); break;  // registers in use
+    case 11:  // installed?
+        r.r[AX] = 1;
+        r.r[DX] = 0;
+        break;
     default:
         rt.Exit(TaskExit::Kind::Unimplemented, 0,
-                "WIN87EM.1 (__fpMath) function " + std::to_string(r.r[BX]) +
-                    " is not implemented yet (floating-point emulation)");
+                "WIN87EM.1 (__fpMath) function " + std::to_string(r.r[BX]) + " is not implemented yet");
         return;
     }
+    cpu.ReturnFar(0);
 }
 
 std::vector<ApiFunction> Win87emApi() { return {{1, "__FPMATH", FpMath}}; }
@@ -70,6 +97,8 @@ std::vector<ApiFunction> Win87emApi() { return {{1, "__FPMATH", FpMath}}; }
 std::vector<ApiFunction> OptionalModuleApi(const std::string& name) {
     if (name == "WIN87EM") return Win87emApi();
     if (name == "MMSYSTEM") return MmsystemApi();
+    if (name == "TOOLHELP") return ToolhelpApi();
+    if (name == "KEYBOARD") return KeyboardApi();
     return {};
 }
 
@@ -154,6 +183,7 @@ Runtime::Runtime()
       user_(std::make_unique<User>(*this)),
       gdi_(std::make_unique<Gdi>(*this)) {
     scratchSel_ = memory_.Allocate(kScratchBytes, SegmentKind::Data);
+    SetUpBiosData();
 }
 
 Runtime::~Runtime() {
@@ -259,8 +289,9 @@ uint16_t Runtime::EquateValue(const CatalogEntry& c) {
     if (name == "__WINFLAGS") return kWinFlags;
     if (name == "__AHINCR") return 8;   // selector increment between the parts of a huge block
     if (name == "__AHSHIFT") return 3;
+    if (name == "__0040H") return kBiosDataSelector;  // the BIOS data area (Bios.cpp)
     if (name == "__ROMBIOS" || (name.size() == 7 && name.compare(0, 2, "__") == 0 && name[6] == 'H')) {
-        // __0040H, __A000H, ...: selectors for real-mode memory (BIOS data, video).
+        // __A000H, __F000H, ...: selectors for other real-mode memory (video, ROM).
         Note("equate:" + name, "the program imports " + name +
                                    " (direct access to real-mode memory): not supported, it gets a null selector");
         return 0;
@@ -335,6 +366,19 @@ TaskExit Runtime::Run(uint64_t budget) {
 }
 
 // --- The program's DLLs --------------------------------------------------------------------
+
+uint16_t Runtime::CallbackData(uint16_t codeSel, uint16_t hInstance) {
+    const auto owns = [&](const LoadedModule& m) {
+        return std::find(m.selectors.begin(), m.selectors.end(), codeSel) != m.selectors.end();
+    };
+    if (owns(module_) && module_.dgroup) return module_.dgroup;
+    for (const auto& d : dlls_) {
+        if (owns(d->loaded)) return d->loaded.dgroup ? d->loaded.dgroup : module_.dgroup;
+    }
+    if (hInstance && hInstance == module_.dgroup) return hInstance;
+    if (const DllModule* d = FindDll(hInstance); d && d->loaded.dgroup == hInstance) return hInstance;
+    return module_.dgroup;
+}
 
 Runtime::DllModule* Runtime::FindDll(uint16_t handle) {
     if (!handle) return nullptr;
@@ -624,6 +668,19 @@ void Runtime::TracePrint(const std::string& line) {
     Print("[trace] " + line);
 }
 
+// Whether one of the Pascal arguments on the stack (declared by `params`) is a
+// far pointer with selector `sel`.
+bool Runtime::IsPointerArgument(const char* params, uint16_t sel) const {
+    uint16_t offset = 0;  // the last parameter is nearest the return address
+    for (size_t i = std::strlen(params); i-- > 0;) {
+        const char p = params[i];
+        const bool pointer = p == 'p' || p == 'P' || p == 'z' || p == 'Z';
+        if (pointer && cpu_.StackArg(uint16_t(offset + 2)) == sel) return true;
+        offset = uint16_t(offset + ParamBytes(std::string(1, p).c_str()));
+    }
+    return false;
+}
+
 void Runtime::CallApi(size_t moduleIndex, uint16_t ip) {
     BuiltinModule& module = builtins_[moduleIndex];
     const ApiFunction* impl = nullptr;
@@ -665,8 +722,23 @@ void Runtime::CallApi(size_t moduleIndex, uint16_t ip) {
     }
 
     if (impl) {
-        const uint16_t sp = cpu_.Regs().r[SP];
-        impl->impl(*this, cpu_);
+        const Registers saved = cpu_.Regs();
+        const uint16_t sp = saved.r[SP];
+        try {
+            impl->impl(*this, cpu_);
+        } catch (const ProtectionFault& e) {
+            // Windows 3.1 validates pointer arguments: a bad one fails the call
+            // (returning 0) instead of faulting, and programs came to rely on it.
+            cpu_.Regs() = saved;
+            if (!c || c->kind != CatalogKind::Pascal || !c->params || !IsPointerArgument(c->params, e.selector))
+                throw;
+            Note("badptr:" + name, name + " was passed an invalid pointer (" + FarAddr(e.selector, e.offset) +
+                                       "): it returned 0, as Windows 3.1's parameter validation does");
+            SetResult(cpu_, 0);
+            cpu_.ReturnFar(ParamBytes(c->params));
+            if (trace_) frame.Finish(TraceResult(c) + " (invalid pointer)");
+            return;
+        }
         // Consistency check: a Pascal function removes exactly its arguments
         // (plus the return address). A mismatch is an engine bug.
         if (c && c->kind == CatalogKind::Pascal && c->params && !exited_ && cpu_.Regs().s[CS] == retCs &&
@@ -709,15 +781,13 @@ bool Runtime::Interrupt(uint8_t vector) {
     case 0x20: Exit(TaskExit::Kind::Exited, 0, "INT 20h"); return true;
     case 0x21: DosService(); return true;
     case 0x31: Int31(); return true;
+    case 0x3E:  // the floating-point emulator's own services (INT 34h-3Dh run on the Cpu)
+        Exit(TaskExit::Kind::Unimplemented, 0,
+             "floating-point emulator service INT 3Eh at " + FarAddr(cpu_.Regs().s[CS], cpu_.Regs().ip) +
+                 " is not implemented yet");
+        return true;
     default:
-        if (vector >= 0x34 && vector <= 0x3E) {  // x87 instructions, emulated through WIN87EM
-            Exit(TaskExit::Kind::Unimplemented, 0,
-                 "floating-point instruction (INT " + Hex(vector, 2) +
-                     "h, x87 emulation) at " + FarAddr(cpu_.Regs().s[CS], cpu_.Regs().ip) +
-                     " is not implemented yet");
-            return true;
-        }
-        return false;
+        return BiosInterrupt(vector);
     }
 }
 
@@ -911,7 +981,33 @@ bool Runtime::DosFileService(uint8_t ah) {
 void Runtime::Int31() {
     Registers& r = cpu_.Regs();
     cpu_.SetFlag(flags::CF, false);
+    auto fail = [&](uint16_t code) {
+        cpu_.SetFlag(flags::CF, true);
+        r.r[AX] = code;
+    };
     switch (r.r[AX]) {
+    case 0x0000:  // allocate CX descriptors (one at a time here)
+        if (r.r[CX] != 1) return fail(0x8011);
+        r.r[AX] = memory_.AllocateDescriptor();
+        if (!r.r[AX]) fail(0x8011);
+        return;
+    case 0x0001:  // free descriptor BX
+        if (!(r.r[BX] & 4) || !memory_.Lookup(r.r[BX])) return fail(0x8022);
+        memory_.Free(r.r[BX]);
+        return;
+    case 0x0007:  // set segment base: BX, CX:DX
+        if (!memory_.SetBase(r.r[BX], (uint32_t(r.r[CX]) << 16) | r.r[DX])) fail(0x8022);
+        return;
+    case 0x0008:  // set segment limit: BX, CX:DX
+        if (!memory_.SetLimit(r.r[BX], (uint32_t(r.r[CX]) << 16) | r.r[DX])) fail(0x8022);
+        return;
+    case 0x0009:  // set access rights: BX, CL (bit 3: code)
+        if (!memory_.SetKind(r.r[BX], (r.R8(1) & 0x08) ? SegmentKind::Code : SegmentKind::Data)) fail(0x8022);
+        return;
+    case 0x000A:  // create a data alias of BX
+        r.r[AX] = memory_.Alias(r.r[BX], SegmentKind::Data);
+        if (!r.r[AX]) fail(0x8022);
+        return;
     case 0x0006: {  // get segment base address
         const Descriptor* d = memory_.Lookup(r.r[BX]);
         if (!d) {

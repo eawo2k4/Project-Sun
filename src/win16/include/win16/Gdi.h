@@ -35,6 +35,10 @@ class PreciseWaiter;
 
 namespace retro::win16 {
 
+struct Point16 {
+    int16_t x = 0, y = 0;
+};
+
 class Runtime;
 struct Rect16;
 
@@ -59,7 +63,13 @@ public:
     // --- Device contexts ---
     // DC for a window's surface (hwnd 0: a 640x480 desktop surface). Each call
     // saves the DC state; ReleaseWindowDc restores it and marks the surface dirty.
+    // A child window draws on its top-level window's surface: its DC is a handle
+    // of its own onto that surface's DC, with the device origin moved to the
+    // child's corner and drawing clipped to the child (and its ancestors).
     uint16_t GetWindowDc(uint16_t hwnd);
+    // A child window DC's device origin on the surface ({0, 0} for other DCs).
+    // Viewport origins and device coordinates are reported relative to it.
+    Point16 DeviceOrigin(uint16_t hdc) const;
     bool ReleaseWindowDc(uint16_t hdc);
     uint16_t CreateCompatibleDc(uint16_t hdc);
     bool DeleteDc(uint16_t hdc);
@@ -123,6 +133,11 @@ private:
     void Unwrap(uint16_t handle);
     const Object* Find(uint16_t handle) const;
     Surface* SurfaceFor(uint16_t hwnd);
+    struct ChildDc {
+        uint16_t top = 0;  // the top-level window whose surface it draws on
+        int16_t x = 0, y = 0;
+    };
+    std::map<uint16_t, ChildDc> childDcs_;  // by HDC
     bool MakeSurface(Surface& s, int width, int height);
     void FreeSurface(Surface& s);
 

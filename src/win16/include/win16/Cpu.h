@@ -6,8 +6,9 @@
 // MUL/DIV, BCD adjust, string ops with REP, near/far CALL/JMP/RET, ENTER/
 // LEAVE, PUSHA/POPA, IMUL immediate, LES/LDS, INT/IRET) with 16-bit
 // addressing and 286 protected-mode segment loads through the virtual LDT
-// (win16/Memory.h). Not yet: 386 operand/address-size prefixes, the 286
-// system instructions (0F xx), x87, I/O ports.
+// (win16/Memory.h), and the x87 FPU (win16/Fpu.h, CpuFpu.cpp), including the
+// INT 34h-3Dh forms of Microsoft's floating-point emulator. Not yet: 386
+// operand/address-size prefixes, the 286 system instructions (0F xx), I/O ports.
 //
 // Host integration:
 //   * INT n goes to the interrupt handler (DOS INT 21h, DPMI INT 31h, ...).
@@ -22,6 +23,7 @@
 #include <string>
 #include <vector>
 
+#include "win16/Fpu.h"
 #include "win16/Memory.h"
 
 namespace retro::win16 {
@@ -74,6 +76,7 @@ public:
     Registers& Regs() { return regs_; }
     const Registers& Regs() const { return regs_; }
     Memory& Mem() { return mem_; }
+    Fpu& FpuState() { return fpu_; }
 
     void SetInterruptHandler(InterruptHandler handler) { interrupt_ = std::move(handler); }
     void MapHostSegment(uint16_t selector, HostHandler handler);
@@ -158,6 +161,24 @@ private:
     void MulDiv(int op, uint16_t src, bool word);
     void StringOp(uint8_t op);
     void Interrupt(uint8_t vector);
+
+    // x87 (CpuFpu.cpp).
+    void Escape(uint8_t op);
+    void EscapeMemory(uint8_t op, const ModRM& m);
+    void EscapeRegister(uint8_t op, uint8_t reg, uint8_t i);
+    void FpuFunction(int n);
+    double FpuArith(int op, double a, double b);
+    void FpuArithST0(int op, double src);
+    bool EmulatorInterrupt(uint8_t vector);
+    void ReadOperand(const ModRM& m, uint8_t* out, uint32_t size);
+    void WriteOperand(const ModRM& m, const uint8_t* in, uint32_t size);
+    double LoadReal(const ModRM& m, int bytes);
+    void StoreReal(const ModRM& m, int bytes, double v);
+    int64_t LoadInt(const ModRM& m, int bytes);
+    void StoreInt(const ModRM& m, int bytes, double v);
+    void StoreFpuEnv(const ModRM& m);
+    void LoadFpuEnv(const ModRM& m);
+
     void FarJump(uint16_t selector, uint16_t offset);
     bool Condition(int cc) const;
 
@@ -165,6 +186,9 @@ private:
 
     Memory& mem_;
     Registers regs_;
+    Fpu fpu_;
+    // The last x87 instruction and memory operand, for FSTENV/FSAVE.
+    uint16_t fpuCs_ = 0, fpuIp_ = 0, fpuOperand_ = 0, fpuOperandSeg_ = 0;
     InterruptHandler interrupt_;
     struct HostSegment {
         uint16_t selector;

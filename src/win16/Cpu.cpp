@@ -662,7 +662,10 @@ void Cpu::Execute(uint8_t op) {
         StringOp(op);
         return;
     }
-    if (op >= 0xD8 && op <= 0xDF) Throw(FaultKind::InvalidOpcode, "x87 instruction (no FPU emulation yet)");
+    if (op >= 0xD8 && op <= 0xDF) {
+        Escape(op);
+        return;
+    }
 
     switch (op) {
     case 0x60: {  // PUSHA
@@ -823,7 +826,11 @@ void Cpu::Execute(uint8_t op) {
         return;
     }
     case 0xCC: Interrupt(3); return;
-    case 0xCD: Interrupt(Fetch8()); return;
+    case 0xCD: {
+        const uint8_t vector = Fetch8();
+        if (!EmulatorInterrupt(vector)) Interrupt(vector);
+        return;
+    }
     case 0xCE: if (Flag(flags::OF)) Interrupt(4); return;
     case 0xCF: {  // IRET
         const uint16_t ip = Pop(), cs = Pop(), f = Pop();
